@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//opt/anaconda3/bin/**)",
+      "Read(//Users/manuelditaranto/anaconda3/bin/**)",
+      "Read(//Users/manuelditaranto/miniconda3/bin/**)",
+      "Bash(venv/bin/python3 -c \":*)",
+      "Bash(venv/bin/python3 -c \"from modules.signal_engine import show; print\\(''OK''\\)\")",
+      "Bash(python3 scripts/office/unpack.py \"/Users/manuelditaranto/Desktop/google LCS AM/Question bank - RRK + GCA.docx\" /tmp/qb_unpacked/)",
+      "Bash(source venv/bin/activate)",
+      "Bash(streamlit run:*)",
+      "Bash(pip install:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(nslookup db.ngufewwtfupespwcpkdx.supabase.co)",
+      "Bash(curl -s --connect-timeout 5 \"https://ngufewwtfupespwcpkdx.supabase.co\" -o /dev/null -w \"%{http_code}\")"
+    ]
+  }
+}
