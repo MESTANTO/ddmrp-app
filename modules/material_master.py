@@ -73,6 +73,9 @@ def _show_item_list():
             "MOQ": it.min_order_qty,
             "Order Cycle": it.order_cycle,
             "On Hand": it.on_hand,
+            "Unit Cost (€)": round(it.unit_cost or 0.0, 2),
+            "Ordering Cost (€)": round(it.ordering_cost or 0.0, 2),
+            "Holding %": round((it.holding_cost_pct or 0.0) * 100, 2),
             "TOG": round(zones.top_of_green, 2),
             "TOY": round(zones.top_of_yellow, 2),
             "TOR": round(zones.top_of_red, 2),
@@ -126,6 +129,24 @@ def _show_add_item():
                 help="How frequently you place orders. Used in Green Zone calculation."
             )
 
+        st.markdown("**💰 Cost Parameters** (optional — for Safety Stock & EOQ)")
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            unit_cost = st.number_input(
+                "Unit Cost (€)", min_value=0.0, value=0.0, step=0.01,
+                help="Purchase or production cost per unit.",
+            )
+        with cc2:
+            ordering_cost = st.number_input(
+                "Ordering Cost (€/order)", min_value=0.0, value=0.0, step=1.0,
+                help="Fixed cost per order. Leave 0 to use global default on the Safety Stock page.",
+            )
+        with cc3:
+            holding_pct = st.number_input(
+                "Holding Cost (% / year)", min_value=0.0, max_value=100.0, value=0.0, step=1.0,
+                help="Annual holding cost as a % of unit cost. Leave 0 to use global default.",
+            )
+
         submitted = st.form_submit_button("Add Item", type="primary")
 
     if submitted:
@@ -152,6 +173,9 @@ def _show_add_item():
                 variability_factor=vf,
                 min_order_qty=moq,
                 order_cycle=order_cycle,
+                unit_cost=unit_cost,
+                ordering_cost=ordering_cost,
+                holding_cost_pct=holding_pct / 100.0,
             )
             session.add(item)
             session.commit()
@@ -219,6 +243,26 @@ def _show_edit_item():
                 moq = st.number_input("MOQ", value=float(item.min_order_qty), step=1.0)
                 order_cycle = st.number_input("Order Cycle (days)", value=float(item.order_cycle), step=1.0)
 
+            st.markdown("**💰 Cost Parameters** (optional — for Safety Stock & EOQ)")
+            cc1, cc2, cc3 = st.columns(3)
+            with cc1:
+                unit_cost = st.number_input(
+                    "Unit Cost (€)", min_value=0.0,
+                    value=float(item.unit_cost or 0.0), step=0.01,
+                )
+            with cc2:
+                ordering_cost = st.number_input(
+                    "Ordering Cost (€/order)", min_value=0.0,
+                    value=float(item.ordering_cost or 0.0), step=1.0,
+                    help="Leave 0 to use global default on the Safety Stock page.",
+                )
+            with cc3:
+                holding_pct = st.number_input(
+                    "Holding Cost (% / year)", min_value=0.0, max_value=100.0,
+                    value=float((item.holding_cost_pct or 0.0) * 100.0), step=1.0,
+                    help="Leave 0 to use global default.",
+                )
+
             col_save, col_delete = st.columns([3, 1])
             save = col_save.form_submit_button("Save Changes", type="primary")
             delete = col_delete.form_submit_button("Delete Item", type="secondary")
@@ -237,6 +281,9 @@ def _show_edit_item():
                 it.variability_factor = vf
                 it.min_order_qty = moq
                 it.order_cycle = order_cycle
+                it.unit_cost = unit_cost
+                it.ordering_cost = ordering_cost
+                it.holding_cost_pct = holding_pct / 100.0
                 session2.commit()
                 st.success("Item updated successfully!")
                 st.rerun()

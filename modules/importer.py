@@ -91,11 +91,15 @@ MATERIAL_HEADERS = [
     {"name": "Min Order Qty",        "width": 14},
     {"name": "Order Cycle (days)",   "width": 16},
     {"name": "On Hand",              "width": 12},
+    {"name": "Unit Cost (€)",        "width": 14},
+    {"name": "Ordering Cost (€)",    "width": 16},
+    {"name": "Holding Cost %",       "width": 16},
 ]
 
 MATERIAL_EXAMPLE = [
     "RM-001", "Raw Material A", "Raw Material", "KG",
     10.0, 5.0, 0.5, 0.5, 50.0, 7.0, 100.0,
+    25.0, 50.0, 25.0,
 ]
 
 
@@ -107,7 +111,9 @@ def build_material_template() -> bytes:
     _add_instructions(ws,
         "Instructions: Fill from row 4 onward. Row 2 is an example (do not delete row 1 or 2). "
         "Fields marked * are required. Lead Time Factor and Variability Factor: use values 0.1–1.0. "
-        "Unit of Measure options: EA, KG, LT, M, MT, PC.",
+        "Unit of Measure options: EA, KG, LT, M, MT, PC. "
+        "Cost fields are optional — leave blank or 0 to use global defaults on the Safety Stock page. "
+        "Holding Cost % is the annual holding cost as a percentage (e.g. 25 = 25%).",
         row=1, col_span=len(MATERIAL_HEADERS))
     _write_header(ws, MATERIAL_HEADERS, row=2)
     _write_example_row(ws, MATERIAL_EXAMPLE, row=3)
@@ -166,6 +172,9 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
                 min_order_qty = float(row.get("Min Order Qty", 0) or 0),
                 order_cycle   = float(row.get("Order Cycle (days)", 0) or 0),
                 on_hand       = float(row.get("On Hand", 0) or 0),
+                unit_cost        = float(row.get("Unit Cost (€)", 0) or 0),
+                ordering_cost    = float(row.get("Ordering Cost (€)", 0) or 0),
+                holding_cost_pct = float(row.get("Holding Cost %", 0) or 0) / 100.0,
             ))
         except (ValueError, TypeError) as e:
             errors.append(f"Row {row_num} ({part}): Invalid numeric value — {e}")
@@ -191,6 +200,9 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
                 min_order_qty=d["min_order_qty"],
                 order_cycle=d["order_cycle"],
                 on_hand=d["on_hand"],
+                unit_cost=d["unit_cost"],
+                ordering_cost=d["ordering_cost"],
+                holding_cost_pct=d["holding_cost_pct"],
             ))
             success += 1
 

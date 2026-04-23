@@ -77,6 +77,11 @@ class Item(Base):
     # Current stock
     on_hand = Column(Float, default=0.0)
 
+    # Cost fields — used by Safety Stock & EOQ module
+    unit_cost        = Column(Float, default=0.0)   # € per unit
+    ordering_cost    = Column(Float, default=0.0)   # € per order (0 → use global default)
+    holding_cost_pct = Column(Float, default=0.0)   # annual holding cost % as fraction, e.g. 0.25 (0 → use global default)
+
     # Relationships
     demand_entries = relationship("DemandEntry", back_populates="item", cascade="all, delete")
     supply_entries = relationship("SupplyEntry", back_populates="item", cascade="all, delete")
@@ -210,29 +215,49 @@ class Process(Base):
 def init_db():
     """Create all tables if they don't exist. Works on both PostgreSQL and SQLite."""
     Base.metadata.create_all(engine)
-    # For SQLite only: add new columns to existing databases (safe migration)
-    if DATABASE_URL.startswith("sqlite"):
-        _migrate_sqlite_buffer_columns()
+    # Add any new columns to existing tables (safe, idempotent, cross-dialect)
+    _migrate_buffer_columns()
+    _migrate_item_columns()
 
 
-def _migrate_sqlite_buffer_columns():
-    """Add new Buffer columns to existing SQLite databases (idempotent)."""
+def _migrate_buffer_columns():
+    """Add new Buffer columns to existing databases (idempotent)."""
+    _add_columns_safely("buffers", [
+        ("dynamic_adu",     "REAL DEFAULT 0.0",        "DOUBLE PRECISION DEFAULT 0.0"),
+        ("static_adu",      "REAL DEFAULT 0.0",        "DOUBLE PRECISION DEFAULT 0.0"),
+        ("adu_window_days", "INTEGER DEFAULT 7",       "INTEGER DEFAULT 7"),
+        ("next_recalc_due", "DATETIME",                "TIMESTAMP"),
+    ])
+
+
+def _migrate_item_columns():
+    """Add cost fields to existing `items` tables (idempotent)."""
+    _add_columns_safely("items", [
+        ("unit_cost",        "REAL DEFAULT 0.0", "DOUBLE PRECISION DEFAULT 0.0"),
+        ("ordering_cost",    "REAL DEFAULT 0.0", "DOUBLE PRECISION DEFAULT 0.0"),
+        ("holding_cost_pct", "REAL DEFAULT 0.0", "DOUBLE PRECISION DEFAULT 0.0"),
+    ])
+
+
+def _add_columns_safely(table: str, cols):
+    """
+    cols: list of tuples (name, sqlite_def, pg_def).
+    Uses the right ALTER TABLE syntax for each dialect and silently skips if
+    the column already exists.
+    """
     import sqlalchemy
-    new_columns = [
-        ("dynamic_adu",     "REAL DEFAULT 0.0"),
-        ("static_adu",      "REAL DEFAULT 0.0"),
-        ("adu_window_days", "INTEGER DEFAULT 7"),
-        ("next_recalc_due", "DATETIME"),
-    ]
+    is_pg = DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres://")
     with engine.connect() as conn:
-        for col_name, col_def in new_columns:
+        for name, sqlite_def, pg_def in cols:
+            if is_pg:
+                stmt = f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{name}" {pg_def}'
+            else:
+                stmt = f"ALTER TABLE {table} ADD COLUMN {name} {sqlite_def}"
             try:
-                conn.execute(sqlalchemy.text(
-                    f"ALTER TABLE buffers ADD COLUMN {col_name} {col_def}"
-                ))
+                conn.execute(sqlalchemy.text(stmt))
                 conn.commit()
             except Exception:
-                pass
+                pass  # column already exists — ignore
 
 
 def get_session():
