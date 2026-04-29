@@ -84,12 +84,16 @@ MATERIAL_HEADERS = [
     {"name": "Description *",        "width": 28},
     {"name": "Category",             "width": 16},
     {"name": "Unit of Measure",      "width": 14},
+    {"name": "Item Type",            "width": 12},
+    {"name": "Buffer Profile",       "width": 16},
     {"name": "ADU *",                "width": 12},
     {"name": "DLT (days) *",         "width": 14},
     {"name": "Lead Time Factor",     "width": 16},
     {"name": "Variability Factor",   "width": 16},
     {"name": "Min Order Qty",        "width": 14},
     {"name": "Order Cycle (days)",   "width": 16},
+    {"name": "Spike Horizon (days)", "width": 18},
+    {"name": "Spike Threshold Factor","width": 20},
     {"name": "On Hand",              "width": 12},
     {"name": "Unit Cost (€)",        "width": 14},
     {"name": "Ordering Cost (€)",    "width": 16},
@@ -98,7 +102,10 @@ MATERIAL_HEADERS = [
 
 MATERIAL_EXAMPLE = [
     "RM-001", "Raw Material A", "Raw Material", "KG",
-    10.0, 5.0, 0.5, 0.5, 50.0, 7.0, 100.0,
+    "P", "P-M-M",
+    10.0, 5.0, 0.5, 0.5, 50.0, 7.0,
+    "", "",
+    100.0,
     25.0, 50.0, 25.0,
 ]
 
@@ -109,32 +116,59 @@ def build_material_template() -> bytes:
     ws.title = "Items"
 
     _add_instructions(ws,
-        "Instructions: Fill from row 4 onward. Row 2 is an example (do not delete row 1 or 2). "
-        "Fields marked * are required. Lead Time Factor and Variability Factor: use values 0.1–1.0. "
+        "Instructions: Fill from row 4 onward. Row 3 is an example (do not delete rows 1-3). "
+        "Fields marked * are required. "
+        "Item Type: M=Manufactured, I=Intermediate, P=Purchased, D=Distributed (slide 50). "
+        "Buffer Profile is the Item Type-LeadTimeCategory-VariabilityCategory code, e.g. 'P-M-M' (slides 51-54); "
+        "leave blank to use manual LTF/VF only. Bands: LTF L=0.20-0.40, M=0.41-0.60, S=0.61-1.0; "
+        "VF L=0.0-0.40, M=0.41-0.60, H=0.61-1.0. "
+        "Spike Horizon (days) and Spike Threshold Factor (× ADU) are ASOH overrides (slide 83) — "
+        "leave blank to use global defaults. "
         "Unit of Measure options: EA, KG, LT, M, MT, PC. "
-        "Cost fields are optional — leave blank or 0 to use global defaults on the Safety Stock page. "
-        "Holding Cost % is the annual holding cost as a percentage (e.g. 25 = 25%).",
+        "Cost fields are optional. Holding Cost % is annual percentage (e.g. 25 = 25%).",
         row=1, col_span=len(MATERIAL_HEADERS))
     _write_header(ws, MATERIAL_HEADERS, row=2)
     _write_example_row(ws, MATERIAL_EXAMPLE, row=3)
 
+    # Resolve column letters by header name to keep dropdowns in sync if columns shift
+    name_to_col = {h["name"]: get_column_letter(i + 1)
+                   for i, h in enumerate(MATERIAL_HEADERS)}
+
     # Dropdown validation for UoM
     dv_uom = DataValidation(type="list", formula1='"EA,KG,LT,M,MT,PC"', allow_blank=True)
     ws.add_data_validation(dv_uom)
-    dv_uom.sqref = "D4:D1000"
+    dv_uom.sqref = f'{name_to_col["Unit of Measure"]}4:{name_to_col["Unit of Measure"]}1000'
 
-    # Dropdown validation for LTF and VF
-    dv_factor = DataValidation(type="list", formula1='"0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,1.0"',
-                               allow_blank=True)
-    ws.add_data_validation(dv_factor)
-    dv_factor.sqref = "G4:H1000"
+    # Dropdown validation for Item Type
+    dv_type = DataValidation(type="list", formula1='"M,I,P,D"', allow_blank=True)
+    ws.add_data_validation(dv_type)
+    dv_type.sqref = f'{name_to_col["Item Type"]}4:{name_to_col["Item Type"]}1000'
+
+    # Dropdown validation for LTF
+    dv_ltf = DataValidation(type="list",
+                            formula1='"0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0"',
+                            allow_blank=True)
+    ws.add_data_validation(dv_ltf)
+    dv_ltf.sqref = f'{name_to_col["Lead Time Factor"]}4:{name_to_col["Lead Time Factor"]}1000'
+
+    # Dropdown validation for VF
+    dv_vf = DataValidation(type="list",
+                           formula1='"0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0"',
+                           allow_blank=True)
+    ws.add_data_validation(dv_vf)
+    dv_vf.sqref = f'{name_to_col["Variability Factor"]}4:{name_to_col["Variability Factor"]}1000'
 
     ws.freeze_panes = "A4"
     return _wb_to_bytes(wb)
 
 
 def import_materials(uploaded_file) -> tuple[int, list[str]]:
-    from database.db import get_session, Item
+    from database.db import get_session, Item, BufferProfile
+
+    # Canonical bands for LTF / VF validation (deck slides 51-54)
+    LTF_BANDS = {"S": (0.61, 1.00), "M": (0.41, 0.60), "L": (0.20, 0.40)}
+    VF_BANDS  = {"L": (0.00, 0.40), "M": (0.41, 0.60), "H": (0.61, 1.00)}
+    VALID_TYPES = {"M", "I", "P", "D"}
 
     try:
         df = pd.read_excel(uploaded_file, header=1, skiprows=[2])  # header at row 2, skip row 3 (example)
@@ -145,8 +179,31 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
     df = df.dropna(how="all")
     df.columns = [c.replace(" *", "").strip() for c in df.columns]
 
+    # Pre-load profiles
+    session = get_session()
+    try:
+        profile_map = {p.name: p for p in session.query(BufferProfile).all()}
+    finally:
+        session.close()
+
     errors = []
     success = 0
+
+    def _opt_int(v):
+        if v is None or pd.isna(v) or str(v).strip() == "":
+            return None
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return None
+
+    def _opt_float(v):
+        if v is None or pd.isna(v) or str(v).strip() == "":
+            return None
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
 
     # --- Pre-validate all rows before touching the DB ---
     new_items = []
@@ -159,18 +216,55 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
         if not desc or desc == "nan":
             errors.append(f"Row {row_num}: Description is required for {part}.")
             continue
+
         try:
+            ltf = float(row.get("Lead Time Factor", 0.5) or 0.5)
+            vf  = float(row.get("Variability Factor", 0.5) or 0.5)
+
+            item_type = str(row.get("Item Type", "P") or "P").strip().upper()
+            if item_type not in VALID_TYPES:
+                item_type = "P"
+
+            raw_profile = row.get("Buffer Profile", "")
+            profile_name = ("" if pd.isna(raw_profile) else str(raw_profile)).strip()
+            if profile_name.lower() == "nan":
+                profile_name = ""
+            profile_obj  = profile_map.get(profile_name) if profile_name else None
+            if profile_name and profile_obj is None:
+                errors.append(f"Row {row_num} ({part}): Buffer Profile '{profile_name}' not found "
+                              "(expected format e.g. 'P-M-M'). Profile cleared.")
+                profile_name = ""
+
+            # Band validation if a profile is set
+            if profile_obj is not None:
+                ltf_band = LTF_BANDS.get(profile_obj.lt_category)
+                vf_band  = VF_BANDS.get(profile_obj.var_category)
+                if ltf_band and not (ltf_band[0] <= ltf <= ltf_band[1]):
+                    errors.append(f"Row {row_num} ({part}): LTF {ltf} outside band "
+                                  f"{ltf_band[0]:.2f}-{ltf_band[1]:.2f} for category "
+                                  f"{profile_obj.lt_category}. Row skipped.")
+                    continue
+                if vf_band and not (vf_band[0] <= vf <= vf_band[1]):
+                    errors.append(f"Row {row_num} ({part}): VF {vf} outside band "
+                                  f"{vf_band[0]:.2f}-{vf_band[1]:.2f} for category "
+                                  f"{profile_obj.var_category}. Row skipped.")
+                    continue
+
             new_items.append(dict(
                 part_number = part,
                 description = desc,
                 category    = str(row.get("Category", "") or "").strip(),
                 unit_of_measure = str(row.get("Unit of Measure", "EA") or "EA").strip(),
+                item_type   = item_type,
+                buffer_profile_id = profile_obj.id if profile_obj else None,
                 adu  = float(row.get("ADU", 0) or 0),
                 dlt  = float(row.get("DLT (days)", 0) or 0),
-                lead_time_factor  = float(row.get("Lead Time Factor", 0.5) or 0.5),
-                variability_factor= float(row.get("Variability Factor", 0.5) or 0.5),
+                lead_time_factor   = ltf,
+                variability_factor = vf,
                 min_order_qty = float(row.get("Min Order Qty", 0) or 0),
                 order_cycle   = float(row.get("Order Cycle (days)", 0) or 0),
+                spike_horizon_days     = _opt_int(row.get("Spike Horizon (days)")),
+                spike_threshold_factor = _opt_float(row.get("Spike Threshold Factor")),
                 on_hand       = float(row.get("On Hand", 0) or 0),
                 unit_cost        = float(row.get("Unit Cost (€)", 0) or 0),
                 ordering_cost    = float(row.get("Ordering Cost (€)", 0) or 0),
@@ -194,11 +288,15 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
             session.add(Item(
                 part_number=d["part_number"], description=d["description"],
                 category=d["category"], unit_of_measure=uom,
+                item_type=d["item_type"],
+                buffer_profile_id=d["buffer_profile_id"],
                 adu=d["adu"], dlt=d["dlt"],
                 lead_time_factor=d["lead_time_factor"],
                 variability_factor=d["variability_factor"],
                 min_order_qty=d["min_order_qty"],
                 order_cycle=d["order_cycle"],
+                spike_horizon_days=d["spike_horizon_days"],
+                spike_threshold_factor=d["spike_threshold_factor"],
                 on_hand=d["on_hand"],
                 unit_cost=d["unit_cost"],
                 ordering_cost=d["ordering_cost"],

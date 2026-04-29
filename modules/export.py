@@ -156,12 +156,16 @@ def _build_params_workbook() -> Workbook:
 
     headers = [
         "Part Number", "Description", "Category", "UoM",
+        "Item Type", "Buffer Profile",
         "ADU", "DLT (days)", "Lead Time Factor", "Variability Factor",
         "Min Order Qty", "Order Cycle (days)",
+        "Spike Horizon (days)", "Spike Threshold Factor",
         "Unit Cost (€)", "Ordering Cost (€)", "Holding Cost %",
         "Red Zone Base", "Red Zone Safety", "Red Zone (TOR)",
         "Yellow Zone", "Green Zone",
         "Top of Red", "Top of Yellow", "Top of Green",
+        "Avg Inventory Target", "Avg Order Freq (days)",
+        "Safety Days", "Avg Active Orders",
     ]
     _write_header_row(ws, headers, row=1)
 
@@ -171,16 +175,24 @@ def _build_params_workbook() -> Workbook:
         items = session.query(Item).order_by(Item.part_number).all()
         for row_idx, item in enumerate(items, start=2):
             z = calculate_zones(item)
+            profile_name = item.buffer_profile.name if item.buffer_profile else ""
             row_data = [
                 item.part_number, item.description, item.category, item.unit_of_measure,
+                item.item_type or "P", profile_name,
                 item.adu, item.dlt, item.lead_time_factor, item.variability_factor,
                 item.min_order_qty, item.order_cycle,
+                item.spike_horizon_days if item.spike_horizon_days else "",
+                item.spike_threshold_factor if item.spike_threshold_factor else "",
                 round(item.unit_cost or 0.0, 2),
                 round(item.ordering_cost or 0.0, 2),
                 round((item.holding_cost_pct or 0.0) * 100, 2),
                 round(z.red_zone_base, 2), round(z.red_zone_safety, 2), round(z.red_zone, 2),
                 round(z.yellow_zone, 2), round(z.green_zone, 2),
                 round(z.top_of_red, 2), round(z.top_of_yellow, 2), round(z.top_of_green, 2),
+                round(z.avg_inventory_target, 2),
+                round(z.avg_order_frequency_days, 2),
+                round(z.safety_days, 2),
+                round(z.avg_active_orders, 2),
             ]
             for col_idx, value in enumerate(row_data, start=1):
                 cell = ws.cell(row=row_idx, column=col_idx, value=value)

@@ -27,7 +27,9 @@ PAGES = {
     "📈 Demand & Supply":            "demand_supply",
     "🏭 Process Designer":           "process_designer",
     "🚦 Replenishment Signals":      "signal_engine",
+    "🚨 Execution Alarms":           "alarms",
     "🛡️ Safety Stock & EOQ":         "safety_stock",
+    "🎛️ Buffer Adjustments":         "buffer_adjustments",
     "📤 Export to Excel":            "export",
 }
 
@@ -74,8 +76,16 @@ elif page_key == "signal_engine":
     from modules.signal_engine import show
     show()
 
+elif page_key == "alarms":
+    from views.alarms import show
+    show()
+
 elif page_key == "safety_stock":
     from modules.safety_stock import show
+    show()
+
+elif page_key == "buffer_adjustments":
+    from modules.buffer_adjustments import show
     show()
 
 elif page_key == "export":

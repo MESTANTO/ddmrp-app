@@ -10,11 +10,27 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 from database.db import get_session, Item, Buffer
-from modules.buffer_engine import recalculate_all_buffers
+from modules.buffer_engine import recalculate_all_buffers, calculate_zones
 
 
 STATUS_COLOR = {"red": "#E74C3C", "yellow": "#F1C40F", "green": "#2ECC71"}
 STATUS_BG = {"red": "#FADBD8", "yellow": "#FDEBD0", "green": "#D5F5E3"}
+
+# Execution colour palette (deck slides 109-118) — distinct from planning colour
+EXEC_COLOR = {
+    "over_tog": "#3498DB",   # blue — excess inventory above TOG
+    "green":    "#2ECC71",
+    "yellow":   "#F1C40F",
+    "red":      "#E74C3C",
+    "dark_red": "#7B241C",   # critical / stockout
+}
+EXEC_LABEL = {
+    "over_tog": "📘 Over-TOG",
+    "green":    "🟢 OK",
+    "yellow":   "🟡 Watch",
+    "red":      "🔴 Critical",
+    "dark_red": "⚫ Stockout",
+}
 
 
 def show():
@@ -39,10 +55,14 @@ def show():
         st.info("No items found. Start in **Material Master** to add items.")
         return
 
-    # Build summary dataframe
+    # Build summary dataframe (with canonical DDMRP KPIs from calculate_zones)
     rows = []
     for item in items:
         buf = buffers.get(item.id)
+        try:
+            z = calculate_zones(item)
+        except Exception:
+            z = None
         rows.append({
             "item_id": item.id,
             "part_number": item.part_number,
@@ -55,6 +75,14 @@ def show():
             "tog": buf.top_of_green if buf else 0.0,
             "suggested_qty": buf.suggested_order_qty if buf else 0.0,
             "last_calc": buf.last_calculated if buf else None,
+            # Execution-side metrics (deck slides 109-118)
+            "buffer_status_pct": (buf.buffer_status_pct or 0.0) if buf else 0.0,
+            "execution_color":  (buf.execution_color or "green") if buf else "green",
+            # Canonical DDMRP KPIs (deck slides 59 / 92)
+            "avg_inv_target":      z.avg_inventory_target     if z else 0.0,
+            "order_freq_days":     z.avg_order_frequency_days if z else 0.0,
+            "safety_days":         z.safety_days              if z else 0.0,
+            "avg_active_orders":   z.avg_active_orders        if z else 0.0,
         })
 
     df = pd.DataFrame(rows)
@@ -64,6 +92,16 @@ def show():
     # -----------------------------------------------------------------------
     st.divider()
     _kpi_row(df)
+
+    # -----------------------------------------------------------------------
+    # Canonical DDMRP KPIs (slide 59 / 92)
+    # -----------------------------------------------------------------------
+    _ddmrp_kpi_row(df)
+
+    # -----------------------------------------------------------------------
+    # Execution view — Buffer Status % (deck slides 109-118)
+    # -----------------------------------------------------------------------
+    _execution_row(df)
 
     # -----------------------------------------------------------------------
     # Buffer Status Board
@@ -106,6 +144,71 @@ def _kpi_row(df: pd.DataFrame):
     c5.metric("Total Reorder Qty", f"{reorder_val:,.0f}")
 
 
+def _ddmrp_kpi_row(df: pd.DataFrame):
+    """
+    Canonical DDMRP fleet-level KPIs (deck slides 59 / 92):
+      - Avg Inventory Target (sum across items) = Σ (Red + Green/2)
+      - Avg Order Frequency (median across items) — Green / ADU
+      - Avg Safety Days (median across items)    — Red / ADU
+      - Avg Active Orders (mean across items)    — Yellow / Green
+    """
+    if df.empty:
+        return
+
+    total_avg_inv = df["avg_inv_target"].sum()
+    valid_freq    = df.loc[df["order_freq_days"]   > 0, "order_freq_days"]
+    valid_safety  = df.loc[df["safety_days"]       > 0, "safety_days"]
+    valid_active  = df.loc[df["avg_active_orders"] > 0, "avg_active_orders"]
+
+    median_freq   = valid_freq.median()   if not valid_freq.empty   else 0.0
+    median_safety = valid_safety.median() if not valid_safety.empty else 0.0
+    mean_active   = valid_active.mean()   if not valid_active.empty else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📦 Avg Inventory Target", f"{total_avg_inv:,.0f} units",
+              help="Σ (Red + Green/2) across all items — DDMRP canonical inventory target")
+    c2.metric("🔁 Median Order Frequency", f"{median_freq:.1f} days",
+              help="Green / ADU — median days between orders across the fleet")
+    c3.metric("🛡️ Median Safety Days", f"{median_safety:.1f} days",
+              help="Red / ADU — median days of safety stock across the fleet")
+    c4.metric("📨 Avg Active Orders", f"{mean_active:.2f}",
+              help="Yellow / Green — mean number of simultaneously open replenishment orders")
+
+
+def _execution_row(df: pd.DataFrame):
+    """
+    Execution-side dashboard row (deck slides 109-118).
+    Shows Buffer Status % distribution across the 5 execution colour bands:
+      over_tog | green | yellow | red | dark_red
+    """
+    if df.empty:
+        return
+
+    counts = df["execution_color"].value_counts().to_dict()
+    n_over = counts.get("over_tog", 0)
+    n_grn  = counts.get("green",    0)
+    n_yel  = counts.get("yellow",   0)
+    n_red  = counts.get("red",      0)
+    n_drk  = counts.get("dark_red", 0)
+
+    valid = df[df["tor"] > 0]
+    avg_pct    = (valid["buffer_status_pct"].mean() * 100) if not valid.empty else 0.0
+    median_pct = (valid["buffer_status_pct"].median() * 100) if not valid.empty else 0.0
+
+    st.divider()
+    st.subheader("Execution View — Buffer Status %")
+    st.caption("On-Hand / Top-of-Red. 100% = at TOR; <50% triggers a Current-Stock alarm.")
+
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("📘 Over-TOG", n_over, help="On-Hand above Top of Green (excess)")
+    c2.metric("🟢 OK",       n_grn)
+    c3.metric("🟡 Watch",    n_yel, help="On-Hand between 50% and 100% of TOR")
+    c4.metric("🔴 Critical", n_red, help="On-Hand below 50% of TOR")
+    c5.metric("⚫ Stockout", n_drk, help="On-Hand <= 0")
+    c6.metric("Avg Status %",    f"{avg_pct:.0f}%")
+    c7.metric("Median Status %", f"{median_pct:.0f}%")
+
+
 # ---------------------------------------------------------------------------
 # Buffer Status Board (card-style)
 # ---------------------------------------------------------------------------
@@ -124,6 +227,12 @@ def _buffer_status_board(df: pd.DataFrame):
             status = r["status"]
             bg = STATUS_BG.get(status, "#F8F9FA")
             emoji = {"red": "🔴", "yellow": "🟡", "green": "🟢"}.get(status, "⚪")
+
+            exec_band = r.get("execution_color", "green")
+            exec_lbl  = EXEC_LABEL.get(exec_band, exec_band)
+            exec_clr  = EXEC_COLOR.get(exec_band, "#888")
+            pct       = (r.get("buffer_status_pct") or 0.0) * 100.0
+
             col.markdown(
                 f"""
                 <div style="background:{bg}; border-radius:8px; padding:12px;
@@ -132,6 +241,7 @@ def _buffer_status_board(df: pd.DataFrame):
                   <span style="font-size:0.8em; color:#555">{r['description'][:30]}</span><br>
                   <span style="font-size:0.9em">NFP: <b>{r['nfp']:.1f}</b></span><br>
                   <span style="font-size:0.8em">TOG: {r['tog']:.1f} | TOR: {r['tor']:.1f}</span><br>
+                  <span style="font-size:0.8em">Status %: <b style="color:{exec_clr}">{pct:.0f}%</b> &middot; {exec_lbl}</span><br>
                   {'<span style="color:#E74C3C; font-size:0.85em"><b>Order: ' + str(round(r["suggested_qty"],1)) + ' units</b></span>' if r["suggested_qty"] > 0 else '<span style="color:#27AE60; font-size:0.85em">No action needed</span>'}
                 </div>
                 """,

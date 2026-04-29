@@ -30,6 +30,38 @@ STATUS_COLOR = {"red": "#E74C3C", "yellow": "#F39C12", "green": "#27AE60"}
 STATUS_BG    = {"red": "#FADBD8", "yellow": "#FDEBD0", "green": "#D5F5E3"}
 STATUS_EMOJI = {"red": "🔴",      "yellow": "🟡",      "green": "🟢"}
 
+# Execution-side colour bands (deck slides 109-118)
+EXEC_EMOJI = {
+    "over_tog": "📘",
+    "green":    "🟢",
+    "yellow":   "🟡",
+    "red":      "🔴",
+    "dark_red": "⚫",
+}
+EXEC_LABEL = {
+    "over_tog": "Over-TOG",
+    "green":    "OK",
+    "yellow":   "Watch",
+    "red":      "Critical",
+    "dark_red": "Stockout",
+}
+
+
+def _execution_band(on_hand: float, tor: float, tog: float) -> str:
+    """Compute the 5-band execution colour from on-hand, TOR, TOG."""
+    if tor <= 0:
+        return "green"
+    if tog > 0 and on_hand > tog:
+        return "over_tog"
+    pct = on_hand / tor
+    if pct < 0:
+        return "dark_red"
+    if pct < 0.50:
+        return "red"
+    if pct < 1.00:
+        return "yellow"
+    return "green"
+
 
 def show():
     st.header("Replenishment Signals")
@@ -206,17 +238,23 @@ def _signal_table(signals):
     rows = []
     for s in signals:
         urgency = _urgency(s, today)
+        tor_v = s.zones.top_of_red   if s.zones else 0.0
+        tog_v = s.zones.top_of_green if s.zones else 0.0
+        exec_band = _execution_band(s.today_on_hand, tor_v, tog_v)
+        status_pct = (s.today_on_hand / tor_v * 100.0) if tor_v > 0 else 0.0
         rows.append({
             "_urgency":        urgency,
             "Status":          f"{STATUS_EMOJI.get(s.today_status,'⚪')} {s.today_status.upper()}",
+            "Exec":            f"{EXEC_EMOJI.get(exec_band,'⚪')} {EXEC_LABEL.get(exec_band, exec_band)}",
+            "Status %":        f"{status_pct:.0f}%",
             "Part Number":     s.part_number,
             "Description":     s.description,
             "NFP Today":       s.today_nfp,
             "On Hand":         s.today_on_hand,
             "On Order":        s.today_on_order,
-            "TOR":             round(s.zones.top_of_red, 1)    if s.zones else "—",
+            "TOR":             round(tor_v, 1) if s.zones else "—",
             "TOY":             round(s.zones.top_of_yellow, 1) if s.zones else "—",
-            "TOG":             round(s.zones.top_of_green, 1)  if s.zones else "—",
+            "TOG":             round(tog_v, 1) if s.zones else "—",
             "First Trigger":   s.trigger_date.strftime("%Y-%m-%d") if s.trigger_date else "—",
             "📅 Order By":     s.order_by_date.strftime("%Y-%m-%d") if s.order_by_date else "—",
             "📦 Receipt":      s.receipt_date.strftime("%Y-%m-%d") if s.receipt_date else "—",

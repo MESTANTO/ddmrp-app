@@ -5,13 +5,54 @@ Allows users to create, view, edit, and delete items with DDMRP parameters.
 
 import streamlit as st
 import pandas as pd
-from database.db import get_session, Item
+from database.db import get_session, Item, BufferProfile
 from modules.buffer_engine import calculate_zones
 from modules.importer import render_import_widget, build_material_template, import_materials
 from modules.param_calculator import (
     calculate_params, calculate_all_params,
     apply_params, apply_all_params, CalcParams,
 )
+
+
+# ---------------------------------------------------------------------------
+# DDMRP Buffer Profile bands (deck slides 51-54)
+# ---------------------------------------------------------------------------
+
+ITEM_TYPES = ["M", "I", "P", "D"]
+ITEM_TYPE_LABELS = {
+    "M": "M — Manufactured (finished)",
+    "I": "I — Intermediate (semi-finished)",
+    "P": "P — Purchased",
+    "D": "D — Distributed",
+}
+
+LTF_BANDS = {  # (lo_inclusive, hi_inclusive)
+    "S": (0.61, 1.00),
+    "M": (0.41, 0.60),
+    "L": (0.20, 0.40),
+}
+VF_BANDS = {
+    "L": (0.00, 0.40),
+    "M": (0.41, 0.60),
+    "H": (0.61, 1.00),
+}
+
+
+def _validate_band(value: float, band: tuple, name: str) -> bool:
+    lo, hi = band
+    if value is None:
+        return True
+    return lo <= float(value) <= hi
+
+
+def _load_profiles() -> dict:
+    """Return mapping {profile_name: BufferProfile} for selectbox use."""
+    session = get_session()
+    try:
+        profs = session.query(BufferProfile).order_by(BufferProfile.name).all()
+        return {p.name: p for p in profs}
+    finally:
+        session.close()
 
 
 def show():
@@ -66,6 +107,8 @@ def _show_item_list():
             "Description": it.description,
             "Category": it.category,
             "UoM": it.unit_of_measure,
+            "Type": it.item_type or "P",
+            "Profile": it.buffer_profile.name if it.buffer_profile else "",
             "ADU": it.adu,
             "DLT (days)": it.dlt,
             "LT Factor": it.lead_time_factor,
@@ -79,6 +122,7 @@ def _show_item_list():
             "TOG": round(zones.top_of_green, 2),
             "TOY": round(zones.top_of_yellow, 2),
             "TOR": round(zones.top_of_red, 2),
+            "Avg Inv Target": round(zones.avg_inventory_target, 2),
         })
 
     df = pd.DataFrame(rows)
@@ -91,6 +135,9 @@ def _show_item_list():
 # ---------------------------------------------------------------------------
 
 def _show_add_item():
+    profiles = _load_profiles()
+    profile_options = ["(none — manual LTF/VF)"] + list(profiles.keys())
+
     with st.form("add_item_form", clear_on_submit=True):
         st.subheader("New Item")
         col1, col2 = st.columns(2)
@@ -101,6 +148,19 @@ def _show_add_item():
             category = st.text_input("Category", placeholder="e.g. Raw Material")
             uom = st.selectbox("Unit of Measure", ["EA", "KG", "LT", "M", "MT", "PC"])
             on_hand = st.number_input("Current On-Hand Qty", min_value=0.0, value=0.0, step=1.0)
+            item_type = st.selectbox(
+                "DDMRP Item Type",
+                options=ITEM_TYPES,
+                index=ITEM_TYPES.index("P"),
+                format_func=lambda k: ITEM_TYPE_LABELS[k],
+                help="Slide 50: M=Manufactured, I=Intermediate, P=Purchased, D=Distributed.",
+            )
+            profile_name = st.selectbox(
+                "Buffer Profile",
+                options=profile_options,
+                help=("Slides 50-54 — Item Type x Lead Time category x Variability category. "
+                      "Selecting a profile auto-fills LTF/VF inside its canonical band."),
+            )
 
         with col2:
             adu = st.number_input(
@@ -115,18 +175,31 @@ def _show_add_item():
                 "Lead Time Factor (LTF)",
                 options=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0],
                 index=4,
-                help="0.5 = medium variability (standard). Lower = low variability, higher = high."
+                help="LTF bands: L=0.20-0.40, M=0.41-0.60, S=0.61-1.0."
             )
             vf = st.selectbox(
                 "Variability Factor (VF)",
-                options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+                options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0],
                 index=5,
-                help="Controls the safety portion of the Red Zone. 0 = no safety, 0.5 = standard."
+                help="VF bands: L=0.0-0.40, M=0.41-0.60, H=0.61-1.0."
             )
             moq = st.number_input("Minimum Order Quantity (MOQ)", min_value=0.0, value=0.0, step=1.0)
             order_cycle = st.number_input(
                 "Order Cycle (days)", min_value=0.0, value=0.0, step=1.0,
                 help="How frequently you place orders. Used in Green Zone calculation."
+            )
+
+        st.markdown("**📈 ASOH Parameters** (Adjusted Spike Horizon, deck slide 83 — optional)")
+        as1, as2 = st.columns(2)
+        with as1:
+            spike_horizon = st.number_input(
+                "Spike Horizon (days)", min_value=0, value=0, step=1,
+                help="Days ahead in which qualifying demand spikes are detected. 0 → defaults to DLT.",
+            )
+        with as2:
+            spike_factor = st.number_input(
+                "Spike Threshold Factor (× ADU)", min_value=0.0, value=0.0, step=0.1,
+                help="A demand entry above (factor × ADU) becomes a spike. 0 → use global default (2.0).",
             )
 
         st.markdown("**💰 Cost Parameters** (optional — for Safety Stock & EOQ)")
@@ -154,6 +227,20 @@ def _show_add_item():
             st.error("Part Number and Description are required.")
             return
 
+        # Resolve buffer profile + validate LTF / VF bands
+        chosen_profile = profiles.get(profile_name) if profile_name in profiles else None
+        if chosen_profile is not None:
+            ltf_band = LTF_BANDS.get(chosen_profile.lt_category)
+            vf_band  = VF_BANDS.get(chosen_profile.var_category)
+            if ltf_band and not _validate_band(ltf, ltf_band, "LTF"):
+                st.error(f"LTF {ltf} is outside the band for category {chosen_profile.lt_category} "
+                         f"(allowed {ltf_band[0]:.2f}-{ltf_band[1]:.2f}).")
+                return
+            if vf_band and not _validate_band(vf, vf_band, "VF"):
+                st.error(f"VF {vf} is outside the band for category {chosen_profile.var_category} "
+                         f"(allowed {vf_band[0]:.2f}-{vf_band[1]:.2f}).")
+                return
+
         session = get_session()
         try:
             existing = session.query(Item).filter_by(part_number=part_number.strip().upper()).first()
@@ -166,6 +253,8 @@ def _show_add_item():
                 description=description.strip(),
                 category=category.strip(),
                 unit_of_measure=uom,
+                item_type=item_type,
+                buffer_profile_id=chosen_profile.id if chosen_profile else None,
                 on_hand=on_hand,
                 adu=adu,
                 dlt=dlt,
@@ -173,6 +262,8 @@ def _show_add_item():
                 variability_factor=vf,
                 min_order_qty=moq,
                 order_cycle=order_cycle,
+                spike_horizon_days=int(spike_horizon) if spike_horizon else None,
+                spike_threshold_factor=float(spike_factor) if spike_factor else None,
                 unit_cost=unit_cost,
                 ordering_cost=ordering_cost,
                 holding_cost_pct=holding_pct / 100.0,
@@ -211,6 +302,9 @@ def _show_edit_item():
     selected_label = st.selectbox("Select Item", list(item_options.keys()))
     selected_id = item_options[selected_label]
 
+    profiles = _load_profiles()
+    profile_options = ["(none — manual LTF/VF)"] + list(profiles.keys())
+
     session = get_session()
     try:
         item = session.query(Item).get(selected_id)
@@ -226,6 +320,21 @@ def _show_edit_item():
                                    index=["EA", "KG", "LT", "M", "MT", "PC"].index(item.unit_of_measure)
                                    if item.unit_of_measure in ["EA", "KG", "LT", "M", "MT", "PC"] else 0)
                 on_hand = st.number_input("On-Hand Qty", value=float(item.on_hand), step=1.0)
+                cur_type = item.item_type if item.item_type in ITEM_TYPES else "P"
+                item_type = st.selectbox(
+                    "DDMRP Item Type",
+                    options=ITEM_TYPES,
+                    index=ITEM_TYPES.index(cur_type),
+                    format_func=lambda k: ITEM_TYPE_LABELS[k],
+                )
+                cur_profile_name = item.buffer_profile.name if item.buffer_profile else "(none — manual LTF/VF)"
+                profile_idx = profile_options.index(cur_profile_name) if cur_profile_name in profile_options else 0
+                profile_name = st.selectbox(
+                    "Buffer Profile",
+                    options=profile_options,
+                    index=profile_idx,
+                    help="Slides 50-54. Selecting a profile validates LTF/VF against the band on save.",
+                )
 
             with col2:
                 adu = st.number_input("ADU", value=float(item.adu), step=1.0)
@@ -235,13 +344,28 @@ def _show_edit_item():
                                    ltf_options,
                                    index=ltf_options.index(item.lead_time_factor)
                                    if item.lead_time_factor in ltf_options else 4)
-                vf_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+                vf_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
                 vf = st.selectbox("Variability Factor",
                                   vf_options,
                                   index=vf_options.index(item.variability_factor)
                                   if item.variability_factor in vf_options else 5)
                 moq = st.number_input("MOQ", value=float(item.min_order_qty), step=1.0)
                 order_cycle = st.number_input("Order Cycle (days)", value=float(item.order_cycle), step=1.0)
+
+            st.markdown("**📈 ASOH Parameters** (Adjusted Spike Horizon, slide 83 — optional)")
+            as1, as2 = st.columns(2)
+            with as1:
+                spike_horizon = st.number_input(
+                    "Spike Horizon (days)", min_value=0, step=1,
+                    value=int(item.spike_horizon_days) if item.spike_horizon_days else 0,
+                    help="0 → defaults to DLT.",
+                )
+            with as2:
+                spike_factor = st.number_input(
+                    "Spike Threshold Factor (× ADU)", min_value=0.0, step=0.1,
+                    value=float(item.spike_threshold_factor) if item.spike_threshold_factor else 0.0,
+                    help="0 → use global default (2.0).",
+                )
 
             st.markdown("**💰 Cost Parameters** (optional — for Safety Stock & EOQ)")
             cc1, cc2, cc3 = st.columns(3)
@@ -268,12 +392,28 @@ def _show_edit_item():
             delete = col_delete.form_submit_button("Delete Item", type="secondary")
 
         if save:
+            # Validate LTF/VF against profile bands
+            chosen_profile = profiles.get(profile_name) if profile_name in profiles else None
+            if chosen_profile is not None:
+                ltf_band = LTF_BANDS.get(chosen_profile.lt_category)
+                vf_band  = VF_BANDS.get(chosen_profile.var_category)
+                if ltf_band and not _validate_band(ltf, ltf_band, "LTF"):
+                    st.error(f"LTF {ltf} is outside the band for category {chosen_profile.lt_category} "
+                             f"(allowed {ltf_band[0]:.2f}-{ltf_band[1]:.2f}).")
+                    return
+                if vf_band and not _validate_band(vf, vf_band, "VF"):
+                    st.error(f"VF {vf} is outside the band for category {chosen_profile.var_category} "
+                             f"(allowed {vf_band[0]:.2f}-{vf_band[1]:.2f}).")
+                    return
+
             session2 = get_session()
             try:
                 it = session2.query(Item).get(selected_id)
                 it.description = description
                 it.category = category
                 it.unit_of_measure = uom
+                it.item_type = item_type
+                it.buffer_profile_id = chosen_profile.id if chosen_profile else None
                 it.on_hand = on_hand
                 it.adu = adu
                 it.dlt = dlt
@@ -281,6 +421,8 @@ def _show_edit_item():
                 it.variability_factor = vf
                 it.min_order_qty = moq
                 it.order_cycle = order_cycle
+                it.spike_horizon_days = int(spike_horizon) if spike_horizon else None
+                it.spike_threshold_factor = float(spike_factor) if spike_factor else None
                 it.unit_cost = unit_cost
                 it.ordering_cost = ordering_cost
                 it.holding_cost_pct = holding_pct / 100.0
