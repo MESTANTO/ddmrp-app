@@ -96,7 +96,9 @@ class Item(Base):
     demand_entries = relationship("DemandEntry", back_populates="item", cascade="all, delete")
     supply_entries = relationship("SupplyEntry", back_populates="item", cascade="all, delete")
     buffer = relationship("Buffer", back_populates="item", uselist=False, cascade="all, delete")
-    process_nodes = relationship("ProcessNode", back_populates="item")
+    process_nodes    = relationship("ProcessNode", back_populates="item",
+                                    foreign_keys="ProcessNode.item_id")
+    node_memberships = relationship("ProcessNodeItem", back_populates="item")
     buffer_profile = relationship("BufferProfile", back_populates="items")
 
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -283,7 +285,7 @@ class ProcessNode(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     process_id = Column(Integer, ForeignKey("processes.id"), nullable=False)
-    item_id = Column(Integer, ForeignKey("items.id"), nullable=True)
+    item_id = Column(Integer, ForeignKey("items.id"), nullable=True)   # legacy — kept for migration
     label = Column(String, nullable=False)
     node_type = Column(String, default="operation")
     has_buffer = Column(Boolean, default=False)
@@ -292,11 +294,25 @@ class ProcessNode(Base):
     sequence = Column(Integer, default=0)
 
     process = relationship("Process", back_populates="nodes")
-    item = relationship("Item", back_populates="process_nodes")
+    item = relationship("Item", back_populates="process_nodes", foreign_keys=[item_id])
+    node_items = relationship("ProcessNodeItem", back_populates="node",
+                              cascade="all, delete-orphan")
     outgoing_edges = relationship("ProcessEdge", foreign_keys="ProcessEdge.source_id",
                                   back_populates="source", cascade="all, delete")
     incoming_edges = relationship("ProcessEdge", foreign_keys="ProcessEdge.target_id",
                                   back_populates="target", cascade="all, delete")
+
+
+class ProcessNodeItem(Base):
+    """Many-to-many: one ProcessNode can reference multiple Items."""
+    __tablename__ = "process_node_items"
+
+    id      = Column(Integer, primary_key=True, autoincrement=True)
+    node_id = Column(Integer, ForeignKey("process_nodes.id"), nullable=False)
+    item_id = Column(Integer, ForeignKey("items.id"), nullable=False)
+
+    node = relationship("ProcessNode", back_populates="node_items")
+    item = relationship("Item", back_populates="node_memberships")
 
 
 class ProcessEdge(Base):
@@ -335,6 +351,7 @@ def init_db():
     _migrate_buffer_columns()
     _migrate_item_columns()
     _migrate_bom_columns()
+    _migrate_process_node_items()
     # Seed reference data
     _seed_buffer_profiles()
     _seed_settings()
@@ -355,6 +372,27 @@ def _migrate_buffer_columns():
 def _migrate_bom_columns():
     """bom_lines is created by create_all; no extra columns to migrate yet."""
     pass  # placeholder — keeps the pattern consistent if columns are added later
+
+
+def _migrate_process_node_items():
+    """
+    process_node_items is created by create_all.
+    This function migrates any existing ProcessNode.item_id (legacy single FK)
+    into the new junction table (idempotent).
+    """
+    session = SessionLocal()
+    try:
+        nodes = session.query(ProcessNode).filter(ProcessNode.item_id.isnot(None)).all()
+        for node in nodes:
+            exists = session.query(ProcessNodeItem).filter_by(
+                node_id=node.id, item_id=node.item_id).first()
+            if not exists:
+                session.add(ProcessNodeItem(node_id=node.id, item_id=node.item_id))
+        session.commit()
+    except Exception:
+        session.rollback()
+    finally:
+        session.close()
 
 
 def _migrate_item_columns():

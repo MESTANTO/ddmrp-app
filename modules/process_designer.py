@@ -1,14 +1,16 @@
 """
 Manufacturing Process Designer — Streamlit page.
 Users define a process flow (sequence of operations/materials),
-link items to nodes, and mark which nodes have a DDMRP buffer (decoupling points).
+assign **one or more items** to each node, and mark which nodes
+have a DDMRP buffer (decoupling points).
 
-Two key behaviours (per DDMRP methodology):
-  1. Marking a node as "has_buffer = True" auto-creates the Buffer row for the
-     linked item, making it a real decoupling point in the buffer engine.
-  2. The process map is visualised as a strict top-down tree (Sugiyama-style
+Key behaviours:
+  1. Each node can be linked to multiple Items via ProcessNodeItem.
+  2. Marking a node as "has_buffer = True" auto-creates a Buffer row for
+     every linked item, activating them as decoupling points.
+  3. The process map is visualised as a strict top-down tree (Sugiyama-style
      hierarchical layout) so the manufacturing flow direction is always clear.
-     Edges carry the item's DLT so you can see cumulative lead-time per path.
+     Edge labels show the max DLT of the source node's items.
 """
 
 import streamlit as st
@@ -17,7 +19,9 @@ import plotly.graph_objects as go
 import networkx as nx
 from datetime import datetime
 
-from database.db import get_session, Item, Buffer, Process, ProcessNode, ProcessEdge
+from database.db import (
+    get_session, Item, Buffer, Process, ProcessNode, ProcessEdge, ProcessNodeItem
+)
 from modules.importer import render_import_widget, build_process_template, import_process_nodes
 
 
@@ -28,10 +32,10 @@ from modules.importer import render_import_widget, build_process_template, impor
 def show():
     st.header("Manufacturing Process Designer")
     st.caption(
-        "Define your manufacturing flow, assign items to each step, "
+        "Define your manufacturing flow, assign **one or more items** to each step, "
         "and mark **decoupling points** where DDMRP buffers will be placed. "
-        "Marking a node as a buffer **automatically creates the Buffer record** "
-        "for the linked item."
+        "Marking a node as a buffer **automatically creates Buffer records** "
+        "for all linked items."
     )
 
     render_import_widget(
@@ -57,7 +61,7 @@ def show():
 
 
 # ---------------------------------------------------------------------------
-# Buffer auto-creation helper
+# Buffer auto-creation helpers
 # ---------------------------------------------------------------------------
 
 def _ensure_buffer_for_item(item_id: int) -> bool:
@@ -80,18 +84,25 @@ def _ensure_buffer_for_item(item_id: int) -> bool:
         session.close()
 
 
-def _remove_buffer_for_item(item_id: int):
-    """Remove the Buffer row for item_id (when has_buffer is un-ticked)."""
+def _ensure_buffers_for_node(node_id: int) -> tuple[int, int]:
+    """
+    Ensure Buffer rows exist for every item linked to node_id.
+    Returns (created_count, already_existed_count).
+    """
     session = get_session()
     try:
-        buf = session.query(Buffer).filter_by(item_id=item_id).first()
-        if buf:
-            session.delete(buf)
-            session.commit()
-    except Exception:
-        session.rollback()
+        pnis = session.query(ProcessNodeItem).filter_by(node_id=node_id).all()
+        item_ids = [pni.item_id for pni in pnis]
     finally:
         session.close()
+
+    created = already = 0
+    for iid in item_ids:
+        if _ensure_buffer_for_item(iid):
+            created += 1
+        else:
+            already += 1
+    return created, already
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +196,17 @@ def _design_process():
     try:
         proc = session.query(Process).get(process_id)
         nodes = sorted(proc.nodes, key=lambda n: n.sequence)
-        node_list = [{"ID": n.id, "Seq": n.sequence, "Label": n.label,
-                      "Type": n.node_type,
-                      "Buffer": "✅ YES" if n.has_buffer else "—",
-                      "Item": n.item.part_number if n.item else "—"} for n in nodes]
+        node_list = []
+        for n in nodes:
+            parts = ", ".join(pni.item.part_number for pni in n.node_items if pni.item) or "—"
+            node_list.append({
+                "ID":     n.id,
+                "Seq":    n.sequence,
+                "Label":  n.label,
+                "Type":   n.node_type,
+                "Buffer": "✅ YES" if n.has_buffer else "—",
+                "Items":  parts,
+            })
         edges = proc.edges
         edge_list = [{"Edge ID": e.id, "From": e.source.label, "To": e.target.label}
                      for e in edges]
@@ -209,68 +227,74 @@ def _design_process():
 
         session = get_session()
         try:
-            items = session.query(Item).order_by(Item.part_number).all()
-            item_options = {"— None —": None}
-            item_options.update({f"{it.part_number} — {it.description}": it.id
-                                  for it in items})
+            all_items = session.query(Item).order_by(Item.part_number).all()
+            item_label_to_id = {f"{it.part_number} — {it.description}": it.id
+                                for it in all_items}
         finally:
             session.close()
 
         with st.form(f"add_node_{process_id}", clear_on_submit=True):
-            label      = st.text_input("Node Label *", placeholder="e.g. Cut & Weld")
-            node_type  = st.selectbox("Node Type",
-                                      ["operation", "material", "buffer"],
-                                      help="operation = process step; material = item/component; "
-                                           "buffer = explicit buffer marker")
-            item_label = st.selectbox("Linked Item (optional)", list(item_options.keys()))
+            label     = st.text_input("Node Label *", placeholder="e.g. Cut & Weld")
+            node_type = st.selectbox("Node Type",
+                                     ["operation", "material", "buffer"],
+                                     help="operation = process step; material = item/component; "
+                                          "buffer = explicit buffer marker")
+            item_labels = st.multiselect(
+                "Linked Items (select one or more)",
+                list(item_label_to_id.keys()),
+                help="Assign all items that are produced, consumed, or stocked at this step.",
+            )
             has_buffer = st.checkbox(
                 "Place DDMRP Buffer here (decoupling point)",
-                help="Ticking this will automatically create a Buffer record for the "
-                     "linked item, activating it as a decoupling point in the buffer engine.",
+                help="Automatically creates a Buffer record for every linked item.",
             )
-            sequence   = st.number_input("Sequence (order in process)",
-                                         min_value=0, value=len(node_list), step=1)
-            add_node   = st.form_submit_button("Add Node", type="primary")
+            sequence  = st.number_input("Sequence (order in process)",
+                                        min_value=0, value=len(node_list), step=1)
+            add_node  = st.form_submit_button("Add Node", type="primary")
 
         if add_node:
             if not label.strip():
                 st.error("Label is required.")
             else:
-                item_id = item_options[item_label]
                 session = get_session()
                 try:
                     node = ProcessNode(
                         process_id=process_id,
-                        item_id=item_id,
                         label=label.strip(),
                         node_type=node_type,
                         has_buffer=has_buffer,
-                        sequence=sequence,
+                        sequence=int(sequence),
                     )
                     session.add(node)
+                    session.flush()  # get node.id before adding children
+
+                    # Create ProcessNodeItem rows for every selected item
+                    for lbl in item_labels:
+                        iid = item_label_to_id[lbl]
+                        session.add(ProcessNodeItem(node_id=node.id, item_id=iid))
+
                     session.commit()
 
-                    # ── Auto-create Buffer row when decoupling point is marked ──
-                    if has_buffer and item_id:
-                        created = _ensure_buffer_for_item(item_id)
-                        if created:
-                            st.info(
-                                f"✅ Buffer record created for **{item_label.split(' — ')[0]}**. "
-                                "Run **Replenishment Signals** to calculate zone sizes."
-                            )
-                        else:
-                            st.info(
-                                f"Buffer record already exists for **{item_label.split(' — ')[0]}**."
-                            )
-                    st.success(f"Node **{label}** added.")
+                    # Auto-create Buffer rows if decoupling point
+                    if has_buffer and item_labels:
+                        created, already = _ensure_buffers_for_node(node.id)
+                        st.info(
+                            f"✅ Buffer records — {created} created, {already} already existed. "
+                            "Run **Replenishment Signals** to calculate zone sizes."
+                        )
+
+                    st.success(f"Node **{label}** added with {len(item_labels)} item(s).")
                     st.rerun()
+                except Exception as exc:
+                    session.rollback()
+                    st.error(f"Error saving node: {exc}")
                 finally:
                     session.close()
 
-        # ── Toggle has_buffer on existing nodes ──
+        # ── Toggle buffer / manage items / remove node ──
         if node_list:
             st.divider()
-            st.markdown("**Toggle Buffer / Remove Node**")
+            st.markdown("**Manage Existing Node**")
 
             session = get_session()
             try:
@@ -288,6 +312,50 @@ def _design_process():
                                           key="sel_node_action")
             sel_node_id = node_del_opts[sel_node_label]
 
+            # ── Assign items to node ──
+            st.markdown("**Assign Items to this Node**")
+            session = get_session()
+            try:
+                current_iids = {pni.item_id for pni in
+                                session.query(ProcessNodeItem).filter_by(node_id=sel_node_id).all()}
+                all_items = session.query(Item).order_by(Item.part_number).all()
+                item_label_to_id2 = {f"{it.part_number} — {it.description}": it.id
+                                     for it in all_items}
+                current_labels = [lbl for lbl, iid in item_label_to_id2.items()
+                                  if iid in current_iids]
+            finally:
+                session.close()
+
+            new_labels = st.multiselect(
+                "Items assigned to this node",
+                list(item_label_to_id2.keys()),
+                default=current_labels,
+                key="node_items_sel",
+            )
+            if st.button("💾 Save Item Assignment", key="save_items_btn"):
+                new_iids = {item_label_to_id2[lbl] for lbl in new_labels}
+                session = get_session()
+                try:
+                    # Remove de-selected items
+                    for pni in session.query(ProcessNodeItem).filter_by(node_id=sel_node_id).all():
+                        if pni.item_id not in new_iids:
+                            session.delete(pni)
+                    # Add newly selected items
+                    existing_iids = {pni.item_id for pni in
+                                     session.query(ProcessNodeItem).filter_by(node_id=sel_node_id).all()}
+                    for iid in new_iids:
+                        if iid not in existing_iids:
+                            session.add(ProcessNodeItem(node_id=sel_node_id, item_id=iid))
+                    session.commit()
+                    st.success("Item assignment saved.")
+                    st.rerun()
+                except Exception as exc:
+                    session.rollback()
+                    st.error(f"Error: {exc}")
+                finally:
+                    session.close()
+
+            st.divider()
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button("🔄 Toggle Buffer", key="toggle_buf_btn"):
@@ -296,24 +364,23 @@ def _design_process():
                         n = session.query(ProcessNode).get(sel_node_id)
                         n.has_buffer = not n.has_buffer
                         session.commit()
-                        if n.has_buffer and n.item_id:
-                            created = _ensure_buffer_for_item(n.item_id)
-                            msg = "created" if created else "already existed"
-                            st.success(
-                                f"Buffer {'enabled' if n.has_buffer else 'disabled'} "
-                                f"on **{n.label}**. Buffer record {msg}."
-                            )
-                        elif not n.has_buffer and n.item_id:
-                            st.info(
-                                f"Buffer disabled on **{n.label}**. "
-                                "The Buffer record is kept — delete it manually in Material Master "
-                                "if this item should no longer be a decoupling point."
-                            )
-                        else:
-                            st.success(f"Buffer toggled on **{n.label}**.")
-                        st.rerun()
                     finally:
                         session.close()
+
+                    if n.has_buffer:
+                        created, already = _ensure_buffers_for_node(sel_node_id)
+                        st.success(
+                            f"Buffer enabled on **{n.label}**. "
+                            f"{created} Buffer record(s) created, {already} already existed."
+                        )
+                    else:
+                        st.info(
+                            f"Buffer disabled on **{n.label}**. "
+                            "Existing Buffer records are kept — remove them manually in "
+                            "Material Master if those items should no longer be decoupling points."
+                        )
+                    st.rerun()
+
             with col_b:
                 if st.button("🗑️ Remove Node", key="del_node_btn"):
                     session = get_session()
@@ -423,12 +490,14 @@ def _view_process_map():
     try:
         proc = session.query(Process).get(process_id)
         nodes = sorted(proc.nodes, key=lambda n: n.sequence)
-        node_data = [
-            (n.id, n.label, n.node_type, n.has_buffer,
-             n.item.part_number if n.item else None,
-             n.item.dlt if n.item else 0.0)
-            for n in nodes
-        ]
+        # node_data: (id, label, ntype, has_buffer, [(part_number, dlt), ...])
+        node_data = []
+        for n in nodes:
+            items_info = [
+                (pni.item.part_number, pni.item.dlt or 0.0)
+                for pni in n.node_items if pni.item
+            ]
+            node_data.append((n.id, n.label, n.node_type, n.has_buffer, items_info))
         edge_data = [(e.source_id, e.target_id) for e in proc.edges]
     finally:
         session.close()
@@ -445,16 +514,19 @@ def _view_process_map():
 
     st.caption(
         "🟦 Operation  |  🟩 Buffer / decoupling point  |  🟨 Material  "
-        "— Flow runs **top → bottom**. Edge numbers = item DLT (days)."
+        "— Flow runs **top → bottom**. Edge numbers = max item DLT at source node (days)."
     )
 
     # Buffer summary table
-    buf_nodes = [(label, part, dlt) for _, label, _, has_buf, part, dlt in node_data if has_buf]
+    buf_nodes = []
+    for _, label, _, has_buf, items_info in node_data:
+        if has_buf:
+            for part, dlt in items_info:
+                buf_nodes.append({"Node": label, "Part Number": part, "Item DLT (days)": dlt})
     if buf_nodes:
         st.divider()
         st.subheader("Decoupling Points in this Process")
-        st.dataframe(pd.DataFrame(buf_nodes, columns=["Node", "Part Number", "Item DLT (days)"]),
-                     use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(buf_nodes), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -467,37 +539,28 @@ def _hierarchical_layout(G: nx.DiGraph) -> dict:
     level assignment:
       - Level 0 = source nodes (no incoming edges)
       - Level k = max level of any predecessor + 1
-      - Within each level, nodes are spaced equally on the x-axis
-      - y = -level  (so level-0 is at top, leaves at bottom)
-
-    For disconnected nodes (no edges at all), they are placed at level 0.
+      - Within each level nodes are spaced equally on the x-axis
+      - y = -level  (level-0 is at top, leaves at bottom)
     """
     if not G.nodes:
         return {}
 
-    # Compute levels via longest-path from any source
     levels: dict[int, int] = {}
     for node in nx.topological_sort(G):
         preds = list(G.predecessors(node))
-        if not preds:
-            levels[node] = 0
-        else:
-            levels[node] = max(levels.get(p, 0) for p in preds) + 1
+        levels[node] = 0 if not preds else max(levels.get(p, 0) for p in preds) + 1
 
-    # Group nodes by level
     from collections import defaultdict
     level_groups: dict[int, list] = defaultdict(list)
     for node, lvl in levels.items():
         level_groups[lvl].append(node)
 
-    # Assign x positions: within each level, space nodes at x = 0, 1, 2, ...
-    # Centre each level on x=0 for a symmetric look
     pos = {}
     y_gap = 2.0
     x_gap = 2.5
     for lvl, group in level_groups.items():
         n = len(group)
-        for i, node in enumerate(sorted(group)):   # sort for determinism
+        for i, node in enumerate(sorted(group)):
             x = (i - (n - 1) / 2.0) * x_gap
             y = -lvl * y_gap
             pos[node] = (x, y)
@@ -509,20 +572,25 @@ def _build_tree_graph(node_data, edge_data, show_dlt=True, show_item=True):
     """
     Build a Plotly figure of the process as a top-down tree.
 
-    node_data: list of (id, label, ntype, has_buffer, part_number, dlt)
+    node_data: list of (id, label, ntype, has_buffer, [(part_number, dlt), ...])
     edge_data: list of (src_id, tgt_id)
     """
     G = nx.DiGraph()
     node_meta = {}
-    for nid, label, ntype, has_buf, part, dlt in node_data:
+    for nid, label, ntype, has_buf, items_info in node_data:
         G.add_node(nid)
-        node_meta[nid] = dict(label=label, ntype=ntype,
-                               has_buffer=has_buf, part=part, dlt=dlt or 0.0)
+        max_dlt = max((dlt for _, dlt in items_info), default=0.0)
+        node_meta[nid] = dict(
+            label=label,
+            ntype=ntype,
+            has_buffer=has_buf,
+            items_info=items_info,   # list of (part, dlt)
+            max_dlt=max_dlt,
+        )
     for src, tgt in edge_data:
         if src in node_meta and tgt in node_meta:
             G.add_edge(src, tgt)
 
-    # Handle cycles gracefully (shouldn't happen in valid process, but be safe)
     try:
         pos = _hierarchical_layout(G)
     except nx.NetworkXUnfeasible:
@@ -530,9 +598,9 @@ def _build_tree_graph(node_data, edge_data, show_dlt=True, show_item=True):
 
     # ── Node colours ─────────────────────────────────────────────────────────
     def _color(ntype, has_buf):
-        if has_buf:   return "#27AE60"   # green — buffer / decoupling
+        if has_buf:            return "#27AE60"   # green — buffer / decoupling
         if ntype == "material": return "#F39C12"  # amber — material
-        return "#2980B9"                  # blue — operation
+        return "#2980B9"                           # blue — operation
 
     def _border(has_buf):
         return "#1A5E20" if has_buf else "#1A252F"
@@ -543,26 +611,31 @@ def _build_tree_graph(node_data, edge_data, show_dlt=True, show_item=True):
     colors   = [_color(node_meta[n]["ntype"], node_meta[n]["has_buffer"]) for n in node_ids]
     borders  = [_border(node_meta[n]["has_buffer"]) for n in node_ids]
 
-    # Node label: show item code below process label if requested
     def _node_text(n):
         m = node_meta[n]
         txt = m["label"]
-        if show_item and m["part"]:
-            txt += f"<br><i style='font-size:10px'>{m['part']}</i>"
+        if show_item and m["items_info"]:
+            parts_str = ", ".join(p for p, _ in m["items_info"])
+            txt += f"<br><i style='font-size:10px'>{parts_str}</i>"
         if m["has_buffer"]:
             txt += "<br>🟩 BUFFER"
         return txt
 
     node_labels = [_node_text(n) for n in node_ids]
 
-    hover_texts = [
-        f"<b>{node_meta[n]['label']}</b>"
-        f"{'<br>Part: ' + node_meta[n]['part'] if node_meta[n]['part'] else ''}"
-        f"<br>Type: {node_meta[n]['ntype']}"
-        f"<br>DLT: {node_meta[n]['dlt']:.1f} d"
-        f"{'<br><b>⬛ DECOUPLING POINT</b>' if node_meta[n]['has_buffer'] else ''}"
-        for n in node_ids
-    ]
+    def _hover(n):
+        m = node_meta[n]
+        lines = [f"<b>{m['label']}</b>", f"Type: {m['ntype']}"]
+        if m["items_info"]:
+            for part, dlt in m["items_info"]:
+                lines.append(f"• {part}  (DLT {dlt:.1f} d)")
+        else:
+            lines.append("No items assigned")
+        if m["has_buffer"]:
+            lines.append("<b>⬛ DECOUPLING POINT</b>")
+        return "<br>".join(lines)
+
+    hover_texts = [_hover(n) for n in node_ids]
 
     # ── Edge traces with arrows ───────────────────────────────────────────────
     traces = []
@@ -572,7 +645,6 @@ def _build_tree_graph(node_data, edge_data, show_dlt=True, show_item=True):
         x0, y0 = pos[src]
         x1, y1 = pos[tgt]
 
-        # Slightly offset endpoints so arrow doesn't overlap node circle
         dx, dy = x1 - x0, y1 - y0
         length = (dx**2 + dy**2) ** 0.5 or 1.0
         ux, uy = dx / length, dy / length
@@ -592,19 +664,16 @@ def _build_tree_graph(node_data, edge_data, show_dlt=True, show_item=True):
             showlegend=False,
         ))
 
-        # Arrow head (small marker at target end)
         traces.append(go.Scatter(
             x=[x1e], y=[y1e],
             mode="markers",
-            marker=dict(symbol="arrow", size=10, color=line_color,
-                        angleref="previous"),
+            marker=dict(symbol="arrow", size=10, color=line_color, angleref="previous"),
             hoverinfo="none",
             showlegend=False,
         ))
 
-        # DLT label on edge midpoint
         if show_dlt:
-            src_dlt = node_meta[src]["dlt"]
+            src_dlt = node_meta[src]["max_dlt"]
             if src_dlt > 0:
                 mx, my = (x0 + x1) / 2, (y0 + y1) / 2
                 traces.append(go.Scatter(
