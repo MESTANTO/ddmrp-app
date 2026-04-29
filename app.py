@@ -26,8 +26,11 @@ PAGES = {
     "📋 Material Master":            "material_master",
     "📈 Demand & Supply":            "demand_supply",
     "🏭 Process Designer":           "process_designer",
+    "🧬 BOM & Auto DLT":             "bom_engine",
     "🚦 Replenishment Signals":      "signal_engine",
     "🚨 Execution Alarms":           "alarms",
+    "📐 Prioritized Share":          "share_allocator",
+    "📉 Model Velocity":             "model_velocity",
     "🛡️ Safety Stock & EOQ":         "safety_stock",
     "🎛️ Buffer Adjustments":         "buffer_adjustments",
     "📤 Export to Excel":            "export",
@@ -78,6 +81,18 @@ elif page_key == "signal_engine":
 
 elif page_key == "alarms":
     from views.alarms import show
+    show()
+
+elif page_key == "bom_engine":
+    from modules.bom_engine import show
+    show()
+
+elif page_key == "share_allocator":
+    from modules.share_allocator import show
+    show()
+
+elif page_key == "model_velocity":
+    from views.model_velocity import show
     show()
 
 elif page_key == "safety_stock":

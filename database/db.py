@@ -252,6 +252,29 @@ class Buffer(Base):
 
 
 # ---------------------------------------------------------------------------
+# BOM (Bill of Materials) — used by compute_dlt() in bom_engine.py
+# ---------------------------------------------------------------------------
+
+class BomLine(Base):
+    """
+    One BOM row: parent item (assembly) needs `qty` units of child item per assembly.
+    Used by compute_dlt() to walk upstream paths and find the longest
+    unprotected (non-buffered) lead-time chain (deck slide 26).
+    """
+    __tablename__ = "bom_lines"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    parent_item_id  = Column(Integer, ForeignKey("items.id"), nullable=False)
+    child_item_id   = Column(Integer, ForeignKey("items.id"), nullable=False)
+    qty             = Column(Float, default=1.0)
+    note            = Column(Text, default="")
+    created_at      = Column(DateTime, default=datetime.utcnow)
+
+    parent = relationship("Item", foreign_keys=[parent_item_id])
+    child  = relationship("Item", foreign_keys=[child_item_id])
+
+
+# ---------------------------------------------------------------------------
 # Manufacturing Process Designer
 # ---------------------------------------------------------------------------
 
@@ -311,6 +334,7 @@ def init_db():
     # Add any new columns to existing tables (safe, idempotent, cross-dialect)
     _migrate_buffer_columns()
     _migrate_item_columns()
+    _migrate_bom_columns()
     # Seed reference data
     _seed_buffer_profiles()
     _seed_settings()
@@ -326,6 +350,11 @@ def _migrate_buffer_columns():
         ("buffer_status_pct", "REAL DEFAULT 0.0",        "DOUBLE PRECISION DEFAULT 0.0"),
         ("execution_color",  "TEXT DEFAULT 'green'",     "VARCHAR DEFAULT 'green'"),
     ])
+
+
+def _migrate_bom_columns():
+    """bom_lines is created by create_all; no extra columns to migrate yet."""
+    pass  # placeholder — keeps the pattern consistent if columns are added later
 
 
 def _migrate_item_columns():
