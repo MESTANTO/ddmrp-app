@@ -26,6 +26,16 @@ def show():
         "ADU, DLT, and individual zones (deck slides 73-80)."
     )
 
+    from modules.importer import (render_import_widget,
+                                   build_adjustments_template, import_adjustments)
+    render_import_widget(
+        label="Buffer Adjustments",
+        template_fn=build_adjustments_template,
+        import_fn=import_adjustments,
+        template_filename="DDMRP_Adjustments_Template.xlsx",
+        key="buffer_adj",
+    )
+
     tab_list, tab_add, tab_chart = st.tabs([
         "Adjustments List", "Add Adjustment", "Factor Curves",
     ])

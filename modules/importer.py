@@ -676,6 +676,217 @@ def import_process_nodes(uploaded_file) -> tuple[int, list[str]]:
 # Shared Streamlit UI widget (reusable across pages)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# BOM Lines template + importer
+# ---------------------------------------------------------------------------
+
+BOM_HEADERS = [
+    {"name": "Parent Part Number *", "width": 20},
+    {"name": "Child Part Number *",  "width": 20},
+    {"name": "Qty per Assembly *",   "width": 18},
+    {"name": "Note",                 "width": 28},
+]
+
+BOM_EXAMPLE = ["FG-001", "RM-001", 2.0, "2 units of RM-001 per assembly of FG-001"]
+
+
+def build_bom_template() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "BOM Lines"
+    _add_instructions(ws,
+        "Instructions: Fill from row 4 onward. Row 3 is an example. "
+        "Parent Part Number = the assembly (output item). "
+        "Child Part Number = the component (input item). "
+        "Both part numbers must already exist in Material Master. "
+        "Importing replaces ALL existing BOM lines.",
+        row=1, col_span=len(BOM_HEADERS))
+    _write_header(ws, BOM_HEADERS, row=2)
+    _write_example_row(ws, BOM_EXAMPLE, row=3)
+    ws.freeze_panes = "A4"
+    return _wb_to_bytes(wb)
+
+
+def import_bom(uploaded_file) -> tuple[int, list[str]]:
+    """
+    Replace all BomLine rows with the contents of the uploaded template.
+    Returns (success_count, error_list).
+    """
+    from database.db import get_session, Item, BomLine
+
+    df = _read_uploaded_file(uploaded_file)
+    if df is None:
+        return 0, ["Could not read file — check it uses the official template."]
+
+    session = get_session()
+    errors: list[str] = []
+    count = 0
+    try:
+        # Wipe existing BOM lines
+        session.query(BomLine).delete()
+        session.commit()
+
+        items_by_pn = {it.part_number.strip(): it for it in session.query(Item).all()}
+
+        for i, row in df.iterrows():
+            row_num = i + 4
+            parent_pn = str(row.get("Parent Part Number *", "") or "").strip()
+            child_pn  = str(row.get("Child Part Number *",  "") or "").strip()
+            qty_raw   = row.get("Qty per Assembly *", 1.0)
+
+            if not parent_pn or not child_pn:
+                errors.append(f"Row {row_num}: missing parent or child part number — skipped.")
+                continue
+
+            parent = items_by_pn.get(parent_pn)
+            child  = items_by_pn.get(child_pn)
+            if not parent:
+                errors.append(f"Row {row_num}: parent '{parent_pn}' not in Material Master — skipped.")
+                continue
+            if not child:
+                errors.append(f"Row {row_num}: child '{child_pn}' not in Material Master — skipped.")
+                continue
+            if parent.id == child.id:
+                errors.append(f"Row {row_num}: parent and child are the same item — skipped.")
+                continue
+
+            try:
+                qty = float(qty_raw)
+            except (TypeError, ValueError):
+                qty = 1.0
+
+            note = str(row.get("Note", "") or "").strip()
+            session.add(BomLine(parent_item_id=parent.id, child_item_id=child.id,
+                                qty=qty, note=note))
+            count += 1
+
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        return 0, [f"Import failed: {e}"]
+    finally:
+        session.close()
+
+    return count, errors
+
+
+# ---------------------------------------------------------------------------
+# Buffer Adjustments template + importer
+# ---------------------------------------------------------------------------
+
+ADJ_HEADERS = [
+    {"name": "Part Number *",       "width": 18},
+    {"name": "Start Date * (YYYY-MM-DD)", "width": 22},
+    {"name": "End Date (YYYY-MM-DD)",     "width": 22},
+    {"name": "DAF",                 "width": 10},
+    {"name": "LTAF",                "width": 10},
+    {"name": "Red ZAF",             "width": 10},
+    {"name": "Yellow ZAF",          "width": 12},
+    {"name": "Green ZAF",           "width": 12},
+    {"name": "Note",                "width": 28},
+]
+
+ADJ_EXAMPLE = [
+    "FG-001", "2026-05-01", "2026-06-30",
+    1.3, 1.0, 1.0, 1.0, 1.0,
+    "Summer demand peak — DAF +30%",
+]
+
+
+def build_adjustments_template() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Buffer Adjustments"
+    _add_instructions(ws,
+        "Instructions: Fill from row 4 onward. Row 3 is an example. "
+        "Part Number must exist in Material Master. "
+        "Start Date is required; End Date blank = open-ended. "
+        "DAF = Demand Adjustment Factor (× ADU). LTAF = Lead Time Adjustment Factor (× DLT). "
+        "Red/Yellow/Green ZAF = Zone Adjustment Factors. "
+        "All factors default to 1.0 (neutral). Importing replaces ALL existing adjustments.",
+        row=1, col_span=len(ADJ_HEADERS))
+    _write_header(ws, ADJ_HEADERS, row=2)
+    _write_example_row(ws, ADJ_EXAMPLE, row=3)
+    ws.freeze_panes = "A4"
+    return _wb_to_bytes(wb)
+
+
+def import_adjustments(uploaded_file) -> tuple[int, list[str]]:
+    """
+    Replace all BufferAdjustment rows with the contents of the uploaded template.
+    Returns (success_count, error_list).
+    """
+    from database.db import get_session, Item, BufferAdjustment
+
+    df = _read_uploaded_file(uploaded_file)
+    if df is None:
+        return 0, ["Could not read file — check it uses the official template."]
+
+    session = get_session()
+    errors: list[str] = []
+    count = 0
+    try:
+        session.query(BufferAdjustment).delete()
+        session.commit()
+
+        items_by_pn = {it.part_number.strip(): it for it in session.query(Item).all()}
+
+        for i, row in df.iterrows():
+            row_num = i + 4
+            pn = str(row.get("Part Number *", "") or "").strip()
+            if not pn:
+                errors.append(f"Row {row_num}: missing Part Number — skipped.")
+                continue
+            item = items_by_pn.get(pn)
+            if not item:
+                errors.append(f"Row {row_num}: '{pn}' not in Material Master — skipped.")
+                continue
+
+            start_raw = row.get("Start Date * (YYYY-MM-DD)", "")
+            if not start_raw:
+                errors.append(f"Row {row_num}: missing Start Date — skipped.")
+                continue
+            try:
+                start_dt = datetime.strptime(str(start_raw).strip()[:10], "%Y-%m-%d")
+            except ValueError:
+                errors.append(f"Row {row_num}: invalid Start Date '{start_raw}' — skipped.")
+                continue
+
+            end_raw = row.get("End Date (YYYY-MM-DD)", "")
+            end_dt  = None
+            if end_raw and str(end_raw).strip():
+                try:
+                    end_dt = datetime.strptime(str(end_raw).strip()[:10], "%Y-%m-%d")
+                except ValueError:
+                    errors.append(f"Row {row_num}: invalid End Date '{end_raw}' — using open-ended.")
+
+            def _f(col, default=1.0):
+                try:
+                    v = float(row.get(col, default) or default)
+                    return v if v > 0 else default
+                except (TypeError, ValueError):
+                    return default
+
+            session.add(BufferAdjustment(
+                item_id=item.id,
+                start_date=start_dt,
+                end_date=end_dt,
+                daf=_f("DAF"), ltaf=_f("LTAF"),
+                red_zaf=_f("Red ZAF"), yellow_zaf=_f("Yellow ZAF"), green_zaf=_f("Green ZAF"),
+                note=str(row.get("Note", "") or "").strip(),
+            ))
+            count += 1
+
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        return 0, [f"Import failed: {e}"]
+    finally:
+        session.close()
+
+    return count, errors
+
+
 def render_import_widget(
     label: str,
     template_fn,

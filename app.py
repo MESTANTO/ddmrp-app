@@ -34,6 +34,7 @@ PAGES = {
     "🛡️ Safety Stock & EOQ":         "safety_stock",
     "🎛️ Buffer Adjustments":         "buffer_adjustments",
     "📤 Export to Excel":            "export",
+    "⚙️ Settings":                   "settings",
 }
 
 with st.sidebar:
@@ -105,4 +106,8 @@ elif page_key == "buffer_adjustments":
 
 elif page_key == "export":
     from modules.export import show
+    show()
+
+elif page_key == "settings":
+    from views.settings import show
     show()

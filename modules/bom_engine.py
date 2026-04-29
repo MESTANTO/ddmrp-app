@@ -184,6 +184,15 @@ def show():
         "(DDMRP *Position* step — slide 26)."
     )
 
+    from modules.importer import render_import_widget, build_bom_template, import_bom
+    render_import_widget(
+        label="BOM Lines",
+        template_fn=build_bom_template,
+        import_fn=import_bom,
+        template_filename="DDMRP_BOM_Template.xlsx",
+        key="bom_lines",
+    )
+
     tab_bom, tab_dlt, tab_graph = st.tabs([
         "⚙️ Manage BOM",
         "⏱️ Computed DLT",
