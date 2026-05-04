@@ -1,32 +1,30 @@
 """
 AI Advisor — Streamlit page.
 
-Connects to a locally-running Ollama instance, builds a structured snapshot
-of the current DDMRP database state, and provides a streaming chat interface
-so the user can interrogate data and get suggested actions.
+Uses the NVIDIA NIM API (OpenAI-compatible) to provide a streaming chat
+interface over the current DDMRP database state.
 
-Requirements:
-  • Ollama running locally:  https://ollama.com/download
-  • At least one model pulled: `ollama pull llama3` (or any model you prefer)
-  • Default URL: http://localhost:11434  (configurable in the sidebar)
+Model: deepseek-ai/deepseek-v3-0324 via https://integrate.api.nvidia.com/v1
 
-The page works offline from Streamlit Cloud — it just needs network access
-to your local Ollama instance.
+API key priority:
+  1. Streamlit secret  NVIDIA_API_KEY  (recommended for production)
+  2. Hard-coded fallback below        (fine for local / dev use)
 """
 
-import json
-import requests
 import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
+from statistics import mean, stdev
 
-from database.db import (
-    get_session, Item, Buffer, DemandEntry, SupplyEntry,
-    ProcessNode, BomLine
-)
+from openai import OpenAI
 
-OLLAMA_DEFAULT = "http://localhost:11434"
+from database.db import get_session, Item, Buffer, DemandEntry
+
+# ── API credentials ───────────────────────────────────────────────────────────
+_NVIDIA_BASE  = "https://integrate.api.nvidia.com/v1"
+_NVIDIA_KEY   = "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"
+_MODEL        = "deepseek-ai/deepseek-v3-0324"
+_MAX_TOKENS   = 16384
 
 SYSTEM_PROMPT = """You are an expert DDMRP (Demand Driven MRP) advisor integrated into a supply chain management application.
 
@@ -46,12 +44,12 @@ Format your answers with clear headings and bullet points. Keep responses concis
 """
 
 QUICK_PROMPTS = [
-    ("🚨 Critical items", "Which items need immediate attention right now? Focus on execution alarms and stockout risk."),
-    ("📦 Buffer sizing", "Which buffers are incorrectly sized? Look at items where on-hand is consistently far from the green zone midpoint."),
-    ("📈 ABC-XYZ actions", "Based on the ABC/XYZ classification, what control policy changes do you recommend?"),
-    ("🔄 Replenishment", "Are there items that should have a replenishment order placed today? Explain why."),
-    ("⚠️ Data quality", "What data quality issues do you see? Look for missing costs, zero ADU, missing DLT, etc."),
-    ("📉 Slow movers", "Which items appear to be slow movers or dead stock risks? What should we do with them?"),
+    ("🚨 Critical items",   "Which items need immediate attention right now? Focus on execution alarms and stockout risk."),
+    ("📦 Buffer sizing",    "Which buffers are incorrectly sized? Look at items where on-hand is consistently far from the green zone midpoint."),
+    ("📈 ABC-XYZ actions",  "Based on the ABC/XYZ classification, what control policy changes do you recommend?"),
+    ("🔄 Replenishment",    "Are there items that should have a replenishment order placed today? Explain why."),
+    ("⚠️ Data quality",     "What data quality issues do you see? Look for missing costs, zero ADU, missing DLT, etc."),
+    ("📉 Slow movers",      "Which items appear to be slow movers or dead stock risks? What should we do with them?"),
 ]
 
 
@@ -62,125 +60,111 @@ QUICK_PROMPTS = [
 def show():
     st.header("🤖 AI Advisor")
     st.caption(
-        "Chat with a local LLM (via **Ollama**) about your DDMRP data. "
-        "The model receives a live snapshot of your inventory and can suggest actions."
+        "Chat with **DeepSeek V3** (via NVIDIA NIM API) about your DDMRP data. "
+        "The model receives a live snapshot of your inventory and suggests prioritised actions."
     )
 
-    # ── Sidebar config ────────────────────────────────────────────────────────
+    # ── Resolve API key ───────────────────────────────────────────────────────
+    api_key = _NVIDIA_KEY
+    try:
+        api_key = st.secrets.get("NVIDIA_API_KEY", _NVIDIA_KEY)
+    except Exception:
+        pass
+
+    client = OpenAI(base_url=_NVIDIA_BASE, api_key=api_key)
+
+    # Quick connectivity check
     with st.sidebar:
         st.divider()
-        st.markdown("**🤖 AI Advisor settings**")
-        ollama_url = st.text_input("Ollama URL", value=OLLAMA_DEFAULT, key="ollama_url")
-        model_name = _pick_model(ollama_url)
-        if model_name:
-            st.success(f"Model: `{model_name}`")
+        st.markdown("**🤖 AI Advisor**")
+        st.caption(f"Model: `{_MODEL}`")
+        st.caption("NVIDIA NIM API")
         st.divider()
 
-    if not model_name:
-        st.error(
-            "**Cannot reach Ollama.** Make sure Ollama is running locally:\n\n"
-            "```bash\n# Install: https://ollama.com/download\nollama serve\n"
-            "ollama pull llama3   # or any model you prefer\n```\n\n"
-            f"Then check that `{ollama_url}` is reachable from this browser."
-        )
-        return
-
-    # ── Build context once per session (or on demand) ────────────────────────
-    if "ai_context" not in st.session_state or st.button("🔄 Refresh data snapshot", key="refresh_ctx"):
+    # ── Build context once per session (or on demand) ─────────────────────────
+    if "ai_context" not in st.session_state:
         with st.spinner("Building data snapshot…"):
             st.session_state["ai_context"] = _build_context()
 
-    with st.expander("📋 Current data snapshot sent to the model", expanded=False):
+    col_refresh, col_clear = st.columns([1, 1])
+    with col_refresh:
+        if st.button("🔄 Refresh data snapshot"):
+            with st.spinner("Refreshing…"):
+                st.session_state["ai_context"] = _build_context()
+            st.success("Snapshot updated.")
+
+    with st.expander("📋 Data snapshot sent to the model", expanded=False):
         st.text(st.session_state["ai_context"])
 
-    # ── Chat history ──────────────────────────────────────────────────────────
-    if "ai_messages" not in st.session_state:
-        st.session_state["ai_messages"] = []
-
-    # Quick-action buttons
+    # ── Quick-action buttons ──────────────────────────────────────────────────
     st.markdown("**Quick analyses:**")
-    cols = st.columns(3)
+    btn_cols = st.columns(3)
     for i, (label, prompt) in enumerate(QUICK_PROMPTS):
-        if cols[i % 3].button(label, key=f"quick_{i}", use_container_width=True):
+        if btn_cols[i % 3].button(label, key=f"quick_{i}", use_container_width=True):
+            if "ai_messages" not in st.session_state:
+                st.session_state["ai_messages"] = []
             st.session_state["ai_messages"].append({"role": "user", "content": prompt})
-            _stream_response(ollama_url, model_name,
-                             st.session_state["ai_context"],
+            _stream_response(client, st.session_state["ai_context"],
                              st.session_state["ai_messages"])
             st.rerun()
 
     st.divider()
 
-    # Render chat history
+    # ── Chat history ──────────────────────────────────────────────────────────
+    if "ai_messages" not in st.session_state:
+        st.session_state["ai_messages"] = []
+
     for msg in st.session_state["ai_messages"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # User input
+    # ── User input ────────────────────────────────────────────────────────────
     user_input = st.chat_input("Ask anything about your inventory…")
     if user_input:
         st.session_state["ai_messages"].append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.markdown(user_input)
-        _stream_response(ollama_url, model_name,
-                         st.session_state["ai_context"],
+        _stream_response(client, st.session_state["ai_context"],
                          st.session_state["ai_messages"])
         st.rerun()
 
-    if st.session_state["ai_messages"]:
-        if st.button("🗑️ Clear conversation", key="clear_chat"):
+    with col_clear:
+        if st.session_state.get("ai_messages") and st.button("🗑️ Clear conversation"):
             st.session_state["ai_messages"] = []
             st.rerun()
 
 
 # ---------------------------------------------------------------------------
-# Ollama helpers
+# Streaming call
 # ---------------------------------------------------------------------------
 
-def _pick_model(base_url: str) -> str | None:
-    """Fetch available models from Ollama; let user pick one. Returns model name or None."""
-    try:
-        resp = requests.get(f"{base_url}/api/tags", timeout=3)
-        resp.raise_for_status()
-        models = [m["name"] for m in resp.json().get("models", [])]
-    except Exception:
-        return None
-
-    if not models:
-        st.sidebar.warning("No models found. Run `ollama pull <model>` first.")
-        return None
-
-    return st.sidebar.selectbox("Model", models, key="ollama_model")
-
-
-def _stream_response(base_url: str, model: str, context: str, messages: list):
-    """Call Ollama /api/chat with streaming and append the assistant reply."""
+def _stream_response(client: OpenAI, context: str, messages: list):
     system = SYSTEM_PROMPT.format(context=context)
-
-    payload = {
-        "model": model,
-        "stream": True,
-        "messages": [{"role": "system", "content": system}] + messages,
-    }
+    api_messages = [{"role": "system", "content": system}] + messages
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full_reply = ""
         try:
-            with requests.post(f"{base_url}/api/chat", json=payload,
-                               stream=True, timeout=120) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    chunk = json.loads(line)
-                    delta = chunk.get("message", {}).get("content", "")
+            stream = client.chat.completions.create(
+                model=_MODEL,
+                messages=api_messages,
+                temperature=1,
+                top_p=0.95,
+                max_tokens=_MAX_TOKENS,
+                extra_body={"chat_template_kwargs": {"thinking": False}},
+                stream=True,
+            )
+            for chunk in stream:
+                if not getattr(chunk, "choices", None):
+                    continue
+                delta = chunk.choices[0].delta.content
+                if delta is not None:
                     full_reply += delta
                     placeholder.markdown(full_reply + "▌")
-                    if chunk.get("done"):
-                        break
             placeholder.markdown(full_reply)
         except Exception as exc:
-            full_reply = f"❌ Error communicating with Ollama: {exc}"
+            full_reply = f"❌ API error: {exc}"
             placeholder.error(full_reply)
 
     messages.append({"role": "assistant", "content": full_reply})
@@ -191,10 +175,6 @@ def _stream_response(base_url: str, model: str, context: str, messages: list):
 # ---------------------------------------------------------------------------
 
 def _build_context() -> str:
-    """
-    Pull a structured snapshot of the DB and format it as plain text
-    that the LLM can reason over.
-    """
     session = get_session()
     try:
         items   = session.query(Item).order_by(Item.part_number).all()
@@ -208,31 +188,19 @@ def _build_context() -> str:
 
     lines = []
     lines.append(f"Report generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    lines.append(f"Total items: {len(items)}")
-    lines.append(f"Items with DDMRP buffer: {len(buffers)}")
+    lines.append(f"Total items: {len(items)}  |  Items with buffer: {len(buffers)}")
     lines.append("")
 
-    # ── Demand index ─────────────────────────────────────────────────────────
     demand_by_item: dict[int, list] = defaultdict(list)
     for d in demands:
         demand_by_item[d.item_id].append(d)
 
-    # ── Per-item data ─────────────────────────────────────────────────────────
-    lines.append("=== ITEM INVENTORY STATUS ===")
-    lines.append(
-        f"{'Part#':<14} {'Desc':<22} {'Type':<4} "
-        f"{'OnHand':>8} {'ADU':>6} {'DLT':>5} "
-        f"{'Cost':>8} {'AnnVal':>10} "
-        f"{'TOR':>8} {'Status%':>8} {'ExecColor':<10} {'ABC':<3} {'XYZ':<3}"
-    )
-    lines.append("-" * 115)
-
+    # ── Per-item rows + ABC/XYZ ───────────────────────────────────────────────
     item_rows = []
     for item in items:
         buf = buffers.get(item.id)
-
-        # Annual value
         item_demands = demand_by_item.get(item.id, [])
+
         if item_demands:
             total_qty = sum(d.quantity for d in item_demands)
             span = max(1, (max(d.demand_date for d in item_demands) -
@@ -240,135 +208,112 @@ def _build_context() -> str:
             annual_usage = total_qty * 365.0 / span
         else:
             annual_usage = (item.adu or 0.0) * 365.0
-        annual_value = annual_usage * (item.unit_cost or 0.0)
 
-        # CV for XYZ
+        annual_value = annual_usage * (item.unit_cost or 0.0)
         cv = _cv(item, item_demands)
         xyz = "X" if cv < 0.5 else ("Y" if cv < 1.0 else "Z")
-
-        # ABC (we compute a rough one here — full ranking not available per item)
-        # We'll attach it properly in the summary; for per-row just store annual_value
         item_rows.append((item, buf, annual_usage, annual_value, cv, xyz))
 
-    # ABC ranking
     sorted_rows = sorted(item_rows, key=lambda r: r[3], reverse=True)
-    total_val = sum(r[3] for r in sorted_rows)
+    total_val = sum(r[3] for r in sorted_rows) or 1.0
+
+    # ── Item status table ─────────────────────────────────────────────────────
+    lines.append("=== ITEM INVENTORY STATUS ===")
+    lines.append(
+        f"{'Part#':<14} {'Description':<24} {'Type':<4} "
+        f"{'OnHand':>8} {'ADU':>6} {'DLT':>5} {'Cost€':>8} {'AnnVal€':>10} "
+        f"{'TOR':>8} {'Stat%':>6} {'Color':<10} {'ABC'} {'XYZ'}"
+    )
+    lines.append("-" * 120)
+
     cum = 0.0
     for item, buf, annual_usage, annual_value, cv, xyz in sorted_rows:
-        cum_prev = cum
+        abc = "A" if cum / total_val < 0.70 else ("B" if cum / total_val < 0.90 else "C")
         cum += annual_value
-        abc = "A" if cum_prev / max(total_val, 1) < 0.70 else (
-              "B" if cum_prev / max(total_val, 1) < 0.90 else "C")
 
-        tor   = buf.top_of_red if buf and hasattr(buf, "top_of_red") else 0
-        sp    = f"{buf.buffer_status_pct*100:.0f}%" if buf and buf.buffer_status_pct else "—"
-        color = buf.execution_color if buf and buf.execution_color else "—"
+        tor   = getattr(buf, "top_of_red",        0) if buf else 0
+        sp    = f"{buf.buffer_status_pct*100:.0f}%" if (buf and buf.buffer_status_pct) else "—"
+        color = (buf.execution_color or "—")         if buf else "—"
 
         lines.append(
-            f"{item.part_number:<14} {item.description[:22]:<22} {item.item_type or 'P':<4} "
+            f"{item.part_number:<14} {item.description[:24]:<24} {item.item_type or 'P':<4} "
             f"{item.on_hand:>8.1f} {item.adu or 0:>6.2f} {item.dlt or 0:>5.1f} "
             f"{item.unit_cost or 0:>8.2f} {annual_value:>10,.0f} "
-            f"{tor:>8.1f} {sp:>8} {color:<10} {abc:<3} {xyz:<3}"
+            f"{tor:>8.1f} {sp:>6} {color:<10} {abc}   {xyz}"
         )
 
     lines.append("")
 
     # ── Execution alarms ─────────────────────────────────────────────────────
     lines.append("=== EXECUTION ALARMS ===")
-    alarm_items = [
-        (item, buf) for item, buf, *_ in item_rows
-        if buf and buf.execution_color in ("red", "dark_red")
-    ]
-    if alarm_items:
-        for item, buf in alarm_items:
-            pct = f"{buf.buffer_status_pct*100:.0f}%" if buf.buffer_status_pct else "?"
+    alarms = [(item, buf) for item, buf, *_ in item_rows
+              if buf and buf.execution_color in ("red", "dark_red")]
+    if alarms:
+        for item, buf in alarms:
+            sp = f"{buf.buffer_status_pct*100:.0f}%" if buf.buffer_status_pct else "?"
             lines.append(
                 f"  ❗ {item.part_number} ({item.description[:30]}): "
-                f"status={buf.execution_color.upper()}, "
-                f"on_hand={item.on_hand:.1f}, status%={pct}"
+                f"{buf.execution_color.upper()} | on_hand={item.on_hand:.1f} | status={sp}"
             )
     else:
-        lines.append("  No red/dark-red execution alarms.")
+        lines.append("  No red/dark-red alarms.")
     lines.append("")
 
-    # ── Data quality issues ───────────────────────────────────────────────────
-    lines.append("=== DATA QUALITY ISSUES ===")
-    issues = []
-    for item, buf, *_ in item_rows:
-        if not item.unit_cost:
-            issues.append(f"  • {item.part_number}: unit_cost = 0 (cannot compute value)")
-        if not item.adu and not demand_by_item.get(item.id):
-            issues.append(f"  • {item.part_number}: ADU = 0 and no demand history")
-        if not item.dlt and buf:
-            issues.append(f"  • {item.part_number}: has buffer but DLT = 0")
-        if buf and not item.lead_time_factor:
-            issues.append(f"  • {item.part_number}: LTF = 0 (buffer zones will be zero)")
-    if issues:
-        lines.extend(issues[:30])
-        if len(issues) > 30:
-            lines.append(f"  … and {len(issues)-30} more issues")
-    else:
-        lines.append("  No data quality issues detected.")
-    lines.append("")
-
-    # ── ABC/XYZ summary ───────────────────────────────────────────────────────
-    lines.append("=== ABC / XYZ SUMMARY ===")
-    abc_counts: dict[str, int] = defaultdict(int)
-    xyz_counts: dict[str, int] = defaultdict(int)
-    matrix:     dict[str, int] = defaultdict(int)
-    cum2 = 0.0
-    for item, buf, annual_usage, annual_value, cv, xyz in sorted_rows:
-        cum_prev = cum2
-        cum2 += annual_value
-        abc = "A" if cum_prev / max(total_val, 1) < 0.70 else (
-              "B" if cum_prev / max(total_val, 1) < 0.90 else "C")
-        abc_counts[abc] += 1
-        xyz_counts[xyz] += 1
-        matrix[f"{abc}-{xyz}"] += 1
-
-    for cat in ["A", "B", "C"]:
-        lines.append(f"  {cat}: {abc_counts[cat]} items")
-    lines.append("")
-    for cat in ["X", "Y", "Z"]:
-        lines.append(f"  {cat}: {xyz_counts[cat]} items")
-    lines.append("")
-    lines.append("  ACV² matrix (item counts):")
-    for a in ["A", "B", "C"]:
-        row_str = "  " + a + " | " + " | ".join(
-            f"{matrix.get(f'{a}-{x}', 0):>4}" for x in ["X", "Y", "Z"]
-        )
-        lines.append(row_str)
-    lines.append("        X      Y      Z")
-    lines.append("")
-
-    # ── Buffer zone summary ───────────────────────────────────────────────────
-    lines.append("=== BUFFER ZONE OVERVIEW ===")
-    buf_with_zones = [
-        (item, buf) for item, buf, *_ in item_rows
-        if buf and getattr(buf, "top_of_green", 0)
-    ]
-    if buf_with_zones:
-        lines.append(
-            f"  {'Part#':<14} {'OnHand':>8} {'TOR':>8} {'TOY':>8} {'TOG':>8} "
-            f"{'Status%':>8} {'Color':<10}"
-        )
-        for item, buf in buf_with_zones:
+    # ── Buffer zones ──────────────────────────────────────────────────────────
+    lines.append("=== BUFFER ZONES ===")
+    buf_zones = [(item, buf) for item, buf, *_ in item_rows
+                 if buf and getattr(buf, "top_of_green", 0)]
+    if buf_zones:
+        lines.append(f"  {'Part#':<14} {'OnHand':>8} {'TOR':>8} {'TOY':>8} {'TOG':>8} {'Stat%':>6} {'Color':<10}")
+        for item, buf in buf_zones:
             sp = f"{buf.buffer_status_pct*100:.0f}%" if buf.buffer_status_pct else "—"
             lines.append(
                 f"  {item.part_number:<14} {item.on_hand:>8.1f} "
                 f"{getattr(buf,'top_of_red',0):>8.1f} "
                 f"{getattr(buf,'top_of_yellow',0):>8.1f} "
                 f"{getattr(buf,'top_of_green',0):>8.1f} "
-                f"{sp:>8} {buf.execution_color or '—':<10}"
+                f"{sp:>6} {buf.execution_color or '—':<10}"
             )
     else:
-        lines.append("  No buffers with calculated zones yet. Run Replenishment Signals first.")
+        lines.append("  No buffers with calculated zones. Run Replenishment Signals first.")
+    lines.append("")
+
+    # ── ABC/XYZ matrix ────────────────────────────────────────────────────────
+    lines.append("=== ABC / XYZ MATRIX (item counts) ===")
+    matrix: dict[str, int] = defaultdict(int)
+    cum2 = 0.0
+    for item, buf, annual_usage, annual_value, cv, xyz in sorted_rows:
+        abc = "A" if cum2 / total_val < 0.70 else ("B" if cum2 / total_val < 0.90 else "C")
+        cum2 += annual_value
+        matrix[f"{abc}-{xyz}"] += 1
+    lines.append("       X    Y    Z")
+    for a in ["A", "B", "C"]:
+        lines.append(f"  {a}  | " + " | ".join(f"{matrix.get(f'{a}-{x}',0):>3}" for x in "XYZ") + " |")
+    lines.append("")
+
+    # ── Data quality ──────────────────────────────────────────────────────────
+    lines.append("=== DATA QUALITY ISSUES ===")
+    issues = []
+    for item, buf, *_ in item_rows:
+        if not item.unit_cost:
+            issues.append(f"  • {item.part_number}: unit_cost = 0")
+        if not item.adu and not demand_by_item.get(item.id):
+            issues.append(f"  • {item.part_number}: ADU = 0 and no demand history")
+        if not item.dlt and buf:
+            issues.append(f"  • {item.part_number}: buffer exists but DLT = 0")
+        if buf and not item.lead_time_factor:
+            issues.append(f"  • {item.part_number}: LTF = 0 (zones will be zero)")
+    if issues:
+        lines.extend(issues[:40])
+        if len(issues) > 40:
+            lines.append(f"  … and {len(issues)-40} more")
+    else:
+        lines.append("  No issues detected.")
 
     return "\n".join(lines)
 
 
 def _cv(item, demands) -> float:
-    from statistics import mean, stdev
     if len(demands) >= 4:
         weekly: dict = defaultdict(float)
         for d in demands:
