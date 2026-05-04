@@ -21,8 +21,15 @@ from database.db import get_session, Item, Buffer, DemandEntry
 
 # ── API credentials ───────────────────────────────────────────────────────────
 _NVIDIA_BASE  = "https://integrate.api.nvidia.com/v1"
-_MODEL        = "deepseek-ai/deepseek-v3-0324"
 _MAX_TOKENS   = 16384
+
+_KNOWN_MODELS = [
+    "deepseek-ai/deepseek-r1",
+    "deepseek-ai/deepseek-v3",
+    "deepseek-ai/deepseek-v3-0324",
+    "meta/llama-3.3-70b-instruct",
+    "nvidia/llama-3.1-nemotron-70b-instruct",
+]
 
 SYSTEM_PROMPT = """You are an expert DDMRP (Demand Driven MRP) advisor integrated into a supply chain management application.
 
@@ -71,11 +78,16 @@ def show():
 
     client = OpenAI(base_url=_NVIDIA_BASE, api_key=api_key)
 
-    # Quick connectivity check
     with st.sidebar:
         st.divider()
         st.markdown("**🤖 AI Advisor**")
-        st.caption(f"Model: `{_MODEL}`")
+        model_choice = st.selectbox("Model", _KNOWN_MODELS, key="nvidia_model_sel",
+                                    index=0)
+        custom = st.text_input("Custom model slug (overrides above)", "",
+                               key="nvidia_model_custom",
+                               placeholder="e.g. deepseek-ai/deepseek-r1")
+        model_name = custom.strip() if custom.strip() else model_choice
+        st.caption(f"`{model_name}`")
         st.caption("NVIDIA NIM API")
         st.divider()
 
@@ -102,7 +114,7 @@ def show():
             if "ai_messages" not in st.session_state:
                 st.session_state["ai_messages"] = []
             st.session_state["ai_messages"].append({"role": "user", "content": prompt})
-            _stream_response(client, st.session_state["ai_context"],
+            _stream_response(client, model_name, st.session_state["ai_context"],
                              st.session_state["ai_messages"])
             st.rerun()
 
@@ -122,7 +134,7 @@ def show():
         st.session_state["ai_messages"].append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.markdown(user_input)
-        _stream_response(client, st.session_state["ai_context"],
+        _stream_response(client, model_name, st.session_state["ai_context"],
                          st.session_state["ai_messages"])
         st.rerun()
 
@@ -136,7 +148,7 @@ def show():
 # Streaming call
 # ---------------------------------------------------------------------------
 
-def _stream_response(client: OpenAI, context: str, messages: list):
+def _stream_response(client: OpenAI, model: str, context: str, messages: list):
     system = SYSTEM_PROMPT.format(context=context)
     api_messages = [{"role": "system", "content": system}] + messages
 
@@ -145,7 +157,7 @@ def _stream_response(client: OpenAI, context: str, messages: list):
         full_reply = ""
         try:
             stream = client.chat.completions.create(
-                model=_MODEL,
+                model=model,
                 messages=api_messages,
                 temperature=1,
                 top_p=0.95,
