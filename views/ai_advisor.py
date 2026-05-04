@@ -155,24 +155,38 @@ def _stream_response(client: OpenAI, model: str, context: str, messages: list):
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full_reply = ""
+        chunk_count = 0
         try:
+            placeholder.markdown("⏳ Waiting for model…")
             stream = client.chat.completions.create(
                 model=model,
                 messages=api_messages,
-                temperature=1,
+                temperature=0.6,
                 top_p=0.95,
                 max_tokens=_MAX_TOKENS,
-                extra_body={"chat_template_kwargs": {"thinking": False}},
                 stream=True,
             )
             for chunk in stream:
+                chunk_count += 1
                 if not getattr(chunk, "choices", None):
                     continue
                 delta = chunk.choices[0].delta.content
                 if delta is not None:
                     full_reply += delta
                     placeholder.markdown(full_reply + "▌")
-            placeholder.markdown(full_reply)
+
+            if full_reply:
+                placeholder.markdown(full_reply)
+            else:
+                # No content received — show diagnostic info
+                placeholder.warning(
+                    f"⚠️ The model returned no text content "
+                    f"(received {chunk_count} chunk(s)). "
+                    f"Try a different model or check your API quota at "
+                    f"[build.nvidia.com](https://build.nvidia.com)."
+                )
+                full_reply = f"[no content — {chunk_count} chunks received]"
+
         except Exception as exc:
             full_reply = f"❌ API error: {exc}"
             placeholder.error(full_reply)
