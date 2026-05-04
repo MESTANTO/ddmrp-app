@@ -31,6 +31,7 @@ PAGES = {
     "🚨 Execution Alarms":           "alarms",
     "📐 Prioritized Share":          "share_allocator",
     "📉 Model Velocity":             "model_velocity",
+    "🔠 ABC / XYZ / ACV² Analysis":  "abc_xyz",
     "🛡️ Safety Stock & EOQ":         "safety_stock",
     "🎛️ Buffer Adjustments":         "buffer_adjustments",
     "📤 Export to Excel":            "export",
@@ -94,6 +95,10 @@ elif page_key == "share_allocator":
 
 elif page_key == "model_velocity":
     from views.model_velocity import show
+    show()
+
+elif page_key == "abc_xyz":
+    from views.abc_xyz import show
     show()
 
 elif page_key == "safety_stock":
