@@ -5,7 +5,7 @@ Allows users to create, view, edit, and delete items with DDMRP parameters.
 
 import streamlit as st
 import pandas as pd
-from database.db import get_session, Item, BufferProfile
+from database.db import get_session, Item, BufferProfile, Supplier
 from modules.buffer_engine import calculate_zones
 from modules.importer import render_import_widget, build_material_template, import_materials
 from modules.param_calculator import (
@@ -51,6 +51,16 @@ def _load_profiles() -> dict:
     try:
         profs = session.query(BufferProfile).order_by(BufferProfile.name).all()
         return {p.name: p for p in profs}
+    finally:
+        session.close()
+
+
+def _load_suppliers() -> dict:
+    """Return mapping {display_label: Supplier} for selectbox use."""
+    session = get_session()
+    try:
+        sups = session.query(Supplier).order_by(Supplier.code).all()
+        return {f"{s.code} — {s.name}": s for s in sups}
     finally:
         session.close()
 
@@ -116,6 +126,7 @@ def _show_item_list():
             "MOQ": it.min_order_qty,
             "Order Cycle": it.order_cycle,
             "On Hand": it.on_hand,
+            "Default Supplier": it.supplier.code if it.supplier else "",
             "Unit Cost (€)": round(it.unit_cost or 0.0, 2),
             "Ordering Cost (€)": round(it.ordering_cost or 0.0, 2),
             "Holding %": round((it.holding_cost_pct or 0.0) * 100, 2),
@@ -137,6 +148,8 @@ def _show_item_list():
 def _show_add_item():
     profiles = _load_profiles()
     profile_options = ["(none — manual LTF/VF)"] + list(profiles.keys())
+    suppliers = _load_suppliers()
+    supplier_options = ["— None —"] + list(suppliers.keys())
 
     with st.form("add_item_form", clear_on_submit=True):
         st.subheader("New Item")
@@ -220,6 +233,9 @@ def _show_add_item():
                 help="Annual holding cost as a % of unit cost. Leave 0 to use global default.",
             )
 
+        sup_label = st.selectbox("Default Supplier", supplier_options,
+                                 help="The supplier this part is normally purchased from.")
+
         submitted = st.form_submit_button("Add Item", type="primary")
 
     if submitted:
@@ -267,6 +283,7 @@ def _show_add_item():
                 unit_cost=unit_cost,
                 ordering_cost=ordering_cost,
                 holding_cost_pct=holding_pct / 100.0,
+                default_supplier_id=suppliers[sup_label].id if sup_label != "— None —" else None,
             )
             session.add(item)
             session.commit()

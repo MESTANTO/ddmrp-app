@@ -57,6 +57,57 @@ Base = declarative_base()
 # Material Master
 # ---------------------------------------------------------------------------
 
+class Supplier(Base):
+    """Supplier master data."""
+    __tablename__ = "suppliers"
+
+    id   = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String, unique=True, nullable=False)
+    name = Column(String, nullable=False)
+
+    # Location
+    country = Column(String, default="")
+    city    = Column(String, default="")
+    address = Column(Text,   default="")
+
+    # General contact
+    website = Column(String, default="")
+    phone   = Column(String, default="")
+    email   = Column(String, default="")
+
+    # Primary material contact
+    material_contact_name  = Column(String, default="")
+    material_contact_email = Column(String, default="")
+    material_contact_phone = Column(String, default="")
+
+    # Procurement contact
+    procurement_contact_name  = Column(String, default="")
+    procurement_contact_email = Column(String, default="")
+    procurement_contact_phone = Column(String, default="")
+
+    # Manager / escalation contact
+    manager_contact_name  = Column(String, default="")
+    manager_contact_email = Column(String, default="")
+    manager_contact_phone = Column(String, default="")
+
+    # Procurement / DDMRP relevant
+    lead_time_days  = Column(Integer, default=0)    # typical supplier lead time
+    reliability_pct = Column(Float,   default=100.0) # on-time delivery rate 0-100
+    payment_terms   = Column(String,  default="")    # e.g. "Net 30"
+    currency        = Column(String,  default="EUR")
+    incoterms       = Column(String,  default="")    # EXW, FOB, DDP …
+
+    # Classification
+    status          = Column(String,  default="active")   # active | inactive | preferred
+    certifications  = Column(Text,    default="")         # ISO 9001, ISO 14001 …
+    notes           = Column(Text,    default="")
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    items = relationship("Item", back_populates="supplier")
+
+
 class Item(Base):
     __tablename__ = "items"
 
@@ -92,6 +143,9 @@ class Item(Base):
     ordering_cost    = Column(Float, default=0.0)   # € per order (0 → use global default)
     holding_cost_pct = Column(Float, default=0.0)   # annual holding cost % as fraction, e.g. 0.25 (0 → use global default)
 
+    # Default supplier
+    default_supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
+
     # Relationships
     demand_entries = relationship("DemandEntry", back_populates="item", cascade="all, delete")
     supply_entries = relationship("SupplyEntry", back_populates="item", cascade="all, delete")
@@ -99,7 +153,8 @@ class Item(Base):
     process_nodes    = relationship("ProcessNode", back_populates="item",
                                     foreign_keys="ProcessNode.item_id")
     node_memberships = relationship("ProcessNodeItem", back_populates="item")
-    buffer_profile = relationship("BufferProfile", back_populates="items")
+    buffer_profile   = relationship("BufferProfile", back_populates="items")
+    supplier         = relationship("Supplier", back_populates="items", foreign_keys=[default_supplier_id])
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -352,6 +407,7 @@ def init_db():
     _migrate_item_columns()
     _migrate_bom_columns()
     _migrate_process_node_items()
+    _migrate_supplier_columns()
     # Seed reference data
     _seed_buffer_profiles()
     _seed_settings()
@@ -372,6 +428,13 @@ def _migrate_buffer_columns():
 def _migrate_bom_columns():
     """bom_lines is created by create_all; no extra columns to migrate yet."""
     pass  # placeholder — keeps the pattern consistent if columns are added later
+
+
+def _migrate_supplier_columns():
+    """Add default_supplier_id to existing items tables (idempotent)."""
+    _add_columns_safely("items", [
+        ("default_supplier_id", "INTEGER", "INTEGER"),
+    ])
 
 
 def _migrate_process_node_items():

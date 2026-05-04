@@ -24,6 +24,7 @@ init_db()
 PAGES = {
     "📊 Dashboard":                  "dashboard",
     "📋 Material Master":            "material_master",
+    "🏭 Supplier Master":            "supplier_master",
     "📈 Demand & Supply":            "demand_supply",
     "🏭 Process Designer":           "process_designer",
     "🧬 BOM & Auto DLT":             "bom_engine",
@@ -68,6 +69,10 @@ if page_key == "dashboard":
 
 elif page_key == "material_master":
     from modules.material_master import show
+    show()
+
+elif page_key == "supplier_master":
+    from modules.supplier_master import show
     show()
 
 elif page_key == "demand_supply":
