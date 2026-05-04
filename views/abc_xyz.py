@@ -346,7 +346,7 @@ def _render_abc(df: pd.DataFrame):
         return f"background-color: {color}; color: white; font-weight: bold" if color else ""
 
     st.dataframe(
-        summary.style.applymap(_style_abc, subset=["Category"]),
+        summary.style.map(_style_abc, subset=["Category"]),
         use_container_width=True, hide_index=True,
     )
 
@@ -436,7 +436,7 @@ def _render_xyz(df: pd.DataFrame):
         return f"background-color: {color}; color: white; font-weight: bold" if color else ""
 
     st.dataframe(
-        summary.style.applymap(_style_xyz, subset=["Category"]),
+        summary.style.map(_style_xyz, subset=["Category"]),
         use_container_width=True, hide_index=True,
     )
 
