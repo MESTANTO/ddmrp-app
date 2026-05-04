@@ -24,11 +24,12 @@ _NVIDIA_BASE  = "https://integrate.api.nvidia.com/v1"
 _MAX_TOKENS   = 16384
 
 _KNOWN_MODELS = [
-    "deepseek-ai/deepseek-v4-pro",
+    "meta/llama-3.1-8b-instruct",        # fast, definitely available
+    "meta/llama-3.3-70b-instruct",
     "deepseek-ai/deepseek-r1",
     "deepseek-ai/deepseek-v3-0324",
-    "meta/llama-3.3-70b-instruct",
     "nvidia/llama-3.1-nemotron-70b-instruct",
+    "deepseek-ai/deepseek-v4-pro",        # may not exist — test first
 ]
 
 SYSTEM_PROMPT = """You are an expert DDMRP (Demand Driven MRP) advisor integrated into a supply chain management application.
@@ -89,14 +90,30 @@ def show():
         model_name = custom.strip() if custom.strip() else model_choice
         st.caption(f"`{model_name}`")
         st.caption("NVIDIA NIM API")
-        if st.button("🔍 List my available models", key="list_models"):
-            try:
-                result = OpenAI(
-                    base_url=_NVIDIA_BASE, api_key=api_key, timeout=10.0
-                ).models.list()
-                st.code("\n".join(m.id for m in result.data))
-            except Exception as e:
-                st.error(str(e))
+        if st.button("🧪 Test selected model", key="test_model"):
+            with st.spinner("Testing…"):
+                try:
+                    resp = OpenAI(
+                        base_url=_NVIDIA_BASE, api_key=api_key, timeout=15.0
+                    ).chat.completions.create(
+                        model=model_name,
+                        messages=[{"role": "user", "content": "say hi"}],
+                        max_tokens=10,
+                        stream=False,
+                    )
+                    st.success(f"✅ Works! Reply: {resp.choices[0].message.content!r}")
+                except Exception as e:
+                    st.error(f"❌ {type(e).__name__}: {e}")
+
+        if st.button("🔍 List available models", key="list_models"):
+            with st.spinner("Fetching…"):
+                try:
+                    result = OpenAI(
+                        base_url=_NVIDIA_BASE, api_key=api_key, timeout=10.0
+                    ).models.list()
+                    st.code("\n".join(m.id for m in result.data))
+                except Exception as e:
+                    st.error(str(e))
         st.divider()
 
     # ── Quick connectivity check ──────────────────────────────────────────────
