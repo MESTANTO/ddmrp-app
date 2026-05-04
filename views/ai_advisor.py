@@ -6,9 +6,8 @@ interface over the current DDMRP database state.
 
 Model: deepseek-ai/deepseek-v3-0324 via https://integrate.api.nvidia.com/v1
 
-API key priority:
-  1. Streamlit secret  NVIDIA_API_KEY  (recommended for production)
-  2. Hard-coded fallback below        (fine for local / dev use)
+API key: read from Streamlit secret NVIDIA_API_KEY
+  → Manage app → Secrets → add:  NVIDIA_API_KEY = "nvapi-..."
 """
 
 import streamlit as st
@@ -22,7 +21,6 @@ from database.db import get_session, Item, Buffer, DemandEntry
 
 # ── API credentials ───────────────────────────────────────────────────────────
 _NVIDIA_BASE  = "https://integrate.api.nvidia.com/v1"
-_NVIDIA_KEY   = "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"
 _MODEL        = "deepseek-ai/deepseek-v3-0324"
 _MAX_TOKENS   = 16384
 
@@ -64,12 +62,12 @@ def show():
         "The model receives a live snapshot of your inventory and suggests prioritised actions."
     )
 
-    # ── Resolve API key ───────────────────────────────────────────────────────
-    api_key = _NVIDIA_KEY
+    # ── Resolve API key from Streamlit secrets ────────────────────────────────
     try:
-        api_key = st.secrets.get("NVIDIA_API_KEY", _NVIDIA_KEY)
+        api_key = st.secrets["NVIDIA_API_KEY"]
     except Exception:
-        pass
+        st.error("**NVIDIA_API_KEY not found in Streamlit secrets.** Add it via Manage app → Secrets.")
+        return
 
     client = OpenAI(base_url=_NVIDIA_BASE, api_key=api_key)
 
