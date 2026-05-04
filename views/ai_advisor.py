@@ -24,8 +24,8 @@ _NVIDIA_BASE  = "https://integrate.api.nvidia.com/v1"
 _MAX_TOKENS   = 16384
 
 _KNOWN_MODELS = [
+    "deepseek-ai/deepseek-v4-pro",
     "deepseek-ai/deepseek-r1",
-    "deepseek-ai/deepseek-v3",
     "deepseek-ai/deepseek-v3-0324",
     "meta/llama-3.3-70b-instruct",
     "nvidia/llama-3.1-nemotron-70b-instruct",
