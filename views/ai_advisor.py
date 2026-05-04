@@ -24,12 +24,14 @@ _NVIDIA_BASE  = "https://integrate.api.nvidia.com/v1"
 _MAX_TOKENS   = 16384
 
 _KNOWN_MODELS = [
-    "meta/llama-3.1-8b-instruct",        # fast, definitely available
+    "google/gemma-4-27b-it",
+    "google/gemma-3-27b-it",
+    "google/gemma-3-12b-it",
+    "meta/llama-3.1-8b-instruct",
     "meta/llama-3.3-70b-instruct",
     "deepseek-ai/deepseek-r1",
     "deepseek-ai/deepseek-v3-0324",
     "nvidia/llama-3.1-nemotron-70b-instruct",
-    "deepseek-ai/deepseek-v4-pro",        # may not exist — test first
 ]
 
 SYSTEM_PROMPT = """You are an expert DDMRP (Demand Driven MRP) advisor integrated into a supply chain management application.
