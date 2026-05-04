@@ -24,7 +24,7 @@ _NVIDIA_BASE  = "https://integrate.api.nvidia.com/v1"
 _MAX_TOKENS   = 16384
 
 _KNOWN_MODELS = [
-    "google/gemma-4-27b-it",
+    "google/gemma-4-31b-it",
     "google/gemma-3-27b-it",
     "google/gemma-3-12b-it",
     "meta/llama-3.1-8b-instruct",
@@ -223,6 +223,7 @@ def _stream_response(client: OpenAI, model: str, context: str, messages: list):
                     top_p=0.95,
                     max_tokens=4096,
                     stream=False,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
             full_reply = response.choices[0].message.content or ""
             if full_reply:
