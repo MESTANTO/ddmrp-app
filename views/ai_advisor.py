@@ -91,10 +91,10 @@ def show():
         st.caption("NVIDIA NIM API")
         if st.button("🔍 List my available models", key="list_models"):
             try:
-                models = timed_client = OpenAI(
+                result = OpenAI(
                     base_url=_NVIDIA_BASE, api_key=api_key, timeout=10.0
                 ).models.list()
-                st.code("\n".join(m.id for m in models.data))
+                st.code("\n".join(m.id for m in result.data))
             except Exception as e:
                 st.error(str(e))
         st.divider()
@@ -157,55 +157,33 @@ def show():
 # ---------------------------------------------------------------------------
 
 def _stream_response(client: OpenAI, model: str, context: str, messages: list):
-    system = SYSTEM_PROMPT.format(context=context)
-    # Keep context short to avoid token-limit hangs
     context_trimmed = context[:6000] if len(context) > 6000 else context
     system = SYSTEM_PROMPT.format(context=context_trimmed)
-    api_messages = [{"role": "system", "content": system}] + messages[-10:]  # last 10 turns max
+    api_messages = [{"role": "system", "content": system}] + messages[-10:]
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full_reply = ""
         try:
-            placeholder.markdown("⏳ Connecting to NVIDIA API…")
-
-            # Use a short-lived client with explicit timeout
-            timed_client = OpenAI(
-                base_url=_NVIDIA_BASE,
-                api_key=client.api_key,
-                timeout=60.0,
-            )
-
-            stream = timed_client.chat.completions.create(
-                model=model,
-                messages=api_messages,
-                temperature=0.6,
-                top_p=0.95,
-                max_tokens=4096,
-                stream=True,
-            )
-
-            placeholder.markdown("⏳ Receiving response…")
-            chunk_count = 0
-            for chunk in stream:
-                chunk_count += 1
-                if not getattr(chunk, "choices", None):
-                    continue
-                delta = chunk.choices[0].delta.content
-                if delta is not None:
-                    full_reply += delta
-                    placeholder.markdown(full_reply + "▌")
-
+            with st.spinner(f"Asking {model}…"):
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=api_messages,
+                    temperature=0.6,
+                    top_p=0.95,
+                    max_tokens=4096,
+                    stream=False,
+                )
+            full_reply = response.choices[0].message.content or ""
             if full_reply:
                 placeholder.markdown(full_reply)
             else:
                 placeholder.warning(
-                    f"⚠️ Model returned no text ({chunk_count} chunks received). "
-                    f"The model slug **`{model}`** may not exist on your account — "
-                    f"check available models at [build.nvidia.com](https://build.nvidia.com)."
+                    f"⚠️ Model returned empty content. "
+                    f"Model **`{model}`** may not be available — "
+                    f"click **List my available models** in the sidebar."
                 )
-                full_reply = f"[no content — {chunk_count} chunks]"
-
+                full_reply = "[empty response]"
         except Exception as exc:
             full_reply = f"❌ {type(exc).__name__}: {exc}"
             placeholder.error(full_reply)
