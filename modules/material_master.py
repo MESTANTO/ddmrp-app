@@ -102,43 +102,43 @@ def _show_item_list():
     session = get_session()
     try:
         items = session.query(Item).order_by(Item.part_number).all()
+
+        if not items:
+            st.info("No items yet. Go to the **Add Item** tab to create one.")
+            return
+
+        rows = []
+        for it in items:
+            zones = calculate_zones(it)
+            rows.append({
+                "Part Number": it.part_number,
+                "Description": it.description,
+                "Category": it.category,
+                "UoM": it.unit_of_measure,
+                "Type": it.item_type or "P",
+                "Profile": it.buffer_profile.name if it.buffer_profile else "",
+                "ADU": it.adu,
+                "DLT (days)": it.dlt,
+                "LT Factor": it.lead_time_factor,
+                "Var. Factor": it.variability_factor,
+                "MOQ": it.min_order_qty,
+                "Order Cycle": it.order_cycle,
+                "On Hand": it.on_hand,
+                "Default Supplier": it.supplier.code if it.supplier else "",
+                "Unit Cost (€)": round(it.unit_cost or 0.0, 2),
+                "Ordering Cost (€)": round(it.ordering_cost or 0.0, 2),
+                "Holding %": round((it.holding_cost_pct or 0.0) * 100, 2),
+                "TOG": round(zones.top_of_green, 2),
+                "TOY": round(zones.top_of_yellow, 2),
+                "TOR": round(zones.top_of_red, 2),
+                "Avg Inv Target": round(zones.avg_inventory_target, 2),
+            })
     finally:
         session.close()
 
-    if not items:
-        st.info("No items yet. Go to the **Add Item** tab to create one.")
-        return
-
-    rows = []
-    for it in items:
-        zones = calculate_zones(it)
-        rows.append({
-            "Part Number": it.part_number,
-            "Description": it.description,
-            "Category": it.category,
-            "UoM": it.unit_of_measure,
-            "Type": it.item_type or "P",
-            "Profile": it.buffer_profile.name if it.buffer_profile else "",
-            "ADU": it.adu,
-            "DLT (days)": it.dlt,
-            "LT Factor": it.lead_time_factor,
-            "Var. Factor": it.variability_factor,
-            "MOQ": it.min_order_qty,
-            "Order Cycle": it.order_cycle,
-            "On Hand": it.on_hand,
-            "Default Supplier": it.supplier.code if it.supplier else "",
-            "Unit Cost (€)": round(it.unit_cost or 0.0, 2),
-            "Ordering Cost (€)": round(it.ordering_cost or 0.0, 2),
-            "Holding %": round((it.holding_cost_pct or 0.0) * 100, 2),
-            "TOG": round(zones.top_of_green, 2),
-            "TOY": round(zones.top_of_yellow, 2),
-            "TOR": round(zones.top_of_red, 2),
-            "Avg Inv Target": round(zones.avg_inventory_target, 2),
-        })
-
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption(f"{len(items)} item(s) in database.")
+    st.caption(f"{len(rows)} item(s) in database.")
 
 
 # ---------------------------------------------------------------------------
