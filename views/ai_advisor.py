@@ -76,7 +76,7 @@ def show():
         st.error("**NVIDIA_API_KEY not found in Streamlit secrets.** Add it via Manage app → Secrets.")
         return
 
-    client = OpenAI(base_url=_NVIDIA_BASE, api_key=api_key)
+    client = OpenAI(base_url=_NVIDIA_BASE, api_key=api_key, timeout=30.0)
 
     with st.sidebar:
         st.divider()
@@ -98,6 +98,27 @@ def show():
             except Exception as e:
                 st.error(str(e))
         st.divider()
+
+    # ── Quick connectivity check ──────────────────────────────────────────────
+    if "nvidia_reachable" not in st.session_state:
+        try:
+            import requests as _req
+            r = _req.get("https://integrate.api.nvidia.com", timeout=5)
+            st.session_state["nvidia_reachable"] = True
+        except Exception as e:
+            st.session_state["nvidia_reachable"] = False
+            st.session_state["nvidia_reach_err"] = str(e)
+
+    if not st.session_state.get("nvidia_reachable"):
+        st.error(
+            f"❌ **Cannot reach `integrate.api.nvidia.com`** from this environment.\n\n"
+            f"Error: `{st.session_state.get('nvidia_reach_err', 'timeout')}`\n\n"
+            "This usually means Streamlit Cloud is blocking outbound HTTPS to NVIDIA. "
+            "Run the app **locally** with `streamlit run app.py` to use the AI Advisor."
+        )
+        return
+    else:
+        st.success("✅ NVIDIA API reachable", icon="🌐")
 
     # ── Build context once per session (or on demand) ─────────────────────────
     if "ai_context" not in st.session_state:
