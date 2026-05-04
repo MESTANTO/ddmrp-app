@@ -89,6 +89,14 @@ def show():
         model_name = custom.strip() if custom.strip() else model_choice
         st.caption(f"`{model_name}`")
         st.caption("NVIDIA NIM API")
+        if st.button("🔍 List my available models", key="list_models"):
+            try:
+                models = timed_client = OpenAI(
+                    base_url=_NVIDIA_BASE, api_key=api_key, timeout=10.0
+                ).models.list()
+                st.code("\n".join(m.id for m in models.data))
+            except Exception as e:
+                st.error(str(e))
         st.divider()
 
     # ── Build context once per session (or on demand) ─────────────────────────
@@ -150,22 +158,35 @@ def show():
 
 def _stream_response(client: OpenAI, model: str, context: str, messages: list):
     system = SYSTEM_PROMPT.format(context=context)
-    api_messages = [{"role": "system", "content": system}] + messages
+    # Keep context short to avoid token-limit hangs
+    context_trimmed = context[:6000] if len(context) > 6000 else context
+    system = SYSTEM_PROMPT.format(context=context_trimmed)
+    api_messages = [{"role": "system", "content": system}] + messages[-10:]  # last 10 turns max
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full_reply = ""
-        chunk_count = 0
         try:
-            placeholder.markdown("⏳ Waiting for model…")
-            stream = client.chat.completions.create(
+            placeholder.markdown("⏳ Connecting to NVIDIA API…")
+
+            # Use a short-lived client with explicit timeout
+            timed_client = OpenAI(
+                base_url=_NVIDIA_BASE,
+                api_key=client.api_key,
+                timeout=60.0,
+            )
+
+            stream = timed_client.chat.completions.create(
                 model=model,
                 messages=api_messages,
                 temperature=0.6,
                 top_p=0.95,
-                max_tokens=_MAX_TOKENS,
+                max_tokens=4096,
                 stream=True,
             )
+
+            placeholder.markdown("⏳ Receiving response…")
+            chunk_count = 0
             for chunk in stream:
                 chunk_count += 1
                 if not getattr(chunk, "choices", None):
@@ -178,17 +199,15 @@ def _stream_response(client: OpenAI, model: str, context: str, messages: list):
             if full_reply:
                 placeholder.markdown(full_reply)
             else:
-                # No content received — show diagnostic info
                 placeholder.warning(
-                    f"⚠️ The model returned no text content "
-                    f"(received {chunk_count} chunk(s)). "
-                    f"Try a different model or check your API quota at "
-                    f"[build.nvidia.com](https://build.nvidia.com)."
+                    f"⚠️ Model returned no text ({chunk_count} chunks received). "
+                    f"The model slug **`{model}`** may not exist on your account — "
+                    f"check available models at [build.nvidia.com](https://build.nvidia.com)."
                 )
-                full_reply = f"[no content — {chunk_count} chunks received]"
+                full_reply = f"[no content — {chunk_count} chunks]"
 
         except Exception as exc:
-            full_reply = f"❌ API error: {exc}"
+            full_reply = f"❌ {type(exc).__name__}: {exc}"
             placeholder.error(full_reply)
 
     messages.append({"role": "assistant", "content": full_reply})
