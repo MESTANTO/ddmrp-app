@@ -116,26 +116,36 @@ def show():
                     st.error(str(e))
         st.divider()
 
-    # ── Quick connectivity check ──────────────────────────────────────────────
-    if "nvidia_reachable" not in st.session_state:
+    # ── API reachability check (POST, not just GET) ───────────────────────────
+    if "nvidia_post_ok" not in st.session_state:
         try:
             import requests as _req
-            r = _req.get("https://integrate.api.nvidia.com", timeout=5)
-            st.session_state["nvidia_reachable"] = True
+            r = _req.post(
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json={"model": "meta/llama-3.1-8b-instruct",
+                      "messages": [{"role": "user", "content": "hi"}],
+                      "max_tokens": 5},
+                timeout=10,
+            )
+            st.session_state["nvidia_post_ok"] = r.status_code < 500
+            st.session_state["nvidia_post_status"] = r.status_code
         except Exception as e:
-            st.session_state["nvidia_reachable"] = False
-            st.session_state["nvidia_reach_err"] = str(e)
+            st.session_state["nvidia_post_ok"] = False
+            st.session_state["nvidia_post_status"] = str(e)
 
-    if not st.session_state.get("nvidia_reachable"):
+    status = st.session_state.get("nvidia_post_status")
+    if not st.session_state.get("nvidia_post_ok"):
         st.error(
-            f"❌ **Cannot reach `integrate.api.nvidia.com`** from this environment.\n\n"
-            f"Error: `{st.session_state.get('nvidia_reach_err', 'timeout')}`\n\n"
-            "This usually means Streamlit Cloud is blocking outbound HTTPS to NVIDIA. "
-            "Run the app **locally** with `streamlit run app.py` to use the AI Advisor."
+            "### ❌ AI Advisor is not available in this environment\n\n"
+            f"**Reason:** Streamlit Cloud blocks outbound API calls to NVIDIA "
+            f"(`{status}`).\n\n"
+            "**To use the AI Advisor, run the app locally:**\n"
+            "```bash\nstreamlit run app.py\n```\n"
+            "The rest of the app works normally on Streamlit Cloud."
         )
         return
-    else:
-        st.success("✅ NVIDIA API reachable", icon="🌐")
 
     # ── Build context once per session (or on demand) ─────────────────────────
     if "ai_context" not in st.session_state:
