@@ -46,22 +46,33 @@ def _validate_band(value: float, band: tuple, name: str) -> bool:
     return lo <= float(value) <= hi
 
 
+@st.cache_data(ttl=300)
 def _load_profiles() -> dict:
-    """Return mapping {profile_name: BufferProfile} for selectbox use."""
+    """Return mapping {profile_name: plain dict} — cached 5 min."""
     session = get_session()
     try:
         profs = session.query(BufferProfile).order_by(BufferProfile.name).all()
-        return {p.name: p for p in profs}
+        return {
+            p.name: {
+                "id": p.id,
+                "lt_category": p.lt_category,
+                "var_category": p.var_category,
+                "default_ltf": p.default_ltf,
+                "default_vf": p.default_vf,
+            }
+            for p in profs
+        }
     finally:
         session.close()
 
 
+@st.cache_data(ttl=300)
 def _load_suppliers() -> dict:
-    """Return mapping {display_label: Supplier} for selectbox use."""
+    """Return mapping {display_label: plain dict} — cached 5 min."""
     session = get_session()
     try:
         sups = session.query(Supplier).order_by(Supplier.code).all()
-        return {f"{s.code} — {s.name}": s for s in sups}
+        return {f"{s.code} — {s.name}": {"id": s.id, "code": s.code} for s in sups}
     finally:
         session.close()
 
@@ -393,14 +404,14 @@ def _show_add_item():
         # Resolve buffer profile + validate LTF / VF bands
         chosen_profile = profiles.get(profile_name) if profile_name in profiles else None
         if chosen_profile is not None:
-            ltf_band = LTF_BANDS.get(chosen_profile.lt_category)
-            vf_band  = VF_BANDS.get(chosen_profile.var_category)
+            ltf_band = LTF_BANDS.get(chosen_profile["lt_category"])
+            vf_band  = VF_BANDS.get(chosen_profile["var_category"])
             if ltf_band and not _validate_band(ltf, ltf_band, "LTF"):
-                st.error(f"LTF {ltf} is outside the band for category {chosen_profile.lt_category} "
+                st.error(f"LTF {ltf} is outside the band for category {chosen_profile['lt_category']} "
                          f"(allowed {ltf_band[0]:.2f}-{ltf_band[1]:.2f}).")
                 return
             if vf_band and not _validate_band(vf, vf_band, "VF"):
-                st.error(f"VF {vf} is outside the band for category {chosen_profile.var_category} "
+                st.error(f"VF {vf} is outside the band for category {chosen_profile['var_category']} "
                          f"(allowed {vf_band[0]:.2f}-{vf_band[1]:.2f}).")
                 return
 
@@ -417,7 +428,7 @@ def _show_add_item():
                 category=category.strip(),
                 unit_of_measure=uom,
                 item_type=item_type,
-                buffer_profile_id=chosen_profile.id if chosen_profile else None,
+                buffer_profile_id=chosen_profile["id"] if chosen_profile else None,
                 on_hand=on_hand,
                 adu=adu,
                 dlt=dlt,
@@ -430,7 +441,7 @@ def _show_add_item():
                 unit_cost=unit_cost,
                 ordering_cost=ordering_cost,
                 holding_cost_pct=holding_pct / 100.0,
-                default_supplier_id=suppliers[sup_label].id if sup_label != "— None —" else None,
+                default_supplier_id=suppliers[sup_label]["id"] if sup_label != "— None —" else None,
             )
             session.add(item)
             session.commit()
@@ -559,14 +570,14 @@ def _show_edit_item():
             # Validate LTF/VF against profile bands
             chosen_profile = profiles.get(profile_name) if profile_name in profiles else None
             if chosen_profile is not None:
-                ltf_band = LTF_BANDS.get(chosen_profile.lt_category)
-                vf_band  = VF_BANDS.get(chosen_profile.var_category)
+                ltf_band = LTF_BANDS.get(chosen_profile["lt_category"])
+                vf_band  = VF_BANDS.get(chosen_profile["var_category"])
                 if ltf_band and not _validate_band(ltf, ltf_band, "LTF"):
-                    st.error(f"LTF {ltf} is outside the band for category {chosen_profile.lt_category} "
+                    st.error(f"LTF {ltf} is outside the band for category {chosen_profile['lt_category']} "
                              f"(allowed {ltf_band[0]:.2f}-{ltf_band[1]:.2f}).")
                     return
                 if vf_band and not _validate_band(vf, vf_band, "VF"):
-                    st.error(f"VF {vf} is outside the band for category {chosen_profile.var_category} "
+                    st.error(f"VF {vf} is outside the band for category {chosen_profile['var_category']} "
                              f"(allowed {vf_band[0]:.2f}-{vf_band[1]:.2f}).")
                     return
 
@@ -577,7 +588,7 @@ def _show_edit_item():
                 it.category = category
                 it.unit_of_measure = uom
                 it.item_type = item_type
-                it.buffer_profile_id = chosen_profile.id if chosen_profile else None
+                it.buffer_profile_id = chosen_profile["id"] if chosen_profile else None
                 it.on_hand = on_hand
                 it.adu = adu
                 it.dlt = dlt

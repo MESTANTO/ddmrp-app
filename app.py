@@ -14,8 +14,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Initialise database on first run
-init_db()
+
+# Run DB migrations and seeding only once per server process (not on every rerun)
+@st.cache_resource
+def _init_db_once():
+    init_db()
+    return True
+
+
+_init_db_once()
 
 # ---------------------------------------------------------------------------
 # Sidebar navigation
@@ -41,11 +48,7 @@ PAGES = {
 }
 
 with st.sidebar:
-    st.image(
-        "https://img.icons8.com/fluency/96/delivery-time.png",
-        width=60,
-    )
-    st.title("DDMRP App")
+    st.title("📦 DDMRP App")
     st.caption("Demand Driven MRP")
     st.divider()
 
