@@ -33,32 +33,19 @@ EXEC_LABEL = {
 }
 
 
-def show():
-    st.header("DDMRP Dashboard")
-    st.caption("Live overview of all buffer levels across the manufacturing process.")
-
-    col_refresh, col_ts = st.columns([1, 3])
-    with col_refresh:
-        if st.button("Refresh Buffers", type="primary", use_container_width=True):
-            with st.spinner("Recalculating..."):
-                recalculate_all_buffers()
-            st.success("Buffers refreshed.")
-
+@st.cache_data(ttl=60)
+def _load_dashboard_data() -> list:
+    """Load items, buffers and calculate zones — cached 60 s."""
     session = get_session()
     try:
         items = session.query(Item).all()
-        buffers = {b.item_id: b for b in session.query(Buffer).all()}
+        buf_map = {b.item_id: b for b in session.query(Buffer).all()}
     finally:
         session.close()
 
-    if not items:
-        st.info("No items found. Start in **Material Master** to add items.")
-        return
-
-    # Build summary dataframe (with canonical DDMRP KPIs from calculate_zones)
     rows = []
     for item in items:
-        buf = buffers.get(item.id)
+        buf = buf_map.get(item.id)
         try:
             z = calculate_zones(item)
         except Exception:
@@ -75,15 +62,33 @@ def show():
             "tog": buf.top_of_green if buf else 0.0,
             "suggested_qty": buf.suggested_order_qty if buf else 0.0,
             "last_calc": buf.last_calculated if buf else None,
-            # Execution-side metrics (deck slides 109-118)
             "buffer_status_pct": (buf.buffer_status_pct or 0.0) if buf else 0.0,
             "execution_color":  (buf.execution_color or "green") if buf else "green",
-            # Canonical DDMRP KPIs (deck slides 59 / 92)
             "avg_inv_target":      z.avg_inventory_target     if z else 0.0,
             "order_freq_days":     z.avg_order_frequency_days if z else 0.0,
             "safety_days":         z.safety_days              if z else 0.0,
             "avg_active_orders":   z.avg_active_orders        if z else 0.0,
         })
+    return rows
+
+
+def show():
+    st.header("DDMRP Dashboard")
+    st.caption("Live overview of all buffer levels across the manufacturing process.")
+
+    col_refresh, col_ts = st.columns([1, 3])
+    with col_refresh:
+        if st.button("Refresh Buffers", type="primary", use_container_width=True):
+            with st.spinner("Recalculating..."):
+                recalculate_all_buffers()
+            _load_dashboard_data.clear()   # invalidate cache so new data shows immediately
+            st.success("Buffers refreshed.")
+
+    rows = _load_dashboard_data()
+
+    if not rows:
+        st.info("No items found. Start in **Material Master** to add items.")
+        return
 
     df = pd.DataFrame(rows)
 

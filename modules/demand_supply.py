@@ -40,13 +40,19 @@ def show():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _item_selector(key_suffix=""):
+@st.cache_data(ttl=120)
+def _load_item_options() -> dict:
+    """Return {label: item_id} mapping — cached 2 min."""
     session = get_session()
     try:
         items = session.query(Item).order_by(Item.part_number).all()
-        options = {f"{it.part_number} — {it.description}": it.id for it in items}
+        return {f"{it.part_number} — {it.description}": it.id for it in items}
     finally:
         session.close()
+
+
+def _item_selector(key_suffix=""):
+    options = _load_item_options()
 
     if not options:
         st.warning("No items found. Please add items in **Material Master** first.")

@@ -157,27 +157,22 @@ def _staleness_banner():
     session = get_session()
     try:
         buffers = session.query(Buffer).all()
+        if not buffers:
+            return  # no buffers yet — first-run state, skip banner
+        # Batch-load all items in one query instead of one session per stale buffer
+        items_by_id = {it.id: it for it in session.query(Item).all()}
     finally:
         session.close()
-
-    if not buffers:
-        return  # no buffers yet — first-run state, skip banner
 
     stale = []
     for buf in buffers:
         if is_buffer_stale(buf, window_days=ADU_WINDOW_DAYS):
-            # Fetch item name for the message
-            session2 = get_session()
-            try:
-                from database.db import Item as _Item
-                item = session2.query(_Item).get(buf.item_id)
-                label = item.part_number if item else f"item #{buf.item_id}"
-                age_days = (
-                    (datetime.utcnow() - buf.last_calculated).days
-                    if buf.last_calculated else None
-                )
-            finally:
-                session2.close()
+            item = items_by_id.get(buf.item_id)
+            label = item.part_number if item else f"item #{buf.item_id}"
+            age_days = (
+                (datetime.utcnow() - buf.last_calculated).days
+                if buf.last_calculated else None
+            )
 
             age_str = f"{age_days}d ago" if age_days is not None else "never"
             stale.append(f"**{label}** (last recalc: {age_str})")

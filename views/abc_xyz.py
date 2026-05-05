@@ -58,24 +58,26 @@ ACVS_LABEL = {
 # Entry point
 # ---------------------------------------------------------------------------
 
-def show():
-    st.header("ABC / XYZ / ACV² Analysis")
-    st.caption(
-        "Classify inventory by **consumption value** (ABC) and **demand variability** (XYZ), "
-        "then cross them in the **ACV² matrix** to prioritise control actions."
-    )
-
-    # ── Load data ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def _cached_compute(abc_a: float, abc_ab: float, xyz_x: float, xyz_y: float) -> pd.DataFrame:
+    """Load all items + demand entries and compute classifications — cached 5 min."""
     session = get_session()
     try:
         items = session.query(Item).order_by(Item.part_number).all()
         demands = session.query(DemandEntry).all()
     finally:
         session.close()
-
     if not items:
-        st.info("No items in Material Master yet. Add items first.")
-        return
+        return pd.DataFrame()
+    return _compute(items, demands, abc_a, abc_ab, xyz_x, xyz_y)
+
+
+def show():
+    st.header("ABC / XYZ / ACV² Analysis")
+    st.caption(
+        "Classify inventory by **consumption value** (ABC) and **demand variability** (XYZ), "
+        "then cross them in the **ACV² matrix** to prioritise control actions."
+    )
 
     # ── Threshold controls ────────────────────────────────────────────────────
     with st.expander("⚙️ Classification thresholds", expanded=False):
@@ -93,8 +95,12 @@ def show():
             xyz_y = st.slider("XYZ — Y max CV", xyz_x + 0.05, 2.0, max(xyz_x + 0.50, 1.0),
                                help="CV above X threshold and below this → category Y")
 
-    # ── Compute classifications ───────────────────────────────────────────────
-    df = _compute(items, demands, abc_a / 100, abc_ab / 100, xyz_x, xyz_y)
+    # ── Compute classifications (cached by threshold values) ──────────────────
+    df = _cached_compute(abc_a / 100, abc_ab / 100, xyz_x, xyz_y)
+
+    if df.empty:
+        st.info("No items in Material Master yet. Add items first.")
+        return
 
     if df.empty:
         st.warning("No data available to classify.")
