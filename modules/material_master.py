@@ -5,7 +5,8 @@ Allows users to create, view, edit, and delete items with DDMRP parameters.
 
 import streamlit as st
 import pandas as pd
-from database.db import get_session, Item, BufferProfile, Supplier
+from datetime import datetime, timedelta
+from database.db import get_session, Item, BufferProfile, Supplier, DemandEntry
 from modules.buffer_engine import calculate_zones
 from modules.importer import render_import_widget, build_material_template, import_materials
 from modules.param_calculator import (
@@ -98,7 +99,153 @@ def show():
 # List
 # ---------------------------------------------------------------------------
 
+def _compute_adu_from_actual(lookback_days: int) -> list[dict]:
+    """
+    For every item, sum actual demand entries in the past `lookback_days`
+    and divide by the period to get a simple historical ADU.
+    Returns a list of dicts ready for a DataFrame.
+    """
+    today_dt = datetime.utcnow()
+    since    = today_dt - timedelta(days=lookback_days)
+
+    session = get_session()
+    try:
+        items = session.query(Item).order_by(Item.part_number).all()
+        results = []
+        for it in items:
+            entries = (
+                session.query(DemandEntry)
+                .filter(
+                    DemandEntry.item_id    == it.id,
+                    DemandEntry.demand_type == "actual",
+                    DemandEntry.demand_date >= since,
+                    DemandEntry.demand_date <= today_dt,
+                ).all()
+            )
+            total_qty   = sum(e.quantity for e in entries)
+            demand_days = len({e.demand_date.date() for e in entries})
+            calc_adu    = round(total_qty / lookback_days, 4)
+            delta_pct   = (
+                f"{((calc_adu - it.adu) / it.adu) * 100:+.1f}%"
+                if it.adu else "—"
+            )
+            results.append({
+                "item_id":      it.id,
+                "Part Number":  it.part_number,
+                "Description":  it.description,
+                "Current ADU":  it.adu,
+                "Calc ADU":     calc_adu,
+                "Δ":            delta_pct,
+                "Demand Days":  demand_days,
+                "Total Qty":    round(total_qty, 2),
+            })
+    finally:
+        session.close()
+    return results
+
+
+def _apply_adu_results(results: list[dict], part_numbers: list[str] | None = None):
+    """Write calculated ADU back to the Item rows."""
+    session = get_session()
+    try:
+        for r in results:
+            if part_numbers is not None and r["Part Number"] not in part_numbers:
+                continue
+            item = session.query(Item).get(r["item_id"])
+            if item:
+                item.adu = r["Calc ADU"]
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        raise e
+    finally:
+        session.close()
+
+
+def _show_adu_from_demand():
+    """Quick ADU recalculation from actual demand — shown as an expander in Item List."""
+    with st.expander("🔄 Recalculate ADU from Actual Demand", expanded=False):
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            lookback = st.number_input(
+                "Lookback period (days)", min_value=7, max_value=730,
+                value=90, step=7,
+                help="Number of past calendar days of actual demand to use.",
+                key="adu_lookback",
+            )
+
+        with col2:
+            st.markdown(
+                "Calculates **ADU = total actual demand ÷ lookback days** for every item. "
+                "Only `actual` demand entries are used. Preview the changes before applying."
+            )
+
+        if st.button("📊 Calculate ADU", key="calc_adu_btn", type="primary"):
+            with st.spinner("Calculating…"):
+                st.session_state["adu_results"] = _compute_adu_from_actual(int(lookback))
+
+        results = st.session_state.get("adu_results")
+        if not results:
+            return
+
+        df = pd.DataFrame([{k: v for k, v in r.items() if k != "item_id"} for r in results])
+
+        def _style_row(row):
+            try:
+                changed = abs(float(row["Calc ADU"]) - float(row["Current ADU"])) > 0.001
+            except Exception:
+                changed = False
+            bg = "#EBF5FB" if changed else "#FFFFFF"
+            return [f"background-color: {bg}; color: #1A1A1A"] * len(row)
+
+        st.dataframe(
+            df.style.apply(_style_row, axis=1),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption(
+            f"Blue rows = ADU value will change. "
+            f"Items with 0 demand days had no actual entries in the last {lookback} days."
+        )
+
+        st.divider()
+        confirmed = st.checkbox(
+            "I have reviewed the values and want to apply them",
+            key="adu_apply_confirm",
+        )
+
+        ca, cb, _ = st.columns([1, 2, 2])
+        with ca:
+            if st.button("✅ Apply to All", type="primary",
+                         disabled=not confirmed, key="adu_apply_all"):
+                try:
+                    _apply_adu_results(results)
+                    st.success(f"ADU updated for {len(results)} item(s).")
+                    st.session_state.pop("adu_results", None)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+        with cb:
+            selected = st.multiselect(
+                "Or apply to specific items",
+                [r["Part Number"] for r in results],
+                key="adu_apply_select",
+            )
+            if selected and confirmed:
+                if st.button("Apply to Selected", key="adu_apply_sel_btn"):
+                    try:
+                        _apply_adu_results(results, selected)
+                        st.success(f"ADU updated for: {', '.join(selected)}")
+                        st.session_state.pop("adu_results", None)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+
 def _show_item_list():
+    _show_adu_from_demand()
+    st.divider()
+
     session = get_session()
     try:
         items = session.query(Item).order_by(Item.part_number).all()
