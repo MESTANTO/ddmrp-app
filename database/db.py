@@ -454,6 +454,8 @@ def init_db():
     _migrate_process_node_items()
     _migrate_supplier_columns()
     _migrate_company_columns()   # multi-tenancy: adds company_id, creates default company
+    # Ensure demo user always exists (idempotent — safe to call every startup)
+    _ensure_demo_user()
 
 
 def _migrate_buffer_columns():
@@ -510,10 +512,10 @@ def _migrate_company_columns():
         _seed_buffer_profiles(cid)
         _seed_settings(cid)
 
-        # Ensure the demo user exists and is linked to the Demo Company
-        _seed_demo_user(session, cid)
-
         session.commit()
+
+        # Ensure the demo user exists and is linked to the Demo Company
+        _seed_demo_user(cid)
     except Exception:
         session.rollback()
     finally:
@@ -617,27 +619,49 @@ def _seed_settings(company_id: int):
         session.close()
 
 
-def _seed_demo_user(session, company_id: int):
+def _seed_demo_user(company_id: int):
     """Create the demo user if it doesn't exist yet (idempotent)."""
     import hashlib, os as _os
-    existing = session.query(User).filter_by(username="demo").first()
-    if existing is None:
-        salt = _os.urandom(32)
-        key  = hashlib.pbkdf2_hmac("sha256", b"demo1234", salt, 260_000)
-        pw_hash = salt.hex() + ":" + key.hex()
-        demo = User(
-            username="demo",
-            email="demo@ddmrp.app",
-            password_hash=pw_hash,
-            company_id=company_id,
-            role="user",
-            is_active=True,
-        )
-        session.add(demo)
-    else:
-        # Make sure existing demo user is linked to the demo company
-        if existing.company_id != company_id:
-            existing.company_id = company_id
+    session = SessionLocal()
+    try:
+        existing = session.query(User).filter_by(username="demo").first()
+        if existing is None:
+            salt = _os.urandom(32)
+            key  = hashlib.pbkdf2_hmac("sha256", b"demo1234", salt, 260_000)
+            pw_hash = salt.hex() + ":" + key.hex()
+            demo = User(
+                username="demo",
+                email="demo@ddmrp.app",
+                password_hash=pw_hash,
+                company_id=company_id,
+                role="user",
+                is_active=True,
+            )
+            session.add(demo)
+            session.commit()
+        else:
+            if existing.company_id != company_id:
+                existing.company_id = company_id
+                session.commit()
+    except Exception:
+        session.rollback()
+    finally:
+        session.close()
+
+
+def _ensure_demo_user():
+    """Called on every startup to guarantee the demo user exists."""
+    session = SessionLocal()
+    try:
+        co = session.query(Company).filter(
+            Company.name.in_(["Demo Company", "Default Company"])
+        ).first()
+        if co:
+            _seed_demo_user(co.id)
+    except Exception:
+        pass
+    finally:
+        session.close()
 
 
 def seed_company_data(company_id: int):
