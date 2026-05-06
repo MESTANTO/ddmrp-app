@@ -41,6 +41,7 @@ from datetime import datetime, timedelta, date
 from statistics import mean, stdev
 from typing import Optional
 from database.db import get_session, Item, DemandEntry, SupplyEntry
+from database.auth import get_company_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,11 +242,15 @@ def calculate_all_params(
     adu_method: str      = "blended",
     past_weight: float   = 0.6,
     forward_weight: float = 0.4,
+    company_id: int      = None,
 ) -> list:
     """Run dynamic parameter calculation for every item."""
     session = get_session()
     try:
-        items = session.query(Item).all()
+        q = session.query(Item)
+        if company_id is not None:
+            q = q.filter(Item.company_id == company_id)
+        items = q.all()
     finally:
         session.close()
 

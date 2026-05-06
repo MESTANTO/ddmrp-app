@@ -22,6 +22,7 @@ from datetime import datetime
 from database.db import (
     get_session, Item, Buffer, Process, ProcessNode, ProcessEdge, ProcessNodeItem
 )
+from database.auth import get_company_id
 from modules.importer import render_import_widget, build_process_template, import_process_nodes
 
 
@@ -114,7 +115,7 @@ def _manage_processes():
 
     session = get_session()
     try:
-        processes = session.query(Process).order_by(Process.name).all()
+        processes = session.query(Process).filter(Process.company_id == get_company_id()).order_by(Process.name).all()
         process_data = [{"ID": p.id, "Name": p.name, "Description": p.description,
                          "Nodes": len(p.nodes)} for p in processes]
     finally:
@@ -138,7 +139,7 @@ def _manage_processes():
             return
         session = get_session()
         try:
-            proc = Process(name=name.strip(), description=description.strip())
+            proc = Process(name=name.strip(), description=description.strip(), company_id=get_company_id())
             session.add(proc)
             session.commit()
             st.success(f"Process **{name}** created.")
@@ -149,7 +150,7 @@ def _manage_processes():
     # Delete
     session = get_session()
     try:
-        processes = session.query(Process).order_by(Process.name).all()
+        processes = session.query(Process).filter(Process.company_id == get_company_id()).order_by(Process.name).all()
         del_options = {f"{p.id} — {p.name}": p.id for p in processes}
     finally:
         session.close()
@@ -179,7 +180,7 @@ def _manage_processes():
 def _design_process():
     session = get_session()
     try:
-        processes = session.query(Process).order_by(Process.name).all()
+        processes = session.query(Process).filter(Process.company_id == get_company_id()).order_by(Process.name).all()
         proc_options = {f"{p.id} — {p.name}": p.id for p in processes}
     finally:
         session.close()
@@ -227,7 +228,7 @@ def _design_process():
 
         session = get_session()
         try:
-            all_items = session.query(Item).order_by(Item.part_number).all()
+            all_items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
             item_label_to_id = {f"{it.part_number} — {it.description}": it.id
                                 for it in all_items}
         finally:
@@ -318,7 +319,7 @@ def _design_process():
             try:
                 current_iids = {pni.item_id for pni in
                                 session.query(ProcessNodeItem).filter_by(node_id=sel_node_id).all()}
-                all_items = session.query(Item).order_by(Item.part_number).all()
+                all_items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
                 item_label_to_id2 = {f"{it.part_number} — {it.description}": it.id
                                      for it in all_items}
                 current_labels = [lbl for lbl, iid in item_label_to_id2.items()
@@ -473,7 +474,7 @@ def _design_process():
 def _view_process_map():
     session = get_session()
     try:
-        processes = session.query(Process).order_by(Process.name).all()
+        processes = session.query(Process).filter(Process.company_id == get_company_id()).order_by(Process.name).all()
         proc_options = {f"{p.id} — {p.name}": p.id for p in processes}
     finally:
         session.close()

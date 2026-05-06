@@ -23,6 +23,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from database.db import get_session, Item, DemandEntry
+from database.auth import get_company_id
 
 
 # ── Colour palettes ──────────────────────────────────────────────────────────
@@ -59,12 +60,13 @@ ACVS_LABEL = {
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=300)
-def _cached_compute(abc_a: float, abc_ab: float, xyz_x: float, xyz_y: float) -> pd.DataFrame:
+def _cached_compute(company_id: int, abc_a: float, abc_ab: float, xyz_x: float, xyz_y: float) -> pd.DataFrame:
     """Load all items + demand entries and compute classifications — cached 5 min."""
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
-        demands = session.query(DemandEntry).all()
+        items = session.query(Item).filter(Item.company_id == company_id).order_by(Item.part_number).all()
+        item_ids = [i.id for i in items]
+        demands = session.query(DemandEntry).filter(DemandEntry.item_id.in_(item_ids)).all() if item_ids else []
     finally:
         session.close()
     if not items:
@@ -96,14 +98,10 @@ def show():
                                help="CV above X threshold and below this → category Y")
 
     # ── Compute classifications (cached by threshold values) ──────────────────
-    df = _cached_compute(abc_a / 100, abc_ab / 100, xyz_x, xyz_y)
+    df = _cached_compute(get_company_id(), abc_a / 100, abc_ab / 100, xyz_x, xyz_y)
 
     if df.empty:
         st.info("No items in Material Master yet. Add items first.")
-        return
-
-    if df.empty:
-        st.warning("No data available to classify.")
         return
 
     missing_cost = (df["unit_cost"] == 0).sum()

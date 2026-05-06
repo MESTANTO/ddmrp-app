@@ -5,6 +5,7 @@ Run with: streamlit run app.py
 
 import streamlit as st
 from database.db import init_db
+from database.auth import is_authenticated, has_company, get_current_user, logout
 from styles import inject_css
 
 # Page config
@@ -26,6 +27,20 @@ def _init_db_once():
 
 
 _init_db_once()
+
+# ---------------------------------------------------------------------------
+# Auth gate — must be authenticated before anything else is shown
+# ---------------------------------------------------------------------------
+
+if not is_authenticated():
+    from views.login import show as _show_login
+    _show_login()
+    st.stop()
+
+if not has_company():
+    from views.company_setup import show_setup as _show_company_setup
+    _show_company_setup()
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Sidebar navigation
@@ -50,6 +65,9 @@ PAGES = {
     "⚙️  Settings":                  "settings",
 }
 
+_user = get_current_user()
+_company_id = _user.get("company_id")
+
 with st.sidebar:
     st.markdown(
         "<div style='margin-bottom:0.15rem'>"
@@ -71,6 +89,22 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     st.divider()
+
+    # User / company info + logout
+    from database.auth import get_company_info
+    _co = get_company_info(_company_id) if _company_id else {}
+    st.markdown(
+        f"<div style='font-size:0.7rem;color:#7A92BB;margin-bottom:0.15rem'>"
+        f"<span style='color:#3D5577'>COMPANY</span><br>"
+        f"<strong style='color:#E8F0FF'>{_co.get('name', '—')}</strong>"
+        f"</div>"
+        f"<div style='font-size:0.68rem;color:#3D5577;margin-bottom:0.75rem'>"
+        f"{_user['username']}</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("Sign Out", use_container_width=True, type="secondary"):
+        logout()
+        st.rerun()
     st.caption("v1.0  ·  Streamlit")
 
 # ---------------------------------------------------------------------------

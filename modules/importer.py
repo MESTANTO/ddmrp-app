@@ -8,6 +8,7 @@ import io
 import pandas as pd
 from datetime import datetime
 from openpyxl import Workbook
+from database.auth import get_company_id
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side, Protection
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -278,8 +279,9 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
 
     session = get_session()
     try:
-        # DELETE all existing items (cascades to demand, supply, buffers)
-        session.query(Item).delete()
+        # DELETE all existing items for this company (cascades to demand, supply, buffers)
+        cid = get_company_id()
+        session.query(Item).filter(Item.company_id == cid).delete()
         session.flush()
 
         # INSERT fresh data from file
@@ -301,6 +303,7 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
                 unit_cost=d["unit_cost"],
                 ordering_cost=d["ordering_cost"],
                 holding_cost_pct=d["holding_cost_pct"],
+                company_id=cid,
             ))
             success += 1
 
@@ -368,7 +371,7 @@ def import_demand(uploaded_file) -> tuple[int, list[str]]:
     # --- Pre-validate ---
     session = get_session()
     try:
-        item_map = {it.part_number: it.id for it in session.query(Item).all()}
+        item_map = {it.part_number: it.id for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
     finally:
         session.close()
 
@@ -477,7 +480,7 @@ def import_supply(uploaded_file) -> tuple[int, list[str]]:
     # --- Pre-validate ---
     session = get_session()
     try:
-        item_map = {it.part_number: it.id for it in session.query(Item).all()}
+        item_map = {it.part_number: it.id for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
     finally:
         session.close()
 
@@ -589,7 +592,7 @@ def import_process_nodes(uploaded_file) -> tuple[int, list[str]]:
     # --- Pre-validate ---
     session = get_session()
     try:
-        item_map = {it.part_number: it.id for it in session.query(Item).all()}
+        item_map = {it.part_number: it.id for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
     finally:
         session.close()
 
@@ -635,8 +638,9 @@ def import_process_nodes(uploaded_file) -> tuple[int, list[str]]:
     try:
         # DELETE all nodes and edges for processes referenced in the file
         # (edges cascade-delete via ProcessNode relationship)
+        cid = get_company_id()
         for proc_name in referenced_processes:
-            proc = session.query(Process).filter_by(name=proc_name).first()
+            proc = session.query(Process).filter(Process.company_id == cid, Process.name == proc_name).first()
             if proc:
                 # Delete edges first to avoid FK issues
                 session.query(ProcessEdge).filter_by(process_id=proc.id).delete()
@@ -645,9 +649,9 @@ def import_process_nodes(uploaded_file) -> tuple[int, list[str]]:
 
         # Re-fetch or create processes after deletion
         for node in new_nodes:
-            proc = session.query(Process).filter_by(name=node["proc_name"]).first()
+            proc = session.query(Process).filter(Process.company_id == cid, Process.name == node["proc_name"]).first()
             if not proc:
-                proc = Process(name=node["proc_name"])
+                proc = Process(name=node["proc_name"], company_id=cid)
                 session.add(proc)
                 session.flush()
             node["process_id"] = proc.id
@@ -726,7 +730,7 @@ def import_bom(uploaded_file) -> tuple[int, list[str]]:
         session.query(BomLine).delete()
         session.commit()
 
-        items_by_pn = {it.part_number.strip(): it for it in session.query(Item).all()}
+        items_by_pn = {it.part_number.strip(): it for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
 
         for i, row in df.iterrows():
             row_num = i + 4
@@ -829,7 +833,7 @@ def import_adjustments(uploaded_file) -> tuple[int, list[str]]:
         session.query(BufferAdjustment).delete()
         session.commit()
 
-        items_by_pn = {it.part_number.strip(): it for it in session.query(Item).all()}
+        items_by_pn = {it.part_number.strip(): it for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
 
         for i, row in df.iterrows():
             row_num = i + 4

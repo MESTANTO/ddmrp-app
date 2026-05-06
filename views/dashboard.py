@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 from database.db import get_session, Item, Buffer
+from database.auth import get_company_id
 from modules.buffer_engine import recalculate_all_buffers, calculate_zones
 
 
@@ -34,11 +35,11 @@ EXEC_LABEL = {
 
 
 @st.cache_data(ttl=60)
-def _load_dashboard_data() -> list:
+def _load_dashboard_data(company_id: int) -> list:
     """Load items, buffers and calculate zones — cached 60 s."""
     session = get_session()
     try:
-        items = session.query(Item).all()
+        items = session.query(Item).filter(Item.company_id == company_id).all()
         buf_map = {b.item_id: b for b in session.query(Buffer).all()}
     finally:
         session.close()
@@ -80,11 +81,11 @@ def show():
     with col_refresh:
         if st.button("Refresh Buffers", type="primary", use_container_width=True):
             with st.spinner("Recalculating..."):
-                recalculate_all_buffers()
+                recalculate_all_buffers(company_id=get_company_id())
             _load_dashboard_data.clear()   # invalidate cache so new data shows immediately
             st.success("Buffers refreshed.")
 
-    rows = _load_dashboard_data()
+    rows = _load_dashboard_data(get_company_id())
 
     if not rows:
         st.info("No items found. Start in **Material Master** to add items.")

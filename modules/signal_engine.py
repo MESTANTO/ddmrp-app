@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import date, datetime, timedelta
 from database.db import get_session, Item, Buffer
+from database.auth import get_company_id
 from modules.buffer_engine import (
     recalculate_all_buffers,
     project_all_buffers,
@@ -95,9 +96,9 @@ def show():
             f"Recalculating buffer zones with dynamic ADU "
             f"(last {int(window)} days of demand)…"
         ):
-            recalculate_all_buffers(window_days=int(window))
-            signals  = project_all_buffers(horizon_days=int(horizon))
-            planning = plan_all_items(horizon_days=int(horizon))
+            recalculate_all_buffers(window_days=int(window), company_id=get_company_id())
+            signals  = project_all_buffers(horizon_days=int(horizon), company_id=get_company_id())
+            planning = plan_all_items(horizon_days=int(horizon), company_id=get_company_id())
         st.session_state["signals"]  = signals
         st.session_state["planning"] = planning
         st.session_state["horizon"]  = int(horizon)
@@ -160,7 +161,7 @@ def _staleness_banner():
         if not buffers:
             return  # no buffers yet — first-run state, skip banner
         # Batch-load all items in one query instead of one session per stale buffer
-        items_by_id = {it.id: it for it in session.query(Item).all()}
+        items_by_id = {it.id: it for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
     finally:
         session.close()
 
@@ -640,7 +641,7 @@ def _action_label(s: ReplenishmentSignal, today: date) -> str:
 def _load_signals(horizon: int) -> list:
     session = get_session()
     try:
-        items = session.query(Item).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).all()
     finally:
         session.close()
     results = []
@@ -655,7 +656,7 @@ def _load_signals(horizon: int) -> list:
 def _load_planning(horizon: int) -> list:
     session = get_session()
     try:
-        items = session.query(Item).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).all()
     finally:
         session.close()
     results = []

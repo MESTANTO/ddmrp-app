@@ -14,6 +14,7 @@ from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 
 from database.db import get_session, Supplier, Item
+from database.auth import get_company_id
 
 # ── Styling constants (match the rest of the app) ────────────────────────────
 HEADER_FILL = PatternFill("solid", fgColor="2C3E50")
@@ -88,7 +89,7 @@ def show():
 def _render_list():
     session = get_session()
     try:
-        suppliers = session.query(Supplier).order_by(Supplier.code).all()
+        suppliers = session.query(Supplier).filter(Supplier.company_id == get_company_id()).order_by(Supplier.code).all()
         rows = []
         for s in suppliers:
             item_count = len(s.items)
@@ -147,7 +148,7 @@ def _render_add():
     st.subheader("Add New Supplier")
     session = get_session()
     try:
-        existing_codes = {s.code for s in session.query(Supplier.code).all()}
+        existing_codes = {s.code for s in session.query(Supplier.code).filter(Supplier.company_id == get_company_id()).all()}
     finally:
         session.close()
 
@@ -223,6 +224,7 @@ def _render_add():
                 lead_time_days=int(lead_time), reliability_pct=reliability,
                 payment_terms=payment, currency=currency, incoterms=incoterms,
                 status=status, certifications=certifications, notes=notes,
+                company_id=get_company_id(),
             ))
             session.commit()
             st.success(f"Supplier **{code}** added.")
@@ -241,7 +243,7 @@ def _render_add():
 def _render_edit():
     session = get_session()
     try:
-        suppliers = session.query(Supplier).order_by(Supplier.code).all()
+        suppliers = session.query(Supplier).filter(Supplier.company_id == get_company_id()).order_by(Supplier.code).all()
         sup_opts  = {f"{s.code} — {s.name}": s.id for s in suppliers}
     finally:
         session.close()
@@ -460,7 +462,8 @@ def _import_suppliers(file) -> tuple[int, list[str]]:
     ok = 0
     errors = []
     try:
-        existing = {s.code: s for s in session.query(Supplier).all()}
+        cid = get_company_id()
+        existing = {s.code: s for s in session.query(Supplier).filter(Supplier.company_id == cid).all()}
         for i, row in df.iterrows():
             code = _get(row, "Supplier Code")
             name = _get(row, "Name")
@@ -468,7 +471,7 @@ def _import_suppliers(file) -> tuple[int, list[str]]:
                 errors.append(f"Row {i+4}: missing Supplier Code or Name — skipped.")
                 continue
 
-            s = existing.get(code) or Supplier(code=code)
+            s = existing.get(code) or Supplier(code=code, company_id=cid)
             s.name                    = name
             s.country                 = _get(row, "Country")
             s.city                    = _get(row, "City")
@@ -521,7 +524,7 @@ def _import_suppliers(file) -> tuple[int, list[str]]:
 def _export_suppliers() -> bytes:
     session = get_session()
     try:
-        suppliers = session.query(Supplier).order_by(Supplier.code).all()
+        suppliers = session.query(Supplier).filter(Supplier.company_id == get_company_id()).order_by(Supplier.code).all()
     finally:
         session.close()
 

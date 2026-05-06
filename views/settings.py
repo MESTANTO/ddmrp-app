@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import streamlit as st
 from database.db import get_session, Settings
+from database.auth import get_company_id
 from modules.buffer_engine import ADU_WINDOW_DAYS
 
 
@@ -43,11 +44,12 @@ def _ensure_settings_columns():
 def _load_settings() -> Settings:
     session = get_session()
     try:
-        s = session.query(Settings).first()
+        s = session.query(Settings).filter_by(company_id=get_company_id()).first()
         if s is None:
             s = Settings(
                 default_spike_horizon_days=0,
                 default_spike_threshold_factor=2.0,
+                company_id=get_company_id(),
             )
             session.add(s)
             session.commit()
@@ -142,9 +144,9 @@ def show():
     if st.button("💾 Save Settings", type="primary"):
         session = get_session()
         try:
-            obj = session.query(Settings).first()
+            obj = session.query(Settings).filter_by(company_id=get_company_id()).first()
             if obj is None:
-                obj = Settings()
+                obj = Settings(company_id=get_company_id())
                 session.add(obj)
 
             obj.default_spike_horizon_days    = int(spike_horizon)

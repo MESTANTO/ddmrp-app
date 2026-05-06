@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 from database.db import get_session, Item, BufferProfile, Supplier, DemandEntry
+from database.auth import get_company_id
 from modules.buffer_engine import calculate_zones
 from modules.importer import render_import_widget, build_material_template, import_materials
 from modules.param_calculator import (
@@ -47,11 +48,13 @@ def _validate_band(value: float, band: tuple, name: str) -> bool:
 
 
 @st.cache_data(ttl=300)
-def _load_profiles() -> dict:
-    """Return mapping {profile_name: plain dict} — cached 5 min."""
+def _load_profiles(company_id: int) -> dict:
+    """Return mapping {profile_name: plain dict} — cached 5 min per company."""
     session = get_session()
     try:
-        profs = session.query(BufferProfile).order_by(BufferProfile.name).all()
+        profs = session.query(BufferProfile).filter(
+            BufferProfile.company_id == company_id
+        ).order_by(BufferProfile.name).all()
         return {
             p.name: {
                 "id": p.id,
@@ -67,11 +70,13 @@ def _load_profiles() -> dict:
 
 
 @st.cache_data(ttl=300)
-def _load_suppliers() -> dict:
-    """Return mapping {display_label: plain dict} — cached 5 min."""
+def _load_suppliers(company_id: int) -> dict:
+    """Return mapping {display_label: plain dict} — cached 5 min per company."""
     session = get_session()
     try:
-        sups = session.query(Supplier).order_by(Supplier.code).all()
+        sups = session.query(Supplier).filter(
+            Supplier.company_id == company_id
+        ).order_by(Supplier.code).all()
         return {f"{s.code} — {s.name}": {"id": s.id, "code": s.code} for s in sups}
     finally:
         session.close()
@@ -121,7 +126,7 @@ def _compute_adu_from_actual(lookback_days: int) -> list[dict]:
 
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
         results = []
         for it in items:
             entries = (
@@ -259,7 +264,7 @@ def _show_item_list():
 
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
 
         if not items:
             st.info("No items yet. Go to the **Add Item** tab to create one.")
@@ -304,9 +309,9 @@ def _show_item_list():
 # ---------------------------------------------------------------------------
 
 def _show_add_item():
-    profiles = _load_profiles()
+    profiles = _load_profiles(get_company_id())
     profile_options = ["(none — manual LTF/VF)"] + list(profiles.keys())
-    suppliers = _load_suppliers()
+    suppliers = _load_suppliers(get_company_id())
     supplier_options = ["— None —"] + list(suppliers.keys())
 
     with st.form("add_item_form", clear_on_submit=True):
@@ -442,6 +447,7 @@ def _show_add_item():
                 ordering_cost=ordering_cost,
                 holding_cost_pct=holding_pct / 100.0,
                 default_supplier_id=suppliers[sup_label]["id"] if sup_label != "— None —" else None,
+                company_id=get_company_id(),
             )
             session.add(item)
             session.commit()
@@ -465,7 +471,7 @@ def _show_add_item():
 def _show_edit_item():
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
         item_options = {f"{it.part_number} — {it.description}": it.id for it in items}
     finally:
         session.close()
@@ -477,7 +483,7 @@ def _show_edit_item():
     selected_label = st.selectbox("Select Item", list(item_options.keys()))
     selected_id = item_options[selected_label]
 
-    profiles = _load_profiles()
+    profiles = _load_profiles(get_company_id())
     profile_options = ["(none — manual LTF/VF)"] + list(profiles.keys())
 
     session = get_session()
@@ -677,7 +683,7 @@ def _show_param_calculator():
         if scope == "Selected item":
             session = get_session()
             try:
-                items = session.query(Item).order_by(Item.part_number).all()
+                items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
                 item_opts = {f"{it.part_number} — {it.description}": it.id for it in items}
             finally:
                 session.close()

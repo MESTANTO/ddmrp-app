@@ -16,6 +16,7 @@ from database.db import (
     get_session, Item, Buffer, DemandEntry, SupplyEntry,
     BufferAdjustment, BomLine,
 )
+from database.auth import get_company_id
 
 
 STATUS_FILL = {
@@ -100,7 +101,7 @@ def _build_signals_workbook() -> Workbook:
 
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
         buffers = {b.item_id: b for b in session.query(Buffer).all()}
 
         priority = {"red": 0, "yellow": 1, "green": 2}
@@ -190,10 +191,10 @@ def _build_params_workbook() -> Workbook:
 
     from modules.buffer_engine import calculate_zones
     from modules.bom_engine import compute_all_dlt
-    dlt_map = {r.item_id: r for r in compute_all_dlt()}
+    dlt_map = {r.item_id: r for r in compute_all_dlt(company_id=get_company_id())}
     session = get_session()
     try:
-        items   = session.query(Item).order_by(Item.part_number).all()
+        items   = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
         buffers = {b.item_id: b for b in session.query(Buffer).all()}
         for row_idx, item in enumerate(items, start=2):
             z = calculate_zones(item)
@@ -379,7 +380,7 @@ def _export_bom():
 
     if st.button("Generate BOM Report", type="primary", key="exp_bom"):
         from modules.bom_engine import compute_all_dlt
-        dlt_map = {r.item_id: r for r in compute_all_dlt()}
+        dlt_map = {r.item_id: r for r in compute_all_dlt(company_id=get_company_id())}
 
         wb = Workbook()
         ws = wb.active
@@ -392,7 +393,7 @@ def _export_bom():
 
         session = get_session()
         try:
-            items = {it.id: it for it in session.query(Item).all()}
+            items = {it.id: it for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
             lines = session.query(BomLine).order_by(
                 BomLine.parent_item_id, BomLine.child_item_id).all()
             for i, l in enumerate(lines, start=2):

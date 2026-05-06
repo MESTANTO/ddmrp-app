@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from database.db import get_session, Item, Buffer
+from database.auth import get_company_id
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +86,7 @@ def _load_candidates() -> list[AllocationLine]:
     """Load all items that need replenishment (NFP ≤ TOY)."""
     session = get_session()
     try:
-        items   = {it.id: it for it in session.query(Item).all()}
+        items   = {it.id: it for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
         buffers = {b.item_id: b for b in session.query(Buffer).all()}
     finally:
         session.close()
@@ -216,7 +217,7 @@ def allocate_discount(
     # Also add green items so we can top up the truck
     session = get_session()
     try:
-        all_items   = {it.id: it for it in session.query(Item).all()}
+        all_items   = {it.id: it for it in session.query(Item).filter(Item.company_id == get_company_id()).all()}
         all_buffers = {b.item_id: b for b in session.query(Buffer).all()}
     finally:
         session.close()

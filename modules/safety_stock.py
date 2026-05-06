@@ -22,6 +22,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from database.db import get_session, Item, DemandEntry, SupplyEntry
+from database.auth import get_company_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,7 +302,7 @@ def calculate_for_all(*, model, service_level, safety_factor,
                       lookback_days) -> List[SafetyStockResult]:
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
     finally:
         session.close()
 

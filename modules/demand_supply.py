@@ -8,6 +8,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 from database.db import get_session, Item, DemandEntry, SupplyEntry
+from database.auth import get_company_id
 from modules.importer import (
     render_import_widget,
     build_demand_template, import_demand,
@@ -41,18 +42,18 @@ def show():
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=120)
-def _load_item_options() -> dict:
+def _load_item_options(company_id: int) -> dict:
     """Return {label: item_id} mapping — cached 2 min."""
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == company_id).order_by(Item.part_number).all()
         return {f"{it.part_number} — {it.description}": it.id for it in items}
     finally:
         session.close()
 
 
 def _item_selector(key_suffix=""):
-    options = _load_item_options()
+    options = _load_item_options(get_company_id())
 
     if not options:
         st.warning("No items found. Please add items in **Material Master** first.")
@@ -170,7 +171,7 @@ def _update_on_hand():
 
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
     finally:
         session.close()
 

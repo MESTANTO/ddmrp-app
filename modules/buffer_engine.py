@@ -19,6 +19,7 @@ from database.db import (
     get_session, Buffer, Item, DemandEntry, SupplyEntry, Settings,
     BufferAdjustment,
 )
+from database.auth import get_company_id
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,7 @@ def _get_global_settings() -> Tuple[int, float]:
     """Return (default_spike_horizon_days, default_spike_threshold_factor) from Settings."""
     session = get_session()
     try:
-        s = session.query(Settings).first()
+        s = session.query(Settings).filter_by(company_id=get_company_id()).first()
         if s is None:
             return (0, 2.0)
         return (
@@ -540,16 +541,20 @@ def is_buffer_stale(buf: Buffer, window_days: int = ADU_WINDOW_DAYS) -> bool:
     return age >= window_days
 
 
-def recalculate_all_buffers(window_days: int = ADU_WINDOW_DAYS) -> List[BufferStatus]:
+def recalculate_all_buffers(window_days: int = ADU_WINDOW_DAYS, company_id: int = None) -> List[BufferStatus]:
     """Recalculate buffers for every item in the database.
 
     Args:
         window_days: Rolling window (days) used to compute dynamic ADU.
                      Defaults to ADU_WINDOW_DAYS (7 days / 1 week).
+        company_id:  If provided, only recalculate buffers for items belonging to this company.
     """
     session = get_session()
     try:
-        items = session.query(Item).all()
+        q = session.query(Item)
+        if company_id is not None:
+            q = q.filter(Item.company_id == company_id)
+        items = q.all()
         results = []
         for item in items:
             try:
@@ -808,11 +813,14 @@ def project_buffer_forward(item: Item, horizon_days: int = 60) -> ReplenishmentS
     )
 
 
-def project_all_buffers(horizon_days: int = 60) -> List[ReplenishmentSignal]:
+def project_all_buffers(horizon_days: int = 60, company_id: int = None) -> List[ReplenishmentSignal]:
     """Run forward projection for every item."""
     session = get_session()
     try:
-        items = session.query(Item).all()
+        q = session.query(Item)
+        if company_id is not None:
+            q = q.filter(Item.company_id == company_id)
+        items = q.all()
     finally:
         session.close()
 
@@ -1023,11 +1031,14 @@ def plan_replenishment_orders(item: Item, horizon_days: int = 60) -> PlanningRes
     )
 
 
-def plan_all_items(horizon_days: int = 60) -> List[PlanningResult]:
+def plan_all_items(horizon_days: int = 60, company_id: int = None) -> List[PlanningResult]:
     """Run full-horizon planning for every item in the database."""
     session = get_session()
     try:
-        items = session.query(Item).all()
+        q = session.query(Item)
+        if company_id is not None:
+            q = q.filter(Item.company_id == company_id)
+        items = q.all()
     finally:
         session.close()
 

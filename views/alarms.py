@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 from datetime import date, datetime, timedelta
 
 from database.db import get_session, Item, Buffer, SupplyEntry, DemandEntry
+from database.auth import get_company_id
 from modules.buffer_engine import (
     project_buffer_forward,
     calculate_zones,
@@ -118,7 +119,7 @@ def _load_state(horizon: int):
     """
     session = get_session()
     try:
-        items = session.query(Item).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).all()
         buffers = {b.item_id: b for b in session.query(Buffer).all()}
     finally:
         session.close()

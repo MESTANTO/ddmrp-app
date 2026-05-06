@@ -54,6 +54,40 @@ Base = declarative_base()
 
 
 # ---------------------------------------------------------------------------
+# Multi-tenancy: Company & User
+# ---------------------------------------------------------------------------
+
+class Company(Base):
+    """One row per tenant organisation."""
+    __tablename__ = "companies"
+
+    id       = Column(Integer, primary_key=True, autoincrement=True)
+    name     = Column(String, nullable=False)
+    industry = Column(String, default="")
+    country  = Column(String, default="")
+    city     = Column(String, default="")
+    currency = Column(String, default="EUR")
+    website  = Column(String, default="")
+    notes    = Column(Text,   default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class User(Base):
+    """Application user — belongs to one company."""
+    __tablename__ = "users"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    username      = Column(String, unique=True, nullable=False)
+    email         = Column(String, default="")
+    password_hash = Column(String, nullable=False)
+    company_id    = Column(Integer, ForeignKey("companies.id"), nullable=True)
+    role          = Column(String, default="user")   # admin | user
+    is_active     = Column(Boolean, default=True)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    last_login    = Column(DateTime, nullable=True)
+
+
+# ---------------------------------------------------------------------------
 # Material Master
 # ---------------------------------------------------------------------------
 
@@ -102,6 +136,9 @@ class Supplier(Base):
     certifications  = Column(Text,    default="")         # ISO 9001, ISO 14001 …
     notes           = Column(Text,    default="")
 
+    # Multi-tenancy
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -146,6 +183,9 @@ class Item(Base):
     # Default supplier
     default_supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
 
+    # Multi-tenancy
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
+
     # Relationships
     demand_entries = relationship("DemandEntry", back_populates="item", cascade="all, delete")
     supply_entries = relationship("SupplyEntry", back_populates="item", cascade="all, delete")
@@ -184,6 +224,7 @@ class BufferProfile(Base):
     var_category = Column(String, nullable=False)     # L | M | H
     default_ltf = Column(Float, nullable=False)
     default_vf = Column(Float, nullable=False)
+    company_id  = Column(Integer, ForeignKey("companies.id"), nullable=True)
 
     items = relationship("Item", back_populates="buffer_profile")
 
@@ -228,10 +269,13 @@ class BufferAdjustment(Base):
 # ---------------------------------------------------------------------------
 
 class Settings(Base):
-    """Singleton row holding global app defaults (id=1)."""
+    """One row per company holding global app defaults."""
     __tablename__ = "settings"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Multi-tenancy
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
 
     # Global ASOH defaults (slide 83) - used when item-level overrides are NULL
     default_spike_horizon_days = Column(Integer, default=0)         # 0 -> fall back to DLT
@@ -389,6 +433,7 @@ class Process(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=False)
     description = Column(Text, default="")
+    company_id  = Column(Integer, ForeignKey("companies.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     nodes = relationship("ProcessNode", back_populates="process", cascade="all, delete")
@@ -408,9 +453,7 @@ def init_db():
     _migrate_bom_columns()
     _migrate_process_node_items()
     _migrate_supplier_columns()
-    # Seed reference data
-    _seed_buffer_profiles()
-    _seed_settings()
+    _migrate_company_columns()   # multi-tenancy: adds company_id, creates default company
 
 
 def _migrate_buffer_columns():
@@ -428,6 +471,44 @@ def _migrate_buffer_columns():
 def _migrate_bom_columns():
     """bom_lines is created by create_all; no extra columns to migrate yet."""
     pass  # placeholder — keeps the pattern consistent if columns are added later
+
+
+def _migrate_company_columns():
+    """
+    Add company_id to all root tables, create a Default Company for existing
+    data, and seed profiles + settings for that company. Fully idempotent.
+    """
+    import sqlalchemy as sa
+
+    for table in ("items", "suppliers", "buffer_profiles", "processes", "settings"):
+        _add_columns_safely(table, [("company_id", "INTEGER", "INTEGER")])
+
+    session = SessionLocal()
+    try:
+        # Ensure a Default Company exists for any pre-existing (unscoped) data
+        default_co = session.query(Company).filter_by(name="Default Company").first()
+        if default_co is None:
+            default_co = Company(name="Default Company", currency="EUR")
+            session.add(default_co)
+            session.flush()   # get the id
+
+        cid = default_co.id
+
+        # Assign all unscoped rows to the Default Company
+        for tbl in ("items", "suppliers", "buffer_profiles", "processes", "settings"):
+            session.execute(
+                sa.text(f"UPDATE {tbl} SET company_id = :cid WHERE company_id IS NULL"),
+                {"cid": cid},
+            )
+        session.commit()
+
+        # Seed profiles + settings for the Default Company if not yet done
+        _seed_buffer_profiles(cid)
+        _seed_settings(cid)
+    except Exception:
+        session.rollback()
+    finally:
+        session.close()
 
 
 def _migrate_supplier_columns():
@@ -483,11 +564,14 @@ _VF_MID  = {"L": 0.20, "M": 0.50, "H": 0.80}
 _ITEM_TYPES = ("M", "I", "P", "D")
 
 
-def _seed_buffer_profiles():
-    """Pre-populate the 36-cell profile matrix (4 item types x 3 LT cats x 3 VF cats)."""
+def _seed_buffer_profiles(company_id: int):
+    """Seed the 36-cell profile matrix for a specific company (idempotent)."""
     session = SessionLocal()
     try:
-        existing = {p.name for p in session.query(BufferProfile).all()}
+        existing = {
+            p.name for p in
+            session.query(BufferProfile).filter_by(company_id=company_id).all()
+        }
         for it in _ITEM_TYPES:
             for ltc in ("S", "M", "L"):
                 for vc in ("L", "M", "H"):
@@ -495,12 +579,9 @@ def _seed_buffer_profiles():
                     if name in existing:
                         continue
                     session.add(BufferProfile(
-                        name=name,
-                        item_type=it,
-                        lt_category=ltc,
-                        var_category=vc,
-                        default_ltf=_LTF_MID[ltc],
-                        default_vf=_VF_MID[vc],
+                        name=name, item_type=it, lt_category=ltc, var_category=vc,
+                        default_ltf=_LTF_MID[ltc], default_vf=_VF_MID[vc],
+                        company_id=company_id,
                     ))
         session.commit()
     except Exception:
@@ -509,21 +590,28 @@ def _seed_buffer_profiles():
         session.close()
 
 
-def _seed_settings():
-    """Ensure the Settings singleton row exists."""
+def _seed_settings(company_id: int):
+    """Ensure the Settings row exists for a company (idempotent)."""
     session = SessionLocal()
     try:
-        s = session.query(Settings).first()
+        s = session.query(Settings).filter_by(company_id=company_id).first()
         if s is None:
             session.add(Settings(
-                default_spike_horizon_days=0,        # 0 -> use DLT as horizon
-                default_spike_threshold_factor=2.0,  # 2x ADU per the deck
+                company_id=company_id,
+                default_spike_horizon_days=0,
+                default_spike_threshold_factor=2.0,
             ))
             session.commit()
     except Exception:
         session.rollback()
     finally:
         session.close()
+
+
+def seed_company_data(company_id: int):
+    """Call after creating a new company to provision its reference data."""
+    _seed_buffer_profiles(company_id)
+    _seed_settings(company_id)
 
 
 def _add_columns_safely(table: str, cols):

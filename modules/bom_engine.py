@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from database.db import get_session, Item, Buffer, BomLine
+from database.auth import get_company_id
 
 
 # ---------------------------------------------------------------------------
@@ -149,12 +150,18 @@ def compute_dlt(
     )
 
 
-def compute_all_dlt() -> list[DltResult]:
+def compute_all_dlt(company_id: int = None) -> list[DltResult]:
     """Compute DLT for every item in the database."""
     session = get_session()
     try:
-        items = session.query(Item).all()
-        all_lines = session.query(BomLine).all()
+        q = session.query(Item)
+        if company_id is not None:
+            q = q.filter(Item.company_id == company_id)
+        items = q.all()
+        item_ids = [i.id for i in items]
+        all_lines = session.query(BomLine).filter(
+            BomLine.parent_item_id.in_(item_ids)
+        ).all() if item_ids else []
         all_buffers = {b.item_id: b for b in session.query(Buffer).all()}
     finally:
         session.close()
@@ -218,12 +225,16 @@ def _bom_manager():
 
     session = get_session()
     try:
+        cid = get_company_id()
+        company_items = session.query(Item).filter(Item.company_id == cid).all()
+        item_ids = [it.id for it in company_items]
+        items = {it.id: it for it in company_items}
         lines = (
             session.query(BomLine)
+            .filter(BomLine.parent_item_id.in_(item_ids))
             .order_by(BomLine.parent_item_id, BomLine.child_item_id)
             .all()
-        )
-        items = {it.id: it for it in session.query(Item).all()}
+        ) if item_ids else []
     finally:
         session.close()
 
@@ -378,8 +389,11 @@ def _bom_graph():
 
     session = get_session()
     try:
-        lines  = session.query(BomLine).all()
-        items  = {it.id: it for it in session.query(Item).all()}
+        cid = get_company_id()
+        company_items = session.query(Item).filter(Item.company_id == cid).all()
+        item_ids = [it.id for it in company_items]
+        items  = {it.id: it for it in company_items}
+        lines  = session.query(BomLine).filter(BomLine.parent_item_id.in_(item_ids)).all() if item_ids else []
         bufs   = {b.item_id for b in session.query(Buffer).all()}
     finally:
         session.close()

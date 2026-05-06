@@ -16,6 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from database.db import get_session, Item, BufferAdjustment
+from database.auth import get_company_id
 from modules.buffer_engine import calculate_zones, get_active_factors, load_item_adjustments
 
 
@@ -123,7 +124,7 @@ def _show_list():
 def _show_add():
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
     finally:
         session.close()
 
@@ -230,7 +231,7 @@ def _show_add():
 def _show_factor_chart():
     session = get_session()
     try:
-        items = session.query(Item).order_by(Item.part_number).all()
+        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
     finally:
         session.close()
 
