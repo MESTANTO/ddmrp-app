@@ -485,12 +485,16 @@ def _migrate_company_columns():
 
     session = SessionLocal()
     try:
-        # Ensure a Default Company exists for any pre-existing (unscoped) data
-        default_co = session.query(Company).filter_by(name="Default Company").first()
+        # Ensure the Demo Company exists for any pre-existing (unscoped) data
+        default_co = session.query(Company).filter(
+            Company.name.in_(["Default Company", "Demo Company"])
+        ).first()
         if default_co is None:
-            default_co = Company(name="Default Company", currency="EUR")
+            default_co = Company(name="Demo Company", currency="EUR")
             session.add(default_co)
-            session.flush()   # get the id
+            session.flush()
+        elif default_co.name == "Default Company":
+            default_co.name = "Demo Company"
 
         cid = default_co.id
 
@@ -502,9 +506,14 @@ def _migrate_company_columns():
             )
         session.commit()
 
-        # Seed profiles + settings for the Default Company if not yet done
+        # Seed profiles + settings for the Demo Company if not yet done
         _seed_buffer_profiles(cid)
         _seed_settings(cid)
+
+        # Ensure the demo user exists and is linked to the Demo Company
+        _seed_demo_user(session, cid)
+
+        session.commit()
     except Exception:
         session.rollback()
     finally:
@@ -606,6 +615,29 @@ def _seed_settings(company_id: int):
         session.rollback()
     finally:
         session.close()
+
+
+def _seed_demo_user(session, company_id: int):
+    """Create the demo user if it doesn't exist yet (idempotent)."""
+    import hashlib, os as _os
+    existing = session.query(User).filter_by(username="demo").first()
+    if existing is None:
+        salt = _os.urandom(32)
+        key  = hashlib.pbkdf2_hmac("sha256", b"demo1234", salt, 260_000)
+        pw_hash = salt.hex() + ":" + key.hex()
+        demo = User(
+            username="demo",
+            email="demo@ddmrp.app",
+            password_hash=pw_hash,
+            company_id=company_id,
+            role="user",
+            is_active=True,
+        )
+        session.add(demo)
+    else:
+        # Make sure existing demo user is linked to the demo company
+        if existing.company_id != company_id:
+            existing.company_id = company_id
 
 
 def seed_company_data(company_id: int):

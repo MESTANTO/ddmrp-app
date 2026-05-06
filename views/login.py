@@ -44,6 +44,21 @@ def show():
         st.markdown('<div class="login-logo">DDMRP</div>', unsafe_allow_html=True)
         st.markdown('<div class="login-sub">Demand Driven MRP Platform</div>', unsafe_allow_html=True)
 
+        # Demo credentials hint
+        st.markdown(
+            """
+            <div style="background:#0C1A30;border:1px solid #1E3356;border-left:3px solid #1565FF;
+                        border-radius:6px;padding:0.6rem 0.9rem;margin-bottom:1rem;font-size:0.78rem;
+                        color:#7A92BB;font-family:'IBM Plex Mono',monospace;">
+                <span style="color:#3D5577;font-size:0.65rem;letter-spacing:0.1em;
+                             text-transform:uppercase;font-weight:700;">Demo Access</span><br>
+                Username&nbsp; <strong style="color:#E8F0FF">demo</strong> &nbsp;·&nbsp;
+                Password&nbsp; <strong style="color:#E8F0FF">demo1234</strong>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         tab_login, tab_register = st.tabs(["Sign In", "Create Account"])
 
         # ── Sign In ───────────────────────────────────────────────────────────
