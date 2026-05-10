@@ -79,7 +79,7 @@ def show():
         st.error("**NVIDIA_API_KEY not found in Streamlit secrets.** Add it via Manage app → Secrets.")
         return
 
-    client = OpenAI(base_url=_NVIDIA_BASE, api_key=api_key, timeout=30.0)
+    client = OpenAI(base_url=_NVIDIA_BASE, api_key=api_key, timeout=300.0)
 
     with st.sidebar:
         st.divider()
@@ -96,7 +96,7 @@ def show():
             with st.spinner("Testing…"):
                 try:
                     resp = OpenAI(
-                        base_url=_NVIDIA_BASE, api_key=api_key, timeout=15.0
+                        base_url=_NVIDIA_BASE, api_key=api_key, timeout=60.0
                     ).chat.completions.create(
                         model=model_name,
                         messages=[{"role": "user", "content": "say hi"}],
@@ -111,7 +111,7 @@ def show():
             with st.spinner("Fetching…"):
                 try:
                     result = OpenAI(
-                        base_url=_NVIDIA_BASE, api_key=api_key, timeout=10.0
+                        base_url=_NVIDIA_BASE, api_key=api_key, timeout=20.0
                     ).models.list()
                     st.code("\n".join(m.id for m in result.data))
                 except Exception as e:
@@ -129,7 +129,7 @@ def show():
                 json={"model": "meta/llama-3.1-8b-instruct",
                       "messages": [{"role": "user", "content": "hi"}],
                       "max_tokens": 5},
-                timeout=10,
+                timeout=20,
             )
             st.session_state["nvidia_post_ok"] = r.status_code < 500
             st.session_state["nvidia_post_status"] = r.status_code
