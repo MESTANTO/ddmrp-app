@@ -370,8 +370,11 @@ class AgentRun(Base):
     signals_generated  = Column(Integer, default=0)
     duration_seconds   = Column(Float, nullable=True)
     error_message      = Column(Text, nullable=True)
+    # JSON list of analysis category keys planned for this run
+    analyses_planned   = Column(Text, default="[]")
+    # JSON list of completed analysis category keys
+    analyses_done      = Column(Text, default="[]")
     context_snapshot   = Column(Text, nullable=True)
-    llm_raw_response   = Column(Text, nullable=True)
     created_at         = Column(DateTime, default=datetime.utcnow)
 
     signals = relationship("AgentSignal", back_populates="run", cascade="all, delete")
@@ -381,26 +384,30 @@ class AgentSignal(Base):
     """One finding/recommendation produced by the agent during a run."""
     __tablename__ = "agent_signals"
 
-    id               = Column(Integer, primary_key=True, autoincrement=True)
-    run_id           = Column(Integer, ForeignKey("agent_runs.id"), nullable=False)
-    company_id       = Column(Integer, ForeignKey("companies.id"), nullable=False)
-    item_id          = Column(Integer, ForeignKey("items.id"), nullable=True)
-    part_number      = Column(String, default="")
-    signal_type      = Column(String, nullable=False)
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    run_id            = Column(Integer, ForeignKey("agent_runs.id"), nullable=False)
+    company_id        = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    item_id           = Column(Integer, ForeignKey("items.id"), nullable=True)
+    part_number       = Column(String, default="")
+    # Which analysis category produced this signal
+    analysis_category = Column(String, default="")
+    # e.g. data_quality | buffer_nfp | abc_xyz | demand_variability
+    #      safety_stock | overstock | supplier_risk
+    signal_type       = Column(String, nullable=False)
     # stockout_risk | overstock | low_nfp | buffer_resizing | data_quality
     # demand_trend | abc_xyz_policy | safety_stock_gap | supplier_risk | portfolio
-    severity         = Column(String, default="medium")
+    severity          = Column(String, default="medium")
     # critical | high | medium | low | info
-    title            = Column(String, nullable=False)
-    detail           = Column(Text, nullable=False)
-    recommendation   = Column(Text, default="")
-    metric_name      = Column(String, default="")
-    metric_value     = Column(Float, nullable=True)
-    metric_threshold = Column(Float, nullable=True)
-    is_actioned      = Column(Boolean, default=False)
-    actioned_at      = Column(DateTime, nullable=True)
-    actioned_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at       = Column(DateTime, default=datetime.utcnow)
+    title             = Column(String, nullable=False)
+    detail            = Column(Text, nullable=False)
+    recommendation    = Column(Text, default="")
+    metric_name       = Column(String, default="")
+    metric_value      = Column(Float, nullable=True)
+    metric_threshold  = Column(Float, nullable=True)
+    is_actioned       = Column(Boolean, default=False)
+    actioned_at       = Column(DateTime, nullable=True)
+    actioned_by       = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at        = Column(DateTime, default=datetime.utcnow)
 
     run  = relationship("AgentRun", back_populates="signals")
 
@@ -722,13 +729,19 @@ def _ensure_demo_user():
 
 def _migrate_agent_tables():
     """
-    Ensure agent_runs and agent_signals tables exist on existing deployments.
-    create_all() already handles new installs; this is a no-op safety net.
+    Ensure agent_runs and agent_signals tables exist and have all current columns.
+    create_all() creates missing tables; _add_columns_safely handles new columns
+    on existing tables (idempotent, cross-dialect).
     """
-    # Both tables are declared as SQLAlchemy models and created by create_all().
-    # If the DB already existed before these models were added, create_all()
-    # with checkfirst=True (default) will create any missing tables.
     Base.metadata.create_all(engine)
+    # New columns added in the per-category analysis redesign
+    _add_columns_safely("agent_runs", [
+        ("analyses_planned", "TEXT DEFAULT '[]'", "TEXT DEFAULT '[]'"),
+        ("analyses_done",    "TEXT DEFAULT '[]'", "TEXT DEFAULT '[]'"),
+    ])
+    _add_columns_safely("agent_signals", [
+        ("analysis_category", "TEXT DEFAULT ''", "VARCHAR DEFAULT ''"),
+    ])
 
 
 def seed_company_data(company_id: int):

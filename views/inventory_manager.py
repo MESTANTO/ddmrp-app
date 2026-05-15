@@ -1,38 +1,56 @@
 """
 Inventory Manager Agent — Streamlit dashboard page.
 
-Shows run controls, signal table, signal detail, and charts.
+Shows run controls with live analysis progress, category-grouped signal panels,
+signal detail, and run history charts.
 All data is scoped to the logged-in user's company_id.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 from database.auth import get_company_id, get_current_user
 from database.db import SessionLocal, AgentRun, AgentSignal
+from agents.inventory_agent import ANALYSIS_CATEGORIES
 
 from views.ai_advisor import _KNOWN_MODELS   # reuse the model list
 
 
 # ---------------------------------------------------------------------------
+# Category metadata
+# ---------------------------------------------------------------------------
+
+_CAT_META = {c["key"]: c for c in ANALYSIS_CATEGORIES}
+
+_CAT_ICON = {
+    "data_quality":       "🗂",
+    "buffer_nfp":         "🚦",
+    "abc_xyz":            "🏷",
+    "demand_variability": "📈",
+    "safety_stock":       "🛡",
+    "overstock":          "📦",
+    "supplier_risk":      "🚚",
+}
+
+# ---------------------------------------------------------------------------
 # Severity helpers
 # ---------------------------------------------------------------------------
 
-_SEV_ORDER  = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-_SEV_COLOR  = {
+_SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+_SEV_COLOR = {
     "critical": "#E74C3C",
     "high":     "#E67E22",
     "medium":   "#F1C40F",
     "low":      "#2980B9",
     "info":     "#7F8C8D",
 }
-_SEV_BADGE  = {
+_SEV_BADGE = {
     "critical": "🔴 CRITICAL",
     "high":     "🟠 HIGH",
     "medium":   "🟡 MEDIUM",
@@ -40,16 +58,16 @@ _SEV_BADGE  = {
     "info":     "⚪ INFO",
 }
 _TYPE_LABEL = {
-    "stockout_risk":   "⚡ Stockout Risk",
-    "overstock":       "📦 Overstock",
-    "low_nfp":         "📉 Low NFP",
-    "buffer_resizing": "🔧 Buffer Resizing",
-    "data_quality":    "🗂 Data Quality",
-    "demand_trend":    "📈 Demand Trend",
-    "abc_xyz_policy":  "🏷 ABC/XYZ Policy",
-    "safety_stock_gap":"🛡 Safety Stock",
-    "supplier_risk":   "🚚 Supplier Risk",
-    "portfolio":       "🌐 Portfolio",
+    "stockout_risk":    "⚡ Stockout Risk",
+    "overstock":        "📦 Overstock",
+    "low_nfp":          "📉 Low NFP",
+    "buffer_resizing":  "🔧 Buffer Resizing",
+    "data_quality":     "🗂 Data Quality",
+    "demand_trend":     "📈 Demand Trend",
+    "abc_xyz_policy":   "🏷 ABC/XYZ Policy",
+    "safety_stock_gap": "🛡 Safety Stock",
+    "supplier_risk":    "🚚 Supplier Risk",
+    "portfolio":        "🌐 Portfolio",
 }
 
 
@@ -76,7 +94,7 @@ def _load_signals(company_id: int, run_id: int) -> list[dict]:
         sigs = (session.query(AgentSignal)
                 .filter(AgentSignal.company_id == company_id,
                         AgentSignal.run_id     == run_id)
-                .order_by(AgentSignal.id)
+                .order_by(AgentSignal.analysis_category, AgentSignal.id)
                 .all())
         return [{c.name: getattr(s, c.name) for c in s.__table__.columns} for s in sigs]
     finally:
@@ -117,11 +135,11 @@ def _is_run_in_progress(company_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def show():
-    st.header("🤖 Inventory Manager Agent")
+    st.header("📦 Inventory Manager Agent")
     st.caption(
-        "An autonomous agent that analyses your full inventory — buffers, demand trends, "
-        "ABC/XYZ classification, safety stock, and supplier risk — then surfaces prioritised "
-        "findings and recommendations."
+        "Runs 7 sequential focused analyses — Data Quality · Buffer & NFP · ABC/XYZ · "
+        "Demand Variability · Safety Stock · Overstock · Supplier Risk. "
+        "Each analysis uses a dedicated skill and generates category-tagged signals."
     )
 
     # ── API key ──────────────────────────────────────────────────────────────
@@ -136,26 +154,25 @@ def show():
     user_id    = user["id"] if user else 0
 
     # ── Run controls ─────────────────────────────────────────────────────────
-    with st.container():
-        col_model, col_btn = st.columns([3, 1])
-        with col_model:
-            model = st.selectbox(
-                "Model",
-                _KNOWN_MODELS,
-                index=_KNOWN_MODELS.index("deepseek-ai/deepseek-v3-0324")
-                      if "deepseek-ai/deepseek-v3-0324" in _KNOWN_MODELS else 0,
-                key="im_model_sel",
-                label_visibility="collapsed",
-            )
-        with col_btn:
-            in_progress = _is_run_in_progress(company_id)
-            run_clicked = st.button(
-                "▶  Run Analysis" if not in_progress else "⏳  Running…",
-                type="primary",
-                use_container_width=True,
-                disabled=in_progress,
-                key="im_run_btn",
-            )
+    col_model, col_btn = st.columns([3, 1])
+    with col_model:
+        model = st.selectbox(
+            "Model",
+            _KNOWN_MODELS,
+            index=_KNOWN_MODELS.index("deepseek-ai/deepseek-v3-0324")
+                  if "deepseek-ai/deepseek-v3-0324" in _KNOWN_MODELS else 0,
+            key="im_model_sel",
+            label_visibility="collapsed",
+        )
+    with col_btn:
+        in_progress = _is_run_in_progress(company_id)
+        run_clicked = st.button(
+            "▶  Run Analysis" if not in_progress else "⏳  Running…",
+            type="primary",
+            use_container_width=True,
+            disabled=in_progress,
+            key="im_run_btn",
+        )
 
     if run_clicked:
         _execute_run(company_id, user_id, model, api_key)
@@ -175,10 +192,13 @@ def show():
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Runs", len(runs))
-    c2.metric("Last Run", last_run["run_at"].strftime("%d %b %H:%M") if last_run["run_at"] else "—")
+    if last_run["run_at"]:
+        c2.metric("Last Run", last_run["run_at"].strftime("%d %b %H:%M"))
+    else:
+        c2.metric("Last Run", "—")
     c3.metric("Signals (last run)", last_run.get("signals_generated", 0))
     if last_completed:
-        sigs_last = _load_signals(company_id, last_completed["id"])
+        sigs_last    = _load_signals(company_id, last_completed["id"])
         critical_high = sum(1 for s in sigs_last if s["severity"] in ("critical", "high"))
         c4.metric("Critical / High", critical_high)
     else:
@@ -187,25 +207,29 @@ def show():
     st.divider()
 
     # ── Run selector ─────────────────────────────────────────────────────────
-    run_options = {
-        f"{'✅' if r['status']=='completed' else '❌' if r['status']=='failed' else '⏳'} "
-        f"{r['run_at'].strftime('%Y-%m-%d %H:%M')} — {r['signals_generated']} signals "
-        f"({r['model_used'].split('/')[-1]})": r["id"]
-        for r in runs
-    }
-    selected_label = st.selectbox("Select run to view", list(run_options.keys()), key="im_run_sel")
+    run_options = {}
+    for r in runs:
+        icon  = "✅" if r["status"] == "completed" else ("❌" if r["status"] == "failed" else "⏳")
+        ts    = r["run_at"].strftime("%Y-%m-%d %H:%M") if r["run_at"] else "?"
+        model_short = r["model_used"].split("/")[-1] if r["model_used"] else ""
+        label = f"{icon} {ts} — {r['signals_generated']} signals ({model_short})"
+        run_options[label] = r["id"]
+
+    selected_label  = st.selectbox("Select run to view", list(run_options.keys()), key="im_run_sel")
     selected_run_id = run_options[selected_label]
     selected_run    = next(r for r in runs if r["id"] == selected_run_id)
 
     if selected_run["status"] == "failed":
         st.error(f"This run failed: {selected_run.get('error_message', 'Unknown error')}")
 
+    # Show analyses done for this run
+    _show_run_analysis_summary(selected_run)
+
     # Load signals for selected run
     signals = _load_signals(company_id, selected_run_id)
 
     if not signals:
         st.info("No signals for this run.")
-        _show_raw_response(selected_run)
         return
 
     # ── Charts row ────────────────────────────────────────────────────────────
@@ -213,57 +237,123 @@ def show():
 
     st.divider()
 
-    # ── Signal table ─────────────────────────────────────────────────────────
-    _show_signal_table(signals, company_id, user_id)
+    # ── Signals grouped by analysis category ─────────────────────────────────
+    _show_signals_by_category(signals, company_id, user_id)
 
     st.divider()
 
     # ── Run history table ─────────────────────────────────────────────────────
     with st.expander("📋 Run History", expanded=False):
         df_runs = pd.DataFrame(runs)
-        df_runs["run_at"] = df_runs["run_at"].apply(
-            lambda x: x.strftime("%Y-%m-%d %H:%M") if x else ""
-        )
-        df_runs = df_runs[["run_at", "model_used", "status",
-                            "items_analysed", "signals_generated", "duration_seconds"]]
-        df_runs.columns = ["Run At", "Model", "Status", "Items", "Signals", "Duration (s)"]
+        if "run_at" in df_runs.columns:
+            df_runs["run_at"] = df_runs["run_at"].apply(
+                lambda x: x.strftime("%Y-%m-%d %H:%M") if x else ""
+            )
+        cols = [c for c in ["run_at", "model_used", "status",
+                             "items_analysed", "signals_generated", "duration_seconds"]
+                if c in df_runs.columns]
+        df_runs = df_runs[cols]
+        df_runs.columns = ["Run At", "Model", "Status", "Items", "Signals", "Duration (s)"][:len(cols)]
         st.dataframe(df_runs, use_container_width=True, hide_index=True)
-
-    # ── Raw LLM response ─────────────────────────────────────────────────────
-    _show_raw_response(selected_run)
 
 
 # ---------------------------------------------------------------------------
-# Execute run (with live progress feedback)
+# Run analysis summary strip
+# ---------------------------------------------------------------------------
+
+def _show_run_analysis_summary(run: dict):
+    """Show which analyses ran and completed for this run."""
+    planned_raw = run.get("analyses_planned") or "[]"
+    done_raw    = run.get("analyses_done")    or "[]"
+    try:
+        planned = json.loads(planned_raw) if isinstance(planned_raw, str) else planned_raw
+        done    = json.loads(done_raw)    if isinstance(done_raw, str) else done_raw
+    except (json.JSONDecodeError, TypeError):
+        planned, done = [], []
+
+    if not planned:
+        return
+
+    st.markdown("**Analyses run:**")
+    badges = []
+    for key in planned:
+        meta  = _CAT_META.get(key, {})
+        icon  = _CAT_ICON.get(key, "🔎")
+        label = meta.get("label", key)
+        if key in done:
+            badges.append(f"<span style='background:#0D3A1F;color:#4ADE80;border:1px solid #166534;"
+                          f"border-radius:4px;padding:2px 8px;font-size:0.72rem;margin:2px'>"
+                          f"{icon} {label} ✓</span>")
+        else:
+            badges.append(f"<span style='background:#1A1A2E;color:#6B7280;border:1px solid #374151;"
+                          f"border-radius:4px;padding:2px 8px;font-size:0.72rem;margin:2px'>"
+                          f"{icon} {label}</span>")
+    st.markdown("<div style='line-height:2.2'>" + " ".join(badges) + "</div>",
+                unsafe_allow_html=True)
+    st.markdown("")
+
+
+# ---------------------------------------------------------------------------
+# Execute run with live progress
 # ---------------------------------------------------------------------------
 
 def _execute_run(company_id: int, user_id: int, model: str, api_key: str):
     from agents.inventory_agent import run_inventory_agent
 
-    placeholder = st.empty()
-    with placeholder.container():
-        with st.spinner(f"Agent is analysing your inventory with **{model.split('/')[-1]}**… "
-                        "This may take 1–3 minutes for large models."):
-            try:
-                run_dict, signal_dicts = run_inventory_agent(
-                    company_id=company_id,
-                    user_id=user_id,
-                    model=model,
-                    api_key=api_key,
-                )
-                status = run_dict.get("status", "unknown")
-                n      = run_dict.get("signals_generated", 0)
-                dur    = run_dict.get("duration_seconds", 0)
-                if status == "completed":
-                    placeholder.success(
-                        f"✅ Analysis complete — **{n} signals** generated in {dur:.1f}s."
-                    )
-                else:
-                    placeholder.error(
-                        f"❌ Run failed: {run_dict.get('error_message', 'Unknown error')}"
-                    )
-            except Exception as exc:
-                placeholder.error(f"❌ Unexpected error: {exc}")
+    # Progress state: category_key → {"status": "pending|running|done|error", "n": int}
+    progress_state = {c["key"]: {"status": "pending", "n": 0} for c in ANALYSIS_CATEGORIES}
+    progress_placeholder = st.empty()
+
+    def _render_progress():
+        rows = []
+        for cat in ANALYSIS_CATEGORIES:
+            key    = cat["key"]
+            s      = progress_state[key]
+            status = s["status"]
+            n      = s["n"]
+            icon   = _CAT_ICON.get(key, "🔎")
+            label  = cat["label"]
+            if status == "pending":
+                status_str = "⬜ Waiting"
+                n_str      = ""
+            elif status == "running":
+                status_str = "⏳ Running…"
+                n_str      = ""
+            elif status == "done":
+                status_str = "✅ Done"
+                n_str      = f"{n} signal{'s' if n != 1 else ''}"
+            else:  # error
+                status_str = "❌ Error"
+                n_str      = f"{n} signal{'s' if n != 1 else ''}"
+            rows.append({"Analysis": f"{icon} {label}", "Status": status_str, "Signals": n_str})
+        with progress_placeholder.container():
+            st.markdown(f"**Running {model.split('/')[-1]}** — 7 analyses queued")
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True, height=290)
+
+    def _progress_callback(category_key: str, status: str, n_signals: int):
+        progress_state[category_key]["status"] = status
+        progress_state[category_key]["n"]      = n_signals
+        _render_progress()
+
+    _render_progress()
+
+    try:
+        run_dict, signal_dicts = run_inventory_agent(
+            company_id=company_id,
+            user_id=user_id,
+            model=model,
+            api_key=api_key,
+            progress_callback=_progress_callback,
+        )
+        dur = run_dict.get("duration_seconds", 0)
+        n   = run_dict.get("signals_generated", 0)
+        progress_placeholder.success(
+            f"✅ All 7 analyses complete — **{n} signals** generated in {dur:.1f}s."
+        )
+    except Exception as exc:
+        progress_placeholder.error(f"❌ Unexpected error: {exc}")
+
     st.rerun()
 
 
@@ -295,32 +385,34 @@ def _show_charts(signals: list[dict], runs: list[dict]):
             fig.update_layout(showlegend=False, margin=dict(t=40, b=20))
             st.plotly_chart(fig, use_container_width=True)
 
-    # Chart B — signal type breakdown
+    # Chart B — signals by analysis category
     with col_b:
-        type_counts = {}
+        cat_counts = {}
         for s in signals:
-            lbl = _TYPE_LABEL.get(s["signal_type"], s["signal_type"])
-            type_counts[lbl] = type_counts.get(lbl, 0) + 1
-        df_type = pd.DataFrame(
-            [{"type": k, "count": v} for k, v in
-             sorted(type_counts.items(), key=lambda x: -x[1])]
+            key = s.get("analysis_category", "")
+            meta = _CAT_META.get(key, {})
+            lbl  = f"{_CAT_ICON.get(key, '🔎')} {meta.get('label', key)}"
+            cat_counts[lbl] = cat_counts.get(lbl, 0) + 1
+        df_cat = pd.DataFrame(
+            [{"category": k, "count": v} for k, v in
+             sorted(cat_counts.items(), key=lambda x: -x[1])]
         )
-        if not df_type.empty:
+        if not df_cat.empty:
             fig2 = px.bar(
-                df_type, x="count", y="type", orientation="h",
-                labels={"count": "Signals", "type": ""},
-                title="Signals by Type",
+                df_cat, x="count", y="category", orientation="h",
+                labels={"count": "Signals", "category": ""},
+                title="Signals by Analysis",
                 height=280,
             )
             fig2.update_layout(margin=dict(t=40, b=20), yaxis=dict(autorange="reversed"))
             st.plotly_chart(fig2, use_container_width=True)
 
-    # Chart C — run history trend (signals over time)
+    # Chart C — run history trend
     with col_c:
         completed = [r for r in runs if r["status"] == "completed"]
         if len(completed) >= 2:
             df_hist = pd.DataFrame([{
-                "run_at": r["run_at"].strftime("%m-%d %H:%M"),
+                "run_at":  r["run_at"].strftime("%m-%d %H:%M"),
                 "signals": r["signals_generated"],
             } for r in reversed(completed[-10:])])
             fig3 = px.line(
@@ -337,79 +429,113 @@ def _show_charts(signals: list[dict], runs: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# Signal table + detail panel
+# Signals grouped by analysis category
 # ---------------------------------------------------------------------------
 
-def _show_signal_table(signals: list[dict], company_id: int, user_id: int):
+def _show_signals_by_category(signals: list[dict], company_id: int, user_id: int):
     st.subheader("Findings & Recommendations")
 
-    # Filters
+    # Global filters
     fc1, fc2, fc3 = st.columns([2, 2, 1])
     with fc1:
-        all_types = sorted({s["signal_type"] for s in signals})
-        sel_types = st.multiselect(
-            "Signal Type", all_types,
-            default=all_types, key="im_filter_type",
-            format_func=lambda x: _TYPE_LABEL.get(x, x),
-        )
-    with fc2:
         all_sevs = sorted({s["severity"] for s in signals}, key=lambda x: _SEV_ORDER.get(x, 9))
-        sel_sevs = st.multiselect(
-            "Severity", all_sevs,
-            default=all_sevs, key="im_filter_sev",
+        sel_sevs = st.multiselect("Severity filter", all_sevs, default=all_sevs, key="im_filter_sev")
+    with fc2:
+        all_cats = list({s.get("analysis_category", "") for s in signals if s.get("analysis_category")})
+        all_cats_sorted = [c["key"] for c in ANALYSIS_CATEGORIES if c["key"] in all_cats]
+        sel_cats = st.multiselect(
+            "Analysis filter", all_cats_sorted, default=all_cats_sorted,
+            key="im_filter_cat",
+            format_func=lambda k: f"{_CAT_ICON.get(k, '🔎')} {_CAT_META.get(k, {}).get('label', k)}",
         )
     with fc3:
         show_actioned = st.checkbox("Show actioned", value=False, key="im_show_actioned")
 
-    filtered = [
-        s for s in signals
-        if s["signal_type"] in sel_types
-        and s["severity"]    in sel_sevs
-        and (show_actioned or not s["is_actioned"])
-    ]
+    # Group signals by category
+    by_cat: dict[str, list[dict]] = {}
+    for s in signals:
+        cat_key = s.get("analysis_category", "")
+        if cat_key not in sel_cats:
+            continue
+        if s["severity"] not in sel_sevs:
+            continue
+        if not show_actioned and s["is_actioned"]:
+            continue
+        by_cat.setdefault(cat_key, []).append(s)
 
-    if not filtered:
+    if not by_cat:
         st.info("No signals match the current filters.")
         return
 
-    # Build display dataframe
+    total_filtered = sum(len(v) for v in by_cat.values())
+    st.caption(f"Showing {total_filtered} signals across {len(by_cat)} analyses")
+
+    # Render one expander per category in the canonical order
+    for cat in ANALYSIS_CATEGORIES:
+        key    = cat["key"]
+        cat_sigs = by_cat.get(key, [])
+        if not cat_sigs:
+            continue
+
+        # Severity summary for the expander header
+        crit  = sum(1 for s in cat_sigs if s["severity"] == "critical")
+        high  = sum(1 for s in cat_sigs if s["severity"] == "high")
+        med   = sum(1 for s in cat_sigs if s["severity"] == "medium")
+        worst = "critical" if crit else ("high" if high else ("medium" if med else "low"))
+        badge_color = _SEV_COLOR.get(worst, "#999")
+
+        summary_parts = []
+        if crit: summary_parts.append(f"🔴 {crit}")
+        if high: summary_parts.append(f"🟠 {high}")
+        if med:  summary_parts.append(f"🟡 {med}")
+        low_ct  = sum(1 for s in cat_sigs if s["severity"] == "low")
+        info_ct = sum(1 for s in cat_sigs if s["severity"] == "info")
+        if low_ct:  summary_parts.append(f"🔵 {low_ct}")
+        if info_ct: summary_parts.append(f"⚪ {info_ct}")
+
+        icon  = _CAT_ICON.get(key, "🔎")
+        label = cat["label"]
+        header = f"{icon} {label} — {len(cat_sigs)} signal{'s' if len(cat_sigs) != 1 else ''} {' '.join(summary_parts)}"
+
+        with st.expander(header, expanded=(worst in ("critical", "high"))):
+            _show_category_signals(cat_sigs, key, company_id, user_id)
+
+
+def _show_category_signals(
+    signals: list[dict],
+    category_key: str,
+    company_id: int,
+    user_id: int,
+):
+    """Signal table + detail panel for one analysis category."""
+    # Compact overview table
     rows = []
-    for s in filtered:
+    for s in signals:
         rows.append({
-            "id":          s["id"],
-            "Severity":    _SEV_BADGE.get(s["severity"], s["severity"]),
-            "Type":        _TYPE_LABEL.get(s["signal_type"], s["signal_type"]),
-            "Part #":      s["part_number"],
-            "Title":       s["title"],
-            "Metric":      (f"{s['metric_name']} = {s['metric_value']:.2f}"
-                            if s["metric_value"] is not None and s["metric_name"] else ""),
-            "Actioned":    "✅" if s["is_actioned"] else "",
+            "id":       s["id"],
+            "Severity": _SEV_BADGE.get(s["severity"], s["severity"]),
+            "Type":     _TYPE_LABEL.get(s["signal_type"], s["signal_type"]),
+            "Part #":   s["part_number"],
+            "Title":    s["title"],
+            "Metric":   (f"{s['metric_name']} = {s['metric_value']:.2f}"
+                         if s["metric_value"] is not None and s["metric_name"] else ""),
+            "Done":     "✅" if s["is_actioned"] else "",
         })
 
     df = pd.DataFrame(rows)
+    st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True,
+                 height=min(40 + 35 * len(df), 380))
 
-    # Show table — row selection via selectbox for Streamlit compatibility
-    st.caption(f"Showing {len(filtered)} signals")
-    selected_idx = st.selectbox(
-        "Select a signal to view details",
-        options=range(len(filtered)),
-        format_func=lambda i: f"{_SEV_BADGE.get(filtered[i]['severity'], '')}  {filtered[i]['title'][:80]}",
-        key="im_signal_sel",
+    # Signal detail via selectbox
+    sel_idx = st.selectbox(
+        "View signal detail",
+        options=range(len(signals)),
+        format_func=lambda i: f"{_SEV_BADGE.get(signals[i]['severity'], '')}  {signals[i]['title'][:80]}",
+        key=f"im_detail_sel_{category_key}",
         label_visibility="collapsed",
     )
-
-    # Compact table (non-interactive) for overview
-    st.dataframe(
-        df.drop(columns=["id"]),
-        use_container_width=True,
-        hide_index=True,
-        height=min(40 + 35 * len(df), 420),
-    )
-
-    # ── Detail panel ─────────────────────────────────────────────────────────
-    if selected_idx is not None and selected_idx < len(filtered):
-        sig = filtered[selected_idx]
-        _show_signal_detail(sig, company_id, user_id)
+    if sel_idx is not None and sel_idx < len(signals):
+        _show_signal_detail(signals[sel_idx], company_id, user_id)
 
 
 def _show_signal_detail(sig: dict, company_id: int, user_id: int):
@@ -421,8 +547,8 @@ def _show_signal_detail(sig: dict, company_id: int, user_id: int):
                         border-radius:6px;margin-top:0.5rem">
             <div style="font-size:0.65rem;font-weight:700;letter-spacing:0.12em;
                         text-transform:uppercase;color:{sev_color}">
-                {_SEV_BADGE.get(sig['severity'],sig['severity'])} &nbsp;·&nbsp;
-                {_TYPE_LABEL.get(sig['signal_type'],sig['signal_type'])} &nbsp;·&nbsp;
+                {_SEV_BADGE.get(sig['severity'], sig['severity'])} &nbsp;·&nbsp;
+                {_TYPE_LABEL.get(sig['signal_type'], sig['signal_type'])} &nbsp;·&nbsp;
                 {sig['part_number']}
             </div>
             <div style="font-size:1.0rem;font-weight:600;margin:0.4rem 0 0.2rem;color:#E8F0FF">
@@ -448,7 +574,9 @@ def _show_signal_detail(sig: dict, company_id: int, user_id: int):
         st.markdown(sig["recommendation"] or "_No recommendation provided._")
 
         if not sig["is_actioned"]:
-            if st.button("✅ Mark as Actioned", key=f"action_{sig['id']}", type="secondary"):
+            if st.button("✅ Mark as Actioned",
+                         key=f"action_{sig['id']}_{sig.get('analysis_category', '')}",
+                         type="secondary"):
                 _mark_actioned(sig["id"], company_id, user_id)
                 st.success("Marked as actioned.")
                 st.rerun()
@@ -456,16 +584,3 @@ def _show_signal_detail(sig: dict, company_id: int, user_id: int):
             at = sig["actioned_at"]
             ts = at.strftime("%Y-%m-%d %H:%M") if at else "unknown time"
             st.success(f"Actioned on {ts}")
-
-
-# ---------------------------------------------------------------------------
-# Raw LLM response
-# ---------------------------------------------------------------------------
-
-def _show_raw_response(run: dict):
-    raw = run.get("llm_raw_response", "")
-    if raw:
-        with st.expander("🔍 View raw agent output", expanded=False):
-            st.text(raw[:8000])
-            if len(raw) > 8000:
-                st.caption(f"…truncated ({len(raw):,} total chars)")

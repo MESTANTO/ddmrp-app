@@ -1,10 +1,9 @@
 """
 Inventory Manager Agent — core module.
 
-Two-phase architecture:
-  Phase 1 — Python tool functions gather all relevant data from the DB.
-  Phase 2 — Single NVIDIA NIM LLM call with structured context + skill files.
-  Phase 3 — Parse JSON response, validate, and persist AgentRun + AgentSignal rows.
+Architecture: 7 sequential focused LLM calls, one per analysis category.
+Each call receives a single skill file + focused data slice and returns signals
+tagged with that category. Signals accumulate in the DB as each analysis completes.
 
 All functions take company_id as their first argument. No global implicit reads.
 The LLM never writes to operational tables — only AgentSignal rows are created.
@@ -19,7 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import mean, stdev
-from typing import Optional
+from typing import Callable, Optional
 
 from openai import OpenAI
 
@@ -43,26 +42,76 @@ VALID_SIGNAL_TYPES = {
 }
 VALID_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 
-# Context section headers — skills are activated when their trigger phrase appears
-_SKILL_TRIGGERS = {
-    "skill_01_data_quality":       "DATA QUALITY ISSUES",
-    "skill_02_ddmrp_buffer_analysis": "EXECUTION ALARMS",
-    "skill_03_abc_xyz_policy":     "ABC/XYZ CLASSIFICATION",
-    "skill_04_demand_variability": "DEMAND TRENDS",
-    "skill_05_safety_stock_optimization": "SAFETY STOCK GAPS",
-    "skill_06_overstock_and_excess":  "OVERSTOCK ITEMS",
-    "skill_07_supplier_risk":      "SUPPLIER RISK",
-}
+# ---------------------------------------------------------------------------
+# Analysis categories — one LLM call per category
+# ---------------------------------------------------------------------------
 
-_AGENT_SYSTEM_PROMPT = """\
+ANALYSIS_CATEGORIES = [
+    {
+        "key":        "data_quality",
+        "label":      "Data Quality",
+        "skill_file": "skill_01_data_quality.md",
+        "data_keys":  ["snapshot", "data_quality"],
+        "description": "Checks for missing costs, zero ADU/DLT on buffered items, zone inconsistencies, and missing suppliers.",
+    },
+    {
+        "key":        "buffer_nfp",
+        "label":      "Buffer & NFP Analysis",
+        "skill_file": "skill_02_ddmrp_buffer_analysis.md",
+        "data_keys":  ["alarms", "low_nfp", "snapshot"],
+        "description": "Identifies items in execution alarm (red/dark_red), low net flow position, and buffer sizing issues.",
+    },
+    {
+        "key":        "abc_xyz",
+        "label":      "ABC/XYZ Policy",
+        "skill_file": "skill_03_abc_xyz_policy.md",
+        "data_keys":  ["abc_xyz", "snapshot"],
+        "description": "Reviews buffer policy alignment against ABC/XYZ classification matrix.",
+    },
+    {
+        "key":        "demand_variability",
+        "label":      "Demand Variability",
+        "skill_file": "skill_04_demand_variability.md",
+        "data_keys":  ["demand_trends", "snapshot"],
+        "description": "Detects items with ADU divergence >25%, high CV, or shifting demand trends.",
+    },
+    {
+        "key":        "safety_stock",
+        "label":      "Safety Stock Optimisation",
+        "skill_file": "skill_05_safety_stock_optimization.md",
+        "data_keys":  ["safety_gaps", "buffer_issues", "snapshot"],
+        "description": "Flags items below TOR (safety stock gap) and buffers misaligned with ADU/DLT.",
+    },
+    {
+        "key":        "overstock",
+        "label":      "Overstock & Excess",
+        "skill_file": "skill_06_overstock_and_excess.md",
+        "data_keys":  ["overstock", "snapshot"],
+        "description": "Identifies items where on_hand > TOG and quantifies excess cash tied up.",
+    },
+    {
+        "key":        "supplier_risk",
+        "label":      "Supplier Risk",
+        "skill_file": "skill_07_supplier_risk.md",
+        "data_keys":  ["supplier_risk", "snapshot"],
+        "description": "Highlights low-reliability suppliers and LTF/DLT configuration issues.",
+    },
+]
+
+_CATEGORY_BY_KEY = {c["key"]: c for c in ANALYSIS_CATEGORIES}
+
+# ---------------------------------------------------------------------------
+# Focused system prompt (single-analysis variant)
+# ---------------------------------------------------------------------------
+
+_FOCUSED_SYSTEM_PROMPT = """\
 You are an autonomous Inventory Manager Agent embedded in a DDMRP supply chain application.
 
-You have expert knowledge of DDMRP (Demand Driven MRP) methodology. The domain knowledge
-and analysis rules you must apply are provided in the SKILLS sections below.
+You are performing ONE focused analysis: **{analysis_label}**.
+{analysis_description}
 
-YOUR TASK:
-Analyse the INVENTORY CONTEXT section and generate a prioritised list of findings and
-recommendations as a JSON array.
+The domain knowledge and rules for THIS analysis are in the SKILL section below.
+Analyse ONLY the data provided in the INVENTORY DATA section.
 
 CRITICAL OUTPUT RULES:
 1. Respond with ONLY a valid JSON array. No markdown, no preamble, no explanation outside the JSON.
@@ -84,18 +133,23 @@ CRITICAL OUTPUT RULES:
 4. severity must be one of: critical | high | medium | low | info
 5. title must be ≤ 120 characters
 6. part_number must match exactly as shown in the data, or "PORTFOLIO" for company-wide findings
-7. Generate between 3 and 30 signals. Prioritise critical first, then high, then medium.
+7. Generate between 1 and 15 signals focused on THIS analysis category only.
+   Prioritise critical first, then high, then medium.
 8. Every recommendation must name the specific item, state the action, and quantify the impact.
    BAD: "Optimize inventory."
    GOOD: "Reduce safety stock for ITEM-001 from 500 to 280 units — demand CV=0.22, coverage 210 days vs target 90. Cash release: €11,000."
 9. Never recommend reducing safety stock on an item currently in red or dark_red execution.
 10. Do not invent data. If a metric is not available, state that clearly in the detail.
+11. If there are no findings for this analysis, return a single INFO signal with:
+    signal_type="portfolio", severity="info", part_number="PORTFOLIO",
+    title="No issues found in {analysis_label}", detail="All checked items pass this analysis."
 
-{skills}
+=== SKILL: {skill_name} ===
+{skill_content}
 
---- INVENTORY CONTEXT ---
+--- INVENTORY DATA ({analysis_label}) ---
 {context}
---- END CONTEXT ---
+--- END DATA ---
 """
 
 
@@ -103,40 +157,16 @@ CRITICAL OUTPUT RULES:
 # Skill loader
 # ---------------------------------------------------------------------------
 
-def load_skills(context_text: str) -> str:
-    """
-    Load only the skill files relevant to the sections present in the context.
-    Returns formatted skill content to inject into the system prompt.
-    """
-    if not _SKILLS_DIR.exists():
-        return ""
-
-    active_skills = []
-    for skill_name, trigger in _SKILL_TRIGGERS.items():
-        if trigger in context_text:
-            skill_path = _SKILLS_DIR / f"{skill_name}.md"
-            if skill_path.exists():
-                active_skills.append((skill_name, skill_path))
-
-    # Always include buffer analysis and data quality
-    for must_have in ("skill_01_data_quality", "skill_02_ddmrp_buffer_analysis"):
-        if not any(s[0] == must_have for s in active_skills):
-            p = _SKILLS_DIR / f"{must_have}.md"
-            if p.exists():
-                active_skills.insert(0, (must_have, p))
-
-    if not active_skills:
-        return ""
-
-    parts = []
-    for skill_name, skill_path in active_skills:
-        parts.append(f"\n\n=== SKILL: {skill_name.upper()} ===\n{skill_path.read_text()}")
-
-    return "\n".join(parts)
+def _load_skill(skill_file: str) -> tuple[str, str]:
+    """Load a single skill file. Returns (skill_name, content)."""
+    path = _SKILLS_DIR / skill_file
+    if not path.exists():
+        return skill_file.replace(".md", ""), "(skill file not found)"
+    return path.stem, path.read_text()
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 — Data tool functions
+# Phase 1 — Data tool functions (all company-scoped)
 # ---------------------------------------------------------------------------
 
 def get_inventory_snapshot(company_id: int) -> list[dict]:
@@ -189,7 +219,7 @@ def get_execution_alarms(company_id: int) -> list[dict]:
     return [r for r in snap if r["execution_color"] in ("red", "dark_red")]
 
 
-def get_low_nfp_items(company_id: int, threshold_pct: float = 1.0) -> list[dict]:
+def get_low_nfp_items(company_id: int) -> list[dict]:
     """Items where NFP < top_of_yellow (order signal active)."""
     snap = get_inventory_snapshot(company_id)
     result = []
@@ -200,7 +230,7 @@ def get_low_nfp_items(company_id: int, threshold_pct: float = 1.0) -> list[dict]
     return sorted(result, key=lambda x: x.get("nfp_pct_of_tor", 0))
 
 
-def get_overstock_items(company_id: int, threshold_pct: float = 1.0) -> list[dict]:
+def get_overstock_items(company_id: int) -> list[dict]:
     """Items where on_hand > top_of_green."""
     snap = get_inventory_snapshot(company_id)
     result = []
@@ -258,7 +288,6 @@ def get_demand_trends(company_id: int, lookback_days: int = 90) -> dict[int, dic
             w_std  = stdev(vals) if len(vals) >= 2 else 0.0
             cv     = (w_std / w_mean) if w_mean > 0 else 0.0
 
-            # Simple trend: compare first half vs second half
             half = max(1, len(vals) // 2)
             first_half  = mean(vals[:half])  if vals[:half]  else 0.0
             second_half = mean(vals[half:])  if vals[half:]  else 0.0
@@ -317,10 +346,10 @@ def get_buffer_sizing_issues(company_id: int) -> list[dict]:
         if calc_tor <= 0:
             continue
         pct_diff = (r["top_of_red"] - calc_tor) / calc_tor * 100
-        if abs(pct_diff) > 20:   # more than 20% off
-            r["calc_tor"]  = round(calc_tor, 2)
-            r["pct_diff"]  = round(pct_diff, 1)
-            r["stale"]     = abs(pct_diff) > 40
+        if abs(pct_diff) > 20:
+            r["calc_tor"] = round(calc_tor, 2)
+            r["pct_diff"] = round(pct_diff, 1)
+            r["stale"]    = abs(pct_diff) > 40
             result.append(r)
     return sorted(result, key=lambda x: abs(x.get("pct_diff", 0)), reverse=True)
 
@@ -351,7 +380,7 @@ def get_data_quality_issues(company_id: int) -> list[dict]:
 
 
 def get_supplier_risk_items(company_id: int) -> list[dict]:
-    """Items whose supplier has reliability < 90% — especially those in red execution."""
+    """Items whose supplier has reliability < 90%."""
     session = SessionLocal()
     try:
         items = (session.query(Item)
@@ -378,7 +407,7 @@ def get_supplier_risk_items(company_id: int) -> list[dict]:
                 continue
             rel = sup.reliability_pct or 100.0
             if rel >= 90:
-                continue  # acceptable reliability
+                continue
             buf = buffers.get(it.id)
             result.append({
                 "id":               it.id,
@@ -409,7 +438,7 @@ def get_abc_xyz_classification(company_id: int) -> list[dict]:
     """Return ABC/XYZ classification records for all items."""
     session = SessionLocal()
     try:
-        items   = session.query(Item).filter(Item.company_id == company_id).all()
+        items    = session.query(Item).filter(Item.company_id == company_id).all()
         item_ids = [i.id for i in items]
         demands  = (session.query(DemandEntry)
                     .filter(DemandEntry.item_id.in_(item_ids))
@@ -429,195 +458,262 @@ def get_abc_xyz_classification(company_id: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Context builder
+# Phase 1 — Collect all raw data once
 # ---------------------------------------------------------------------------
 
-def build_agent_context(company_id: int) -> tuple[str, dict]:
+def collect_raw_data(company_id: int) -> dict:
     """
-    Collect all tool outputs and format as a structured text context for the LLM.
-    Returns (context_text, raw_data_dict).
+    Gather all data tool outputs upfront. Returns a dict keyed by data_key.
+    Called once before the 7-analysis loop to avoid redundant DB queries.
     """
-    raw: dict = {}
+    snap = get_inventory_snapshot(company_id)
+    return {
+        "snapshot":      snap,
+        "alarms":        get_execution_alarms(company_id),
+        "low_nfp":       get_low_nfp_items(company_id),
+        "overstock":     get_overstock_items(company_id),
+        "demand_trends": get_demand_trends(company_id),
+        "safety_gaps":   get_safety_stock_gaps(company_id),
+        "buffer_issues": get_buffer_sizing_issues(company_id),
+        "data_quality":  get_data_quality_issues(company_id),
+        "supplier_risk": get_supplier_risk_items(company_id),
+        "abc_xyz":       get_abc_xyz_classification(company_id),
+    }
 
-    raw["snapshot"]        = get_inventory_snapshot(company_id)
-    raw["alarms"]          = get_execution_alarms(company_id)
-    raw["low_nfp"]         = get_low_nfp_items(company_id)
-    raw["overstock"]       = get_overstock_items(company_id)
-    raw["demand_trends"]   = get_demand_trends(company_id)
-    raw["safety_gaps"]     = get_safety_stock_gaps(company_id)
-    raw["buffer_issues"]   = get_buffer_sizing_issues(company_id)
-    raw["data_quality"]    = get_data_quality_issues(company_id)
-    raw["supplier_risk"]   = get_supplier_risk_items(company_id)
-    raw["abc_xyz"]         = get_abc_xyz_classification(company_id)
 
-    lines = []
-    now   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    total = len(raw["snapshot"])
+# ---------------------------------------------------------------------------
+# Phase 2a — Focused context builder (per-analysis)
+# ---------------------------------------------------------------------------
 
-    lines.append(f"=== INVENTORY MANAGER AGENT — ANALYSIS CONTEXT ===")
-    lines.append(f"Generated: {now}")
-    lines.append(f"Company ID: {company_id}")
-    lines.append(f"Total items: {total}  |  Items with buffers: {sum(1 for r in raw['snapshot'] if r['has_buffer'])}")
+def build_focused_context(category_key: str, raw_data: dict) -> str:
+    """
+    Build a context string containing only the data relevant to one analysis.
+    Keeps tokens focused and avoids overwhelming the LLM with unrelated sections.
+    """
+    cat    = _CATEGORY_BY_KEY[category_key]
+    lines  = []
+    snap   = raw_data.get("snapshot", [])
+    now    = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    total  = len(snap)
+    buf_ct = sum(1 for r in snap if r["has_buffer"])
+
+    lines.append(f"Generated: {now}  |  Total items: {total}  |  Buffered: {buf_ct}")
     lines.append("")
 
-    # ── EXECUTION ALARMS ─────────────────────────────────────────────────
-    lines.append("=== CRITICAL EXECUTION ALARMS ===")
-    if raw["alarms"]:
-        lines.append(f"{'Part #':<20} {'Color':<10} {'On-Hand':>10} {'TOR':>10} {'Status%':>8} {'ADU':>8} {'DLT':>6} {'Cost€':>10}")
-        for r in raw["alarms"][:20]:
-            lines.append(f"{r['part_number']:<20} {r['execution_color']:<10} "
-                         f"{r['on_hand']:>10.1f} {r['top_of_red']:>10.1f} "
-                         f"{r['buffer_status_pct']:>8.1f} {r['adu']:>8.3f} "
-                         f"{r['dlt']:>6.0f} {r['unit_cost']:>10.2f}")
-    else:
-        lines.append("None — all items with buffers are in yellow or green execution.")
-    lines.append("")
+    data_keys = cat["data_keys"]
 
-    # ── LOW NFP ──────────────────────────────────────────────────────────
-    lines.append("=== LOW NET FLOW POSITION ITEMS (NFP < TOY) ===")
-    if raw["low_nfp"]:
-        lines.append(f"{'Part #':<20} {'NFP':>10} {'TOY':>10} {'TOG':>10} {'NFP%TOR':>8} {'ADU':>8} {'DLT':>6}")
-        for r in raw["low_nfp"][:20]:
-            lines.append(f"{r['part_number']:<20} {r['nfp']:>10.1f} "
-                         f"{r['top_of_yellow']:>10.1f} {r['top_of_green']:>10.1f} "
-                         f"{r.get('nfp_pct_of_tor', 0):>8.1f} {r['adu']:>8.3f} {r['dlt']:>6.0f}")
-    else:
-        lines.append("None — all buffered items have NFP above TOY.")
-    lines.append("")
-
-    # ── OVERSTOCK ────────────────────────────────────────────────────────
-    lines.append("=== OVERSTOCK ITEMS (on_hand > TOG) ===")
-    if raw["overstock"]:
-        lines.append(f"{'Part #':<20} {'On-Hand':>10} {'TOG':>10} {'Excess Units':>13} {'Excess €':>12} {'OH%TOG':>8}")
-        for r in raw["overstock"][:15]:
-            lines.append(f"{r['part_number']:<20} {r['on_hand']:>10.1f} "
-                         f"{r['top_of_green']:>10.1f} {r['excess_units']:>13.1f} "
-                         f"{r['excess_value']:>12.2f} {r['on_hand_vs_tog']:>8.1f}%")
-    else:
-        lines.append("None — no items above TOG.")
-    lines.append("")
-
-    # ── SAFETY STOCK GAPS ────────────────────────────────────────────────
-    lines.append("=== SAFETY STOCK GAPS (on_hand < TOR) ===")
-    if raw["safety_gaps"]:
-        lines.append(f"{'Part #':<20} {'On-Hand':>10} {'TOR':>10} {'Gap Units':>10} {'Gap €':>12} {'Days2SO':>8}")
-        for r in raw["safety_gaps"][:15]:
-            d2s = r["days_until_stockout"]
-            lines.append(f"{r['part_number']:<20} {r['on_hand']:>10.1f} "
-                         f"{r['top_of_red']:>10.1f} {r['gap_units']:>10.1f} "
-                         f"{r['gap_value']:>12.2f} {d2s:>8.1f}")
-    else:
-        lines.append("None — all items with buffers are above TOR.")
-    lines.append("")
-
-    # ── DEMAND TRENDS ────────────────────────────────────────────────────
-    lines.append("=== DEMAND TRENDS (90-day window) ===")
-    trend_items = [
-        (item_id, t) for item_id, t in raw["demand_trends"].items()
-        if t["total_entries"] >= 5 and (t["adu_divergence_pct"] > 20 or t["cv"] > 0.8)
-    ]
-    if trend_items:
-        snap_map = {r["id"]: r for r in raw["snapshot"]}
-        lines.append(f"{'Part #':<20} {'Stored ADU':>11} {'Recent ADU':>11} {'Div%':>6} {'CV':>6} {'Trend':>8}")
-        for item_id, t in sorted(trend_items, key=lambda x: x[1]["adu_divergence_pct"], reverse=True)[:15]:
-            pn = snap_map.get(item_id, {}).get("part_number", str(item_id))
-            lines.append(f"{pn:<20} {t['stored_adu']:>11.3f} {t['recent_adu']:>11.3f} "
-                         f"{t['adu_divergence_pct']:>6.1f} {t['cv']:>6.2f} {t['trend_direction']:>8}")
-    else:
-        lines.append("No significant demand trend deviations detected.")
-    lines.append("")
-
-    # ── ABC/XYZ ──────────────────────────────────────────────────────────
-    lines.append("=== ABC/XYZ CLASSIFICATION ===")
-    if raw["abc_xyz"]:
-        from collections import Counter
-        cell_counts: Counter = Counter()
-        cell_values: dict    = defaultdict(float)
-        for r in raw["abc_xyz"]:
-            key = r["acvs"]
-            cell_counts[key] += 1
-            cell_values[key] += r["annual_value"]
-        lines.append(f"{'Cell':<8} {'Items':>6} {'Annual Value €':>16}")
-        for cell in ["A-X", "A-Y", "A-Z", "B-X", "B-Y", "B-Z", "C-X", "C-Y", "C-Z"]:
-            lines.append(f"{cell:<8} {cell_counts.get(cell, 0):>6} {cell_values.get(cell, 0):>16,.0f}")
-    else:
-        lines.append("No ABC/XYZ data available (no items or missing cost/demand data).")
-    lines.append("")
-
-    # ── BUFFER SIZING ISSUES ─────────────────────────────────────────────
-    lines.append("=== BUFFER SIZING ISSUES (TOR diverges >20% from formula) ===")
-    if raw["buffer_issues"]:
-        lines.append(f"{'Part #':<20} {'Curr TOR':>10} {'Calc TOR':>10} {'Diff%':>7} {'Stale':>6}")
-        for r in raw["buffer_issues"][:15]:
-            lines.append(f"{r['part_number']:<20} {r['top_of_red']:>10.1f} "
-                         f"{r['calc_tor']:>10.1f} {r['pct_diff']:>7.1f} {str(r['stale']):>6}")
-    else:
-        lines.append("No significant buffer sizing misalignments detected.")
-    lines.append("")
+    # ── SNAPSHOT summary (always include a mini snapshot) ────────────────
+    if "snapshot" in data_keys and snap:
+        lines.append("=== ITEM SUMMARY ===")
+        lines.append(f"{'Part #':<20} {'Cost€':>8} {'On-Hand':>10} {'ADU':>8} {'DLT':>5} {'Exec':>8} {'HasBuf':>7}")
+        for r in snap[:30]:
+            lines.append(
+                f"{r['part_number']:<20} {r['unit_cost']:>8.2f} {r['on_hand']:>10.1f} "
+                f"{r['adu']:>8.3f} {r['dlt']:>5.0f} {r['execution_color']:>8} "
+                f"{'Y' if r['has_buffer'] else 'N':>7}"
+            )
+        if len(snap) > 30:
+            lines.append(f"  ... ({len(snap) - 30} more items not shown)")
+        lines.append("")
 
     # ── DATA QUALITY ─────────────────────────────────────────────────────
-    lines.append("=== DATA QUALITY ISSUES ===")
-    if raw["data_quality"]:
-        lines.append(f"{'Part #':<20} {'Issues'}")
-        for r in raw["data_quality"][:20]:
-            lines.append(f"{r['part_number']:<20} {', '.join(r['issues'])}")
-    else:
-        lines.append("No data quality issues detected.")
-    lines.append("")
+    if "data_quality" in data_keys:
+        dq = raw_data.get("data_quality", [])
+        lines.append("=== DATA QUALITY ISSUES ===")
+        if dq:
+            lines.append(f"{'Part #':<20} {'Issues'}")
+            for r in dq[:25]:
+                lines.append(f"{r['part_number']:<20} {', '.join(r['issues'])}")
+        else:
+            lines.append("No data quality issues detected.")
+        lines.append("")
+
+    # ── EXECUTION ALARMS ─────────────────────────────────────────────────
+    if "alarms" in data_keys:
+        alarms = raw_data.get("alarms", [])
+        lines.append("=== EXECUTION ALARMS (red / dark_red) ===")
+        if alarms:
+            lines.append(f"{'Part #':<20} {'Color':<10} {'On-Hand':>10} {'TOR':>10} {'Status%':>8} {'ADU':>8} {'DLT':>6} {'Cost€':>8}")
+            for r in alarms[:20]:
+                lines.append(
+                    f"{r['part_number']:<20} {r['execution_color']:<10} "
+                    f"{r['on_hand']:>10.1f} {r['top_of_red']:>10.1f} "
+                    f"{r['buffer_status_pct']:>8.1f} {r['adu']:>8.3f} "
+                    f"{r['dlt']:>6.0f} {r['unit_cost']:>8.2f}"
+                )
+        else:
+            lines.append("No execution alarms — all buffered items in yellow or green.")
+        lines.append("")
+
+    # ── LOW NFP ──────────────────────────────────────────────────────────
+    if "low_nfp" in data_keys:
+        low = raw_data.get("low_nfp", [])
+        lines.append("=== LOW NET FLOW POSITION (NFP < TOY) ===")
+        if low:
+            lines.append(f"{'Part #':<20} {'NFP':>10} {'TOY':>10} {'TOG':>10} {'NFP%TOR':>8}")
+            for r in low[:20]:
+                lines.append(
+                    f"{r['part_number']:<20} {r['nfp']:>10.1f} "
+                    f"{r['top_of_yellow']:>10.1f} {r['top_of_green']:>10.1f} "
+                    f"{r.get('nfp_pct_of_tor', 0):>8.1f}"
+                )
+        else:
+            lines.append("No items with NFP below TOY.")
+        lines.append("")
+
+    # ── OVERSTOCK ────────────────────────────────────────────────────────
+    if "overstock" in data_keys:
+        ov = raw_data.get("overstock", [])
+        lines.append("=== OVERSTOCK (on_hand > TOG) ===")
+        if ov:
+            lines.append(f"{'Part #':<20} {'On-Hand':>10} {'TOG':>10} {'Excess Units':>13} {'Excess €':>12} {'OH%TOG':>8}")
+            for r in ov[:15]:
+                lines.append(
+                    f"{r['part_number']:<20} {r['on_hand']:>10.1f} "
+                    f"{r['top_of_green']:>10.1f} {r['excess_units']:>13.1f} "
+                    f"{r['excess_value']:>12.2f} {r['on_hand_vs_tog']:>8.1f}%"
+                )
+        else:
+            lines.append("No items above TOG.")
+        lines.append("")
+
+    # ── SAFETY STOCK GAPS ────────────────────────────────────────────────
+    if "safety_gaps" in data_keys:
+        sg = raw_data.get("safety_gaps", [])
+        lines.append("=== SAFETY STOCK GAPS (on_hand < TOR) ===")
+        if sg:
+            lines.append(f"{'Part #':<20} {'On-Hand':>10} {'TOR':>10} {'Gap Units':>10} {'Gap €':>12} {'Days2SO':>8}")
+            for r in sg[:15]:
+                d2s = r["days_until_stockout"]
+                lines.append(
+                    f"{r['part_number']:<20} {r['on_hand']:>10.1f} "
+                    f"{r['top_of_red']:>10.1f} {r['gap_units']:>10.1f} "
+                    f"{r['gap_value']:>12.2f} {d2s:>8.1f}"
+                )
+        else:
+            lines.append("No items below TOR.")
+        lines.append("")
+
+    # ── BUFFER SIZING ISSUES ─────────────────────────────────────────────
+    if "buffer_issues" in data_keys:
+        bi = raw_data.get("buffer_issues", [])
+        lines.append("=== BUFFER SIZING ISSUES (TOR diverges >20% from ADU×DLT×(LTF+VF)) ===")
+        if bi:
+            lines.append(f"{'Part #':<20} {'Curr TOR':>10} {'Calc TOR':>10} {'Diff%':>7} {'Stale':>6}")
+            for r in bi[:15]:
+                lines.append(
+                    f"{r['part_number']:<20} {r['top_of_red']:>10.1f} "
+                    f"{r['calc_tor']:>10.1f} {r['pct_diff']:>7.1f} {str(r['stale']):>6}"
+                )
+        else:
+            lines.append("No significant buffer sizing misalignments.")
+        lines.append("")
+
+    # ── DEMAND TRENDS ────────────────────────────────────────────────────
+    if "demand_trends" in data_keys:
+        trends = raw_data.get("demand_trends", {})
+        snap_map = {r["id"]: r for r in snap}
+        notable = [
+            (iid, t) for iid, t in trends.items()
+            if t["total_entries"] >= 5 and (t["adu_divergence_pct"] > 20 or t["cv"] > 0.8)
+        ]
+        lines.append("=== DEMAND TRENDS (90-day, notable items only) ===")
+        if notable:
+            lines.append(f"{'Part #':<20} {'Stored ADU':>11} {'Recent ADU':>11} {'Div%':>6} {'CV':>6} {'Trend':>8}")
+            for iid, t in sorted(notable, key=lambda x: x[1]["adu_divergence_pct"], reverse=True)[:15]:
+                pn = snap_map.get(iid, {}).get("part_number", str(iid))
+                lines.append(
+                    f"{pn:<20} {t['stored_adu']:>11.3f} {t['recent_adu']:>11.3f} "
+                    f"{t['adu_divergence_pct']:>6.1f} {t['cv']:>6.2f} {t['trend_direction']:>8}"
+                )
+        else:
+            lines.append("No significant demand trend deviations detected.")
+        lines.append("")
+
+    # ── ABC/XYZ ──────────────────────────────────────────────────────────
+    if "abc_xyz" in data_keys:
+        abc = raw_data.get("abc_xyz", [])
+        lines.append("=== ABC/XYZ CLASSIFICATION ===")
+        if abc:
+            from collections import Counter
+            cell_counts: Counter = Counter()
+            cell_values: dict    = defaultdict(float)
+            for r in abc:
+                key = r["acvs"]
+                cell_counts[key] += 1
+                cell_values[key] += r.get("annual_value", 0)
+            lines.append(f"{'Cell':<8} {'Items':>6} {'Annual Value €':>16}")
+            for cell in ["A-X", "A-Y", "A-Z", "B-X", "B-Y", "B-Z", "C-X", "C-Y", "C-Z"]:
+                lines.append(f"{cell:<8} {cell_counts.get(cell, 0):>6} {cell_values.get(cell, 0):>16,.0f}")
+            lines.append("")
+            lines.append(f"{'Part #':<20} {'ABC':>4} {'XYZ':>4} {'Cell':>6} {'CV':>6} {'Annual €':>12}")
+            for r in sorted(abc, key=lambda x: x.get("annual_value", 0), reverse=True)[:25]:
+                lines.append(
+                    f"{r['part_number']:<20} {r['abc']:>4} {r['xyz']:>4} {r['acvs']:>6} "
+                    f"{r['cv']:>6.2f} {r.get('annual_value', 0):>12,.0f}"
+                )
+        else:
+            lines.append("No ABC/XYZ data available.")
+        lines.append("")
 
     # ── SUPPLIER RISK ────────────────────────────────────────────────────
-    lines.append("=== SUPPLIER RISK ===")
-    if raw["supplier_risk"]:
-        lines.append(f"{'Part #':<20} {'Supplier':<25} {'Rel%':>6} {'Exec':>8} {'DLT':>5} {'SupLT':>6} {'LTGap':>7}")
-        for r in raw["supplier_risk"][:15]:
-            lines.append(f"{r['part_number']:<20} {r['supplier_name'][:24]:<25} "
-                         f"{r['reliability_pct']:>6.0f} {r['execution_color']:>8} "
-                         f"{r['dlt']:>5.0f} {r['supplier_lt_days']:>6} "
-                         f"{r['dlt_vs_sup_lt_gap']:>7.0f}")
-    else:
-        lines.append("No supplier risk items detected (all suppliers have reliability ≥ 90%).")
-    lines.append("")
+    if "supplier_risk" in data_keys:
+        sr = raw_data.get("supplier_risk", [])
+        lines.append("=== SUPPLIER RISK (reliability < 90%) ===")
+        if sr:
+            lines.append(f"{'Part #':<20} {'Supplier':<25} {'Rel%':>6} {'Exec':>8} {'DLT':>5} {'SupLT':>6} {'LTGap':>7}")
+            for r in sr[:15]:
+                lines.append(
+                    f"{r['part_number']:<20} {r['supplier_name'][:24]:<25} "
+                    f"{r['reliability_pct']:>6.0f} {r['execution_color']:>8} "
+                    f"{r['dlt']:>5.0f} {r['supplier_lt_days']:>6} "
+                    f"{r['dlt_vs_sup_lt_gap']:>7.0f}"
+                )
+        else:
+            lines.append("No supplier risk items (all suppliers ≥ 90% reliability).")
+        lines.append("")
 
-    context_text = "\n".join(lines)
-
-    # Cap context to avoid token overflow (~12k chars)
-    if len(context_text) > 12_000:
-        context_text = context_text[:12_000] + "\n\n[...context truncated to fit token limit...]"
-
-    return context_text, raw
+    ctx = "\n".join(lines)
+    # Cap at ~8k chars per analysis to keep token usage reasonable
+    if len(ctx) > 8_000:
+        ctx = ctx[:8_000] + "\n\n[...context truncated...]"
+    return ctx
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — LLM call
+# Phase 2b — Single focused LLM call
 # ---------------------------------------------------------------------------
 
-def call_nvidia_nim(
-    context: str,
-    model:   str   = "deepseek-ai/deepseek-v3-0324",
-    api_key: str   = "",
-    max_tokens: int = 8192,
+def call_nvidia_nim_focused(
+    category_key: str,
+    focused_context: str,
+    model: str = "deepseek-ai/deepseek-v3-0324",
+    api_key: str = "",
+    max_tokens: int = 4096,
 ) -> tuple[str, str]:
     """
-    Call the NVIDIA NIM API with the assembled context + skills.
+    Call the NVIDIA NIM API for one analysis category.
     Returns (raw_response_text, status) where status is 'ok' or 'error'.
     """
     if not api_key:
         return "No NVIDIA_API_KEY configured.", "error"
 
-    # Sanitise model slug
-    model = model.strip()[:100]
+    cat          = _CATEGORY_BY_KEY[category_key]
+    skill_name, skill_content = _load_skill(cat["skill_file"])
 
-    skills_text  = load_skills(context)
-    system_prompt = _AGENT_SYSTEM_PROMPT.format(
-        skills=skills_text if skills_text else "(no specific skill files loaded)",
-        context="{context}",   # placeholder — context injected below
-    ).replace("{context}", context)  # safe: context is trusted internal data
+    prompt = _FOCUSED_SYSTEM_PROMPT.format(
+        analysis_label=cat["label"],
+        analysis_description=cat["description"],
+        skill_name=skill_name,
+        skill_content=skill_content,
+        context=focused_context,
+    )
 
     try:
         client = OpenAI(base_url=_NVIDIA_BASE, api_key=api_key, timeout=300.0)
         response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": system_prompt}],
+            model=model.strip()[:100],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             top_p=0.95,
             max_tokens=max_tokens,
@@ -638,34 +734,35 @@ def parse_llm_signals(
     run_id:              int,
     company_id:          int,
     item_id_by_part_num: dict[str, int],
+    analysis_category:   str = "",
 ) -> list[AgentSignal]:
     """
-    Extract JSON array from raw LLM response and return AgentSignal objects.
-    On any parse failure, returns a single error signal.
+    Extract JSON array from raw LLM response and return AgentSignal objects
+    tagged with the given analysis_category.
+    On any parse failure returns a single error signal.
     """
-    # Try to find a JSON array in the response (handle preamble/postamble)
-    text = raw_response.strip()
+    text  = raw_response.strip()
     start = text.find("[")
     end   = text.rfind("]")
     if start == -1 or end == -1 or end <= start:
-        return [_error_signal(run_id, company_id, "LLM did not return a JSON array.",
-                              raw_response[:500])]
+        return [_error_signal(run_id, company_id, analysis_category,
+                              "LLM did not return a JSON array.", raw_response[:500])]
 
     try:
         data = json.loads(text[start:end + 1])
     except json.JSONDecodeError as e:
-        return [_error_signal(run_id, company_id, f"JSON parse error: {e}",
-                              text[start:start + 300])]
+        return [_error_signal(run_id, company_id, analysis_category,
+                              f"JSON parse error: {e}", text[start:start + 300])]
 
     if not isinstance(data, list):
-        return [_error_signal(run_id, company_id, "LLM returned JSON but not an array.", "")]
+        return [_error_signal(run_id, company_id, analysis_category,
+                              "LLM returned JSON but not an array.", "")]
 
     signals = []
     for obj in data:
         if not isinstance(obj, dict):
             continue
 
-        # Validate and sanitise signal_type and severity
         sig_type = str(obj.get("signal_type", "portfolio")).strip().lower()
         if sig_type not in VALID_SIGNAL_TYPES:
             sig_type = "portfolio"
@@ -689,36 +786,41 @@ def parse_llm_signals(
         except (TypeError, ValueError):
             m_thresh = None
 
-        # Resolve item_id — None for portfolio-level signals
         item_id = item_id_by_part_num.get(part_num)
 
         signals.append(AgentSignal(
-            run_id          = run_id,
-            company_id      = company_id,
-            item_id         = item_id,
-            part_number     = part_num,
-            signal_type     = sig_type,
-            severity        = severity,
-            title           = title or f"{sig_type} signal for {part_num}",
-            detail          = detail or "No detail provided.",
-            recommendation  = rec,
-            metric_name     = m_name,
-            metric_value    = m_value,
-            metric_threshold= m_thresh,
+            run_id            = run_id,
+            company_id        = company_id,
+            item_id           = item_id,
+            part_number       = part_num,
+            analysis_category = analysis_category,
+            signal_type       = sig_type,
+            severity          = severity,
+            title             = title or f"{sig_type} signal for {part_num}",
+            detail            = detail or "No detail provided.",
+            recommendation    = rec,
+            metric_name       = m_name,
+            metric_value      = m_value,
+            metric_threshold  = m_thresh,
         ))
 
     if not signals:
-        return [_error_signal(run_id, company_id, "LLM returned an empty array.", "")]
+        return [_error_signal(run_id, company_id, analysis_category,
+                              "LLM returned an empty array.", "")]
 
-    # Sort: critical first, then high, medium, low, info
     _order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     signals.sort(key=lambda s: _order.get(s.severity, 5))
     return signals
 
 
-def _error_signal(run_id: int, company_id: int, msg: str, detail: str) -> AgentSignal:
+def _error_signal(
+    run_id: int, company_id: int,
+    analysis_category: str, msg: str, detail: str,
+) -> AgentSignal:
     return AgentSignal(
-        run_id=run_id, company_id=company_id, part_number="PORTFOLIO",
+        run_id=run_id, company_id=company_id,
+        part_number="PORTFOLIO",
+        analysis_category=analysis_category,
         signal_type="portfolio", severity="info",
         title=f"Agent parse error: {msg[:80]}",
         detail=detail or msg,
@@ -731,16 +833,20 @@ def _error_signal(run_id: int, company_id: int, msg: str, detail: str) -> AgentS
 # ---------------------------------------------------------------------------
 
 def run_inventory_agent(
-    company_id: int,
-    user_id:    int,
-    model:      str = "deepseek-ai/deepseek-v3-0324",
-    api_key:    str = "",
-) -> tuple[AgentRun, list[AgentSignal]]:
+    company_id:        int,
+    user_id:           int,
+    model:             str = "deepseek-ai/deepseek-v3-0324",
+    api_key:           str = "",
+    progress_callback: Optional[Callable[[str, str, int], None]] = None,
+) -> tuple[dict, list[dict]]:
     """
-    Full agent orchestration. Creates an AgentRun, collects data, calls the LLM,
-    parses and persists signals, then updates the run record.
+    Full agent orchestration — 7 sequential focused analyses.
 
-    Returns (AgentRun, [AgentSignal]) — all already committed to the DB.
+    progress_callback(category_key, status, n_signals):
+        Called after each analysis completes.
+        status = "running" | "done" | "error"
+
+    Returns (run_dict, signal_dicts) — plain dicts, session already closed.
     """
     if not isinstance(company_id, int) or company_id is None:
         raise ValueError("company_id must be a non-None integer")
@@ -748,64 +854,97 @@ def run_inventory_agent(
     session = SessionLocal()
     t_start = time.time()
 
+    planned_keys = [c["key"] for c in ANALYSIS_CATEGORIES]
+
     # Create run record
     run = AgentRun(
-        company_id    = company_id,
-        triggered_by  = user_id,
-        model_used    = model.strip()[:200],
-        status        = "running",
+        company_id       = company_id,
+        triggered_by     = user_id,
+        model_used       = model.strip()[:200],
+        status           = "running",
+        analyses_planned = json.dumps(planned_keys),
+        analyses_done    = json.dumps([]),
     )
     session.add(run)
-    session.flush()   # get run.id
+    session.flush()
     run_id = run.id
 
     try:
-        # Phase 1 — build context
-        context_text, raw_data = build_agent_context(company_id)
-
-        # Phase 2 — call LLM
-        raw_response, status = call_nvidia_nim(
-            context=context_text, model=model, api_key=api_key
-        )
-
-        # Phase 3 — parse signals
+        # Phase 1 — collect all data once
+        raw_data    = collect_raw_data(company_id)
         item_id_map = {r["part_number"]: r["id"] for r in raw_data.get("snapshot", [])}
-        signals = parse_llm_signals(raw_response, run_id, company_id, item_id_map)
+        total_items = len(raw_data["snapshot"])
 
-        # Persist signals
-        for sig in signals:
-            session.add(sig)
+        all_signal_dicts: list[dict] = []
+        done_keys: list[str]         = []
+        total_signals                = 0
 
-        # Update run record
+        # Phase 2+3 — one focused LLM call per analysis
+        for cat in ANALYSIS_CATEGORIES:
+            cat_key   = cat["key"]
+            cat_label = cat["label"]
+
+            if progress_callback:
+                progress_callback(cat_key, "running", 0)
+
+            focused_ctx = build_focused_context(cat_key, raw_data)
+            raw_resp, status = call_nvidia_nim_focused(
+                category_key=cat_key,
+                focused_context=focused_ctx,
+                model=model,
+                api_key=api_key,
+            )
+
+            signals = parse_llm_signals(
+                raw_response=raw_resp,
+                run_id=run_id,
+                company_id=company_id,
+                item_id_by_part_num=item_id_map,
+                analysis_category=cat_key,
+            )
+
+            # Persist signals for this analysis immediately
+            for sig in signals:
+                session.add(sig)
+            session.flush()
+
+            n_sigs       = len(signals)
+            total_signals += n_sigs
+            done_keys.append(cat_key)
+
+            # Update run progress
+            run.analyses_done    = json.dumps(done_keys)
+            run.signals_generated = total_signals
+            session.flush()
+
+            if progress_callback:
+                cb_status = "done" if status == "ok" else "error"
+                progress_callback(cat_key, cb_status, n_sigs)
+
+        # Finalise run record
         duration = time.time() - t_start
-        run.status            = "completed" if status == "ok" else "failed"
-        run.items_analysed    = len(raw_data.get("snapshot", []))
-        run.signals_generated = len(signals)
-        run.duration_seconds  = round(duration, 2)
-        run.context_snapshot  = context_text[:8000]   # truncate for storage
-        run.llm_raw_response  = raw_response[:16000]
-        if status == "error":
-            run.error_message = raw_response[:500]
-
+        run.status           = "completed"
+        run.items_analysed   = total_items
+        run.signals_generated = total_signals
+        run.duration_seconds = round(duration, 2)
+        run.context_snapshot = json.dumps({k: len(v) if isinstance(v, (list, dict)) else str(v)
+                                           for k, v in raw_data.items()})[:4000]
         session.commit()
 
-        # Re-query signals after commit so relationships are loaded
-        persisted_signals = (session.query(AgentSignal)
-                             .filter(AgentSignal.run_id == run_id)
-                             .order_by(AgentSignal.id)
-                             .all())
-        # Detach safely
-        result_run = {c.name: getattr(run, c.name) for c in run.__table__.columns}
-        result_signals = [
-            {c.name: getattr(s, c.name) for c in s.__table__.columns}
-            for s in persisted_signals
-        ]
+        # Re-query signals after commit
+        persisted = (session.query(AgentSignal)
+                     .filter(AgentSignal.run_id == run_id)
+                     .order_by(AgentSignal.analysis_category, AgentSignal.id)
+                     .all())
+        result_run     = {c.name: getattr(run, c.name) for c in run.__table__.columns}
+        result_signals = [{c.name: getattr(s, c.name) for c in s.__table__.columns}
+                          for s in persisted]
         return result_run, result_signals
 
     except Exception as exc:
         try:
-            run.status        = "failed"
-            run.error_message = str(exc)[:500]
+            run.status           = "failed"
+            run.error_message    = str(exc)[:500]
             run.duration_seconds = round(time.time() - t_start, 2)
             session.commit()
         except Exception:
