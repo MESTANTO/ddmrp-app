@@ -492,7 +492,11 @@ def _render_results_table(results):
             bg = "#FEF9E7"
         return [f"background-color: {bg}; color: #1A1A1A"] * len(row)
 
-    st.dataframe(df.style.apply(_style, axis=1),
+    from modules.ui_helpers import top_n_selector
+    ss_total = len(df)
+    ss_n = top_n_selector(ss_total, key="ss_main_n", default=10, label="Show top")
+    st.caption(f"Showing {min(ss_n, ss_total):,} of {ss_total:,} items")
+    st.dataframe(df.head(ss_n).style.apply(_style, axis=1),
                  use_container_width=True, hide_index=True)
 
     # Warnings expander
@@ -577,5 +581,9 @@ def _render_ddmrp_comparison(results):
         else: bg = "#EBF5FB"
         return [f"background-color: {bg}; color: #1A1A1A"] * len(row)
 
-    st.dataframe(df.style.apply(_style, axis=1),
+    from modules.ui_helpers import top_n_selector
+    cmp_total = len(df)
+    cmp_n = top_n_selector(cmp_total, key="ss_ddmrp_cmp_n", default=10, label="Show top")
+    st.caption(f"Showing {min(cmp_n, cmp_total):,} of {cmp_total:,} items")
+    st.dataframe(df.head(cmp_n).style.apply(_style, axis=1),
                  use_container_width=True, hide_index=True)

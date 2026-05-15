@@ -531,9 +531,12 @@ def _render_table(df: pd.DataFrame):
         result.append(f"background-color:{bg};color:white;font-weight:bold")
         return result
 
-    st.caption(f"Showing {len(display)} of {len(df)} items")
+    from modules.ui_helpers import top_n_selector
+    total_disp = len(display)
+    disp_n = top_n_selector(total_disp, key="abcxyz_full_n", default=10, label="Show top")
+    st.caption(f"Showing {min(disp_n, total_disp):,} of {total_disp:,} items (filtered) · {len(df):,} total")
     st.dataframe(
-        display.style.apply(_style_full, axis=1),
+        display.head(disp_n).style.apply(_style_full, axis=1),
         use_container_width=True,
         hide_index=True,
         height=520,

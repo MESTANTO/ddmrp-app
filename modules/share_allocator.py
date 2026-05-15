@@ -427,7 +427,12 @@ def _render_result(result: AllocationResult):
         bg  = STATUS_BG.get(key, "#FFFFFF")
         return [f"background-color: {bg}; color: #1A1A1A"] * len(row)
 
-    st.dataframe(df.style.apply(_sty, axis=1), use_container_width=True, hide_index=True)
+    from modules.ui_helpers import top_n_selector
+    sa_total = len(df)
+    sa_n = top_n_selector(sa_total, key="share_alloc_n", default=10, label="Show top")
+    st.caption(f"Showing {min(sa_n, sa_total):,} of {sa_total:,} lines")
+    st.dataframe(df.head(sa_n).style.apply(_sty, axis=1),
+                 use_container_width=True, hide_index=True)
 
     # Waterfall chart — allocated qty per item
     allocated = [l for l in result.lines if l.allocated_qty > 0]

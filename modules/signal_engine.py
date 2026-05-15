@@ -267,12 +267,19 @@ def _signal_table(signals):
             bg = "#FEF9E7"
         return [f"background-color: {bg}; color: #1A1A1A"] * len(row)
 
-    st.dataframe(df.style.apply(_row_style, axis=1),
+    from modules.ui_helpers import top_n_selector
+    total = len(df)
+    n = top_n_selector(total, key="sig_replen_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n, total):,} of {total:,} items (sorted by urgency)")
+    st.dataframe(df.head(n).style.apply(_row_style, axis=1),
                  use_container_width=True, hide_index=True)
 
     if st.checkbox("Show only items requiring action", key="filter_signals"):
         action_df = df[df["1st Order Qty"] != "—"]
-        st.dataframe(action_df, use_container_width=True, hide_index=True)
+        a_total = len(action_df)
+        a_n = top_n_selector(a_total, key="sig_replen_action_n", default=10, label="Show top")
+        st.caption(f"Showing {min(a_n, a_total):,} of {a_total:,} actionable items")
+        st.dataframe(action_df.head(a_n), use_container_width=True, hide_index=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,12 +389,15 @@ def _planned_orders_section(planning):
             bg = "#FDEBD0"
         return [f"background-color: {bg}; color: #1A1A1A"] * len(row)
 
+    from modules.ui_helpers import top_n_selector
+    total_po = len(df_po)
+    po_n = top_n_selector(total_po, key="sig_planned_orders_n", default=10, label="Show top")
+    st.caption(f"Showing {min(po_n, total_po):,} of {total_po:,} planned orders.")
     st.dataframe(
-        df_po.style.apply(_po_row_style, axis=1),
+        df_po.head(po_n).style.apply(_po_row_style, axis=1),
         use_container_width=True,
         hide_index=True,
     )
-    st.caption(f"Showing {len(rows)} of {len(all_orders)} planned orders.")
 
     # ── Per-item summary table ──
     st.divider()
@@ -426,7 +436,10 @@ def _planned_orders_section(planning):
             return ["background-color: #FADBD8; color: #1A1A1A"] * len(row)
         return ["background-color: #FDEBD0; color: #1A1A1A"] * len(row)
 
-    st.dataframe(df_sum.style.apply(_sum_style, axis=1),
+    sum_total = len(df_sum)
+    sum_n = top_n_selector(sum_total, key="sig_planned_summary_n", default=10, label="Show top")
+    st.caption(f"Showing {min(sum_n, sum_total):,} of {sum_total:,} items")
+    st.dataframe(df_sum.head(sum_n).style.apply(_sum_style, axis=1),
                  use_container_width=True, hide_index=True)
 
 

@@ -91,8 +91,15 @@ def _show_list():
             "Active now": "✅" if is_active else "—",
             "Note": adj.note or "",
         })
-    st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
-    st.caption(f"{len(data)} adjustment(s).")
+    from modules.ui_helpers import limited_dataframe
+    limited_dataframe(
+        pd.DataFrame(data),
+        key="buf_adj",
+        sort_by="Start",
+        ascending=False,
+        show_search=True,
+        search_columns=["Part", "Description", "Note"],
+    )
 
     st.divider()
     st.markdown("**Delete an adjustment**")

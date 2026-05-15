@@ -246,7 +246,13 @@ def _bom_manager():
             "Qty per Assembly":  l.qty,
             "Note":              l.note or "",
         } for l in lines]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        from modules.ui_helpers import limited_dataframe
+        limited_dataframe(
+            pd.DataFrame(rows),
+            key="bom_lines",
+            show_search=True,
+            search_columns=["Parent (Assembly)", "Child (Component)", "Note"],
+        )
     else:
         st.info("No BOM lines yet. Add lines below.")
 
@@ -355,7 +361,12 @@ def _dlt_table():
             return ["background-color: #D6EAF8; color: #1A1A1A"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(df.style.apply(_style, axis=1), use_container_width=True, hide_index=True)
+    from modules.ui_helpers import top_n_selector
+    dlt_total = len(df)
+    dlt_n = top_n_selector(dlt_total, key="bom_dlt_n", default=10, label="Show top")
+    st.caption(f"Showing {min(dlt_n, dlt_total):,} of {dlt_total:,} items")
+    st.dataframe(df.head(dlt_n).style.apply(_style, axis=1),
+                 use_container_width=True, hide_index=True)
     st.caption("Orange = Computed > Manual (manual DLT is understated). Blue = Computed < Manual.")
 
     # Offer to sync computed DLT back to item records

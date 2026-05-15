@@ -260,8 +260,15 @@ def _view_entries():
         session.close()
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption(f"{len(rows)} entr{'y' if len(rows)==1 else 'ies'} found.")
+    from modules.ui_helpers import limited_dataframe
+    limited_dataframe(
+        df,
+        key="ds_entries",
+        sort_by="Due Date" if "Due Date" in df.columns else None,
+        ascending=False,
+        show_search=True,
+        search_columns=["Part Number", "Description", "Reference"],
+    )
 
     # Delete by ID
     st.divider()

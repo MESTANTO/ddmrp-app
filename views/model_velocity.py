@@ -233,8 +233,13 @@ def _detail_table(df: pd.DataFrame, window: int):
             return ["background-color: #D5F5E3; color: #1A1A1A"] * len(row)
         return [""] * len(row)
 
+    from modules.ui_helpers import top_n_selector
+    mv_disp = display[cols].rename(columns=rename)
+    total_mv = len(mv_disp)
+    mv_n = top_n_selector(total_mv, key="mv_main_n", default=10, label="Show top")
+    st.caption(f"Showing {min(mv_n, total_mv):,} of {total_mv:,} items")
     st.dataframe(
-        display[cols].rename(columns=rename).style.apply(_sty, axis=1),
+        mv_disp.head(mv_n).style.apply(_sty, axis=1),
         use_container_width=True,
         hide_index=True,
     )
@@ -246,6 +251,7 @@ def _dba_recommendations(df: pd.DataFrame):
     Too fast → DBA up (increase ADU or green zone multiplier).
     Too slow → DBA down (decrease ADU or consider buffer reduction).
     """
+    from modules.ui_helpers import top_n_selector
     st.subheader("DBA Recommendations")
     st.caption(
         "Based on Model Velocity deviations. "
@@ -276,7 +282,11 @@ def _dba_recommendations(df: pd.DataFrame):
                 "Velocity":       f"{r['velocity']:+.2f}",
                 "Suggested DAF":  suggested_daf,
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        fast_df = pd.DataFrame(rows)
+        f_total = len(fast_df)
+        f_n = top_n_selector(f_total, key="mv_fast_n", default=10, label="Show top")
+        st.caption(f"Showing {min(f_n, f_total):,} of {f_total:,} fast items")
+        st.dataframe(fast_df.head(f_n), use_container_width=True, hide_index=True)
 
     if not slow.empty:
         st.markdown("#### 🐢 Reduce buffer (DBA down) — Too Slow")
@@ -293,4 +303,8 @@ def _dba_recommendations(df: pd.DataFrame):
                 "Velocity":       f"{r['velocity']:+.2f}",
                 "Suggested DAF":  suggested_daf,
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        slow_df = pd.DataFrame(rows)
+        s_total = len(slow_df)
+        s_n = top_n_selector(s_total, key="mv_slow_n", default=10, label="Show top")
+        st.caption(f"Showing {min(s_n, s_total):,} of {s_total:,} slow items")
+        st.dataframe(slow_df.head(s_n), use_container_width=True, hide_index=True)

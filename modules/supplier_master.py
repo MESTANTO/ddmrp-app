@@ -132,8 +132,12 @@ def _render_list():
         color = STATUS_COLOR.get(val, "#FFFFFF")
         return f"background-color:{color};color:white;font-weight:bold;border-radius:4px"
 
+    from modules.ui_helpers import top_n_selector
+    total = len(df)
+    n = top_n_selector(total, key="sup_master_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n, total):,} of {total:,} suppliers")
     st.dataframe(
-        df.style.map(_style_status, subset=["Status"]),
+        df.head(n).style.map(_style_status, subset=["Status"]),
         use_container_width=True,
         hide_index=True,
         height=420,

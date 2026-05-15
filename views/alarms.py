@@ -266,7 +266,11 @@ def _buffer_status_alarm(df: pd.DataFrame):
         "tor":         "TOR",
         "tog":         "TOG",
     })
-    st.dataframe(_styled(table, "Band"), use_container_width=True, hide_index=True)
+    from modules.ui_helpers import top_n_selector
+    t1 = len(table)
+    n1 = top_n_selector(t1, key="alarm_buf_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n1, t1):,} of {t1:,} items")
+    st.dataframe(_styled(table.head(n1), "Band"), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +297,11 @@ def _current_stock_alarm(df: pd.DataFrame):
         "on_hand":     "On Hand",
         "tor":         "TOR",
     })
-    st.dataframe(_styled(table, "Band"), use_container_width=True, hide_index=True)
+    from modules.ui_helpers import top_n_selector
+    t2 = len(table)
+    n2 = top_n_selector(t2, key="alarm_cur_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n2, t2):,} of {t2:,} items")
+    st.dataframe(_styled(table.head(n2), "Band"), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +341,11 @@ def _projected_stock_alarm(df: pd.DataFrame, signals: dict):
         "on_hand":     "On Hand Today",
         "tor":         "TOR",
     })
-    st.dataframe(_styled(table, "Band"), use_container_width=True, hide_index=True)
+    from modules.ui_helpers import top_n_selector
+    t3 = len(table)
+    n3 = top_n_selector(t3, key="alarm_proj_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n3, t3):,} of {t3:,} items")
+    st.dataframe(_styled(table.head(n3), "Band"), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +416,11 @@ def _material_sync_alarm(df: pd.DataFrame, signals: dict, horizon: int):
         "description": "Description",
         "note":        "Note",
     })
-    st.dataframe(_styled(table, "Band"), use_container_width=True, hide_index=True)
+    from modules.ui_helpers import top_n_selector
+    t4 = len(table)
+    n4 = top_n_selector(t4, key="alarm_sync_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n4, t4):,} of {t4:,} items")
+    st.dataframe(_styled(table.head(n4), "Band"), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +471,11 @@ def _lead_time_alarm(df: pd.DataFrame):
         return
 
     df_lt = pd.DataFrame(flagged).sort_values("Excess (days)", ascending=False)
-    st.dataframe(df_lt, use_container_width=True, hide_index=True)
+    from modules.ui_helpers import top_n_selector
+    t5 = len(df_lt)
+    n5 = top_n_selector(t5, key="alarm_lt_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n5, t5):,} of {t5:,} orders")
+    st.dataframe(df_lt.head(n5), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------

@@ -300,8 +300,15 @@ def _show_item_list():
         session.close()
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption(f"{len(rows)} item(s) in database.")
+    from modules.ui_helpers import limited_dataframe
+    limited_dataframe(
+        df,
+        key="mat_master_items",
+        sort_by="Part Number",
+        ascending=True,
+        show_search=True,
+        search_columns=["Part Number", "Description", "Category"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +766,12 @@ def _show_param_calculator():
         bg = "#EBF5FB" if changed else "#FFFFFF"
         return [f"background-color: {bg}; color: #1A1A1A"] * len(row)
 
-    st.dataframe(df.style.apply(_style, axis=1), use_container_width=True, hide_index=True)
+    from modules.ui_helpers import top_n_selector
+    total = len(df)
+    n = top_n_selector(total, key="mat_master_calc_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n, total):,} of {total:,} rows")
+    st.dataframe(df.head(n).style.apply(_style, axis=1),
+                 use_container_width=True, hide_index=True)
 
     # ── Single-item diagnostics ──────────────────────────────────────────────
     if len(results) == 1:

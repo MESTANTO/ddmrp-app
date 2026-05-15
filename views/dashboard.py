@@ -223,6 +223,12 @@ def _buffer_status_board(df: pd.DataFrame):
     priority = {"red": 0, "yellow": 1, "green": 2, "unknown": 3}
     sorted_df = df.sort_values("status", key=lambda s: s.map(priority))
 
+    from modules.ui_helpers import top_n_selector
+    total = len(sorted_df)
+    n = top_n_selector(total, key="dash_board_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n, total):,} of {total:,} items (sorted by status priority).")
+    sorted_df = sorted_df.head(n)
+
     cols_per_row = 4
     rows_data = [sorted_df.iloc[i:i + cols_per_row]
                  for i in range(0, len(sorted_df), cols_per_row)]
@@ -263,7 +269,16 @@ def _nfp_zone_chart(df: pd.DataFrame):
     if df.empty:
         return
 
-    sorted_df = df.sort_values("part_number")
+    from modules.ui_helpers import top_n_selector
+    # Sort by NFP penetration (lowest first → most critical) so the top-N is meaningful
+    sorted_df = df.copy()
+    sorted_df["_penetration"] = (sorted_df["nfp"] - sorted_df["tor"]) / (sorted_df["tog"] - sorted_df["tor"]).replace(0, 1)
+    sorted_df = sorted_df.sort_values("_penetration")
+
+    total = len(sorted_df)
+    n = top_n_selector(total, key="dash_nfp_n", default=10, label="Show top")
+    st.caption(f"Showing {min(n, total):,} of {total:,} items (most critical first by NFP penetration).")
+    sorted_df = sorted_df.head(n).sort_values("part_number")
 
     fig = go.Figure()
 
