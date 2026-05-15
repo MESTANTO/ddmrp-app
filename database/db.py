@@ -353,6 +353,59 @@ class Buffer(Base):
 
 
 # ---------------------------------------------------------------------------
+# Agent tables — Inventory Manager Agent runs and signals
+# ---------------------------------------------------------------------------
+
+class AgentRun(Base):
+    """One row per Inventory Manager Agent execution (one button click)."""
+    __tablename__ = "agent_runs"
+
+    id                 = Column(Integer, primary_key=True, autoincrement=True)
+    company_id         = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    triggered_by       = Column(Integer, ForeignKey("users.id"), nullable=False)
+    run_at             = Column(DateTime, default=datetime.utcnow, nullable=False)
+    model_used         = Column(String, nullable=False)
+    status             = Column(String, default="running")   # running | completed | failed
+    items_analysed     = Column(Integer, default=0)
+    signals_generated  = Column(Integer, default=0)
+    duration_seconds   = Column(Float, nullable=True)
+    error_message      = Column(Text, nullable=True)
+    context_snapshot   = Column(Text, nullable=True)
+    llm_raw_response   = Column(Text, nullable=True)
+    created_at         = Column(DateTime, default=datetime.utcnow)
+
+    signals = relationship("AgentSignal", back_populates="run", cascade="all, delete")
+
+
+class AgentSignal(Base):
+    """One finding/recommendation produced by the agent during a run."""
+    __tablename__ = "agent_signals"
+
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    run_id           = Column(Integer, ForeignKey("agent_runs.id"), nullable=False)
+    company_id       = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    item_id          = Column(Integer, ForeignKey("items.id"), nullable=True)
+    part_number      = Column(String, default="")
+    signal_type      = Column(String, nullable=False)
+    # stockout_risk | overstock | low_nfp | buffer_resizing | data_quality
+    # demand_trend | abc_xyz_policy | safety_stock_gap | supplier_risk | portfolio
+    severity         = Column(String, default="medium")
+    # critical | high | medium | low | info
+    title            = Column(String, nullable=False)
+    detail           = Column(Text, nullable=False)
+    recommendation   = Column(Text, default="")
+    metric_name      = Column(String, default="")
+    metric_value     = Column(Float, nullable=True)
+    metric_threshold = Column(Float, nullable=True)
+    is_actioned      = Column(Boolean, default=False)
+    actioned_at      = Column(DateTime, nullable=True)
+    actioned_by      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at       = Column(DateTime, default=datetime.utcnow)
+
+    run  = relationship("AgentRun", back_populates="signals")
+
+
+# ---------------------------------------------------------------------------
 # BOM (Bill of Materials) — used by compute_dlt() in bom_engine.py
 # ---------------------------------------------------------------------------
 
@@ -456,6 +509,9 @@ def init_db():
     _migrate_company_columns()   # multi-tenancy: adds company_id, creates default company
     # Ensure demo user always exists (idempotent — safe to call every startup)
     _ensure_demo_user()
+    # Agent tables are created by create_all above (no migration needed for new installs)
+    # For existing DBs, add any new agent columns safely
+    _migrate_agent_tables()
 
 
 def _migrate_buffer_columns():
@@ -662,6 +718,17 @@ def _ensure_demo_user():
         pass
     finally:
         session.close()
+
+
+def _migrate_agent_tables():
+    """
+    Ensure agent_runs and agent_signals tables exist on existing deployments.
+    create_all() already handles new installs; this is a no-op safety net.
+    """
+    # Both tables are declared as SQLAlchemy models and created by create_all().
+    # If the DB already existed before these models were added, create_all()
+    # with checkfirst=True (default) will create any missing tables.
+    Base.metadata.create_all(engine)
 
 
 def seed_company_data(company_id: int):

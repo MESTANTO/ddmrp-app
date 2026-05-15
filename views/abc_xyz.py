@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 
 from database.db import get_session, Item, DemandEntry
 from database.auth import get_company_id
+from modules.classification import compute_abc_xyz, _compute_cv
 
 
 # ── Colour palettes ──────────────────────────────────────────────────────────
@@ -71,7 +72,7 @@ def _cached_compute(company_id: int, abc_a: float, abc_ab: float, xyz_x: float, 
         session.close()
     if not items:
         return pd.DataFrame()
-    return _compute(items, demands, abc_a, abc_ab, xyz_x, xyz_y)
+    return compute_abc_xyz(items, demands, abc_a, abc_ab, xyz_x, xyz_y)
 
 
 def show():
@@ -140,101 +141,6 @@ def show():
 
     with tab_table:
         _render_table(df)
-
-
-# ---------------------------------------------------------------------------
-# Computation
-# ---------------------------------------------------------------------------
-
-def _compute(items, demands, abc_a_thr, abc_ab_thr, xyz_x_thr, xyz_y_thr) -> pd.DataFrame:
-    # Index demand by item
-    demand_by_item: dict[int, list] = defaultdict(list)
-    for d in demands:
-        demand_by_item[d.item_id].append(d)
-
-    rows = []
-    for item in items:
-        item_demands = demand_by_item.get(item.id, [])
-
-        # ── Annual usage ──────────────────────────────────────────────────
-        if item_demands:
-            total_qty = sum(d.quantity for d in item_demands)
-            dates = [d.demand_date for d in item_demands]
-            span_days = max(1, (max(dates) - min(dates)).days)
-            annual_usage = total_qty * 365.0 / span_days
-        else:
-            annual_usage = (item.adu or 0.0) * 365.0
-
-        annual_value = annual_usage * (item.unit_cost or 0.0)
-
-        # ── Demand variability (CV of weekly buckets) ─────────────────────
-        cv = _compute_cv(item, item_demands)
-
-        rows.append({
-            "id":           item.id,
-            "part_number":  item.part_number,
-            "description":  item.description,
-            "category":     item.category or "",
-            "item_type":    item.item_type or "P",
-            "unit_cost":    item.unit_cost or 0.0,
-            "annual_usage": annual_usage,
-            "annual_value": annual_value,
-            "cv":           cv,
-        })
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-
-    # ── ABC classification ────────────────────────────────────────────────
-    df_val = df[df["annual_value"] > 0].copy()
-    df_zero = df[df["annual_value"] <= 0].copy()
-
-    if not df_val.empty:
-        df_val = df_val.sort_values("annual_value", ascending=False).reset_index(drop=True)
-        total_v = df_val["annual_value"].sum()
-        df_val["cum_pct"] = df_val["annual_value"].cumsum() / total_v
-        # Shift cum_pct back by 1 row: item goes into A if it was needed to reach the threshold
-        df_val["cum_pct_prev"] = df_val["cum_pct"].shift(1, fill_value=0.0)
-        df_val["abc"] = df_val["cum_pct_prev"].apply(
-            lambda c: "A" if c < abc_a_thr else ("B" if c < abc_ab_thr else "C")
-        )
-        df_zero["abc"] = "C"
-        df = pd.concat([df_val, df_zero], ignore_index=True)
-    else:
-        df["abc"] = "C"
-        df["cum_pct"] = 0.0
-
-    # ── XYZ classification ────────────────────────────────────────────────
-    def _xyz(cv):
-        if cv < xyz_x_thr:  return "X"
-        if cv < xyz_y_thr:  return "Y"
-        return "Z"
-
-    df["xyz"] = df["cv"].apply(_xyz)
-    df["acvs"] = df["abc"] + "-" + df["xyz"]
-
-    return df
-
-
-def _compute_cv(item, demands) -> float:
-    """Coefficient of variation of weekly demand buckets."""
-    if len(demands) >= 4:
-        weekly: dict = defaultdict(float)
-        for d in demands:
-            # ISO week key
-            week_key = d.demand_date.isocalendar()[:2]  # (year, week)
-            weekly[week_key] += d.quantity
-
-        vals = list(weekly.values())
-        if len(vals) >= 2:
-            mean_v = statistics.mean(vals)
-            if mean_v > 0:
-                return statistics.stdev(vals) / mean_v
-
-    # Fallback: use variability_factor (0 = low, 1 = high)
-    return item.variability_factor or 0.0
 
 
 # ---------------------------------------------------------------------------
