@@ -57,8 +57,7 @@ PAGES = {
     "🚨  Execution Alarms":          "alarms",
     "📐  Prioritized Share":         "share_allocator",
     "📉  Model Velocity":            "model_velocity",
-    "🤖  AI Advisor":                "ai_advisor",
-    "📦  Inventory Manager":         "inventory_manager",
+    "🤖  AI Inventory Manager":      "ai_inventory_manager",
     "🔠  ABC / XYZ / ACV²":          "abc_xyz",
     "🛡️  Safety Stock & EOQ":        "safety_stock",
     "🎛️  Buffer Adjustments":        "buffer_adjustments",
@@ -154,12 +153,8 @@ elif page_key == "model_velocity":
     from views.model_velocity import show
     show()
 
-elif page_key == "ai_advisor":
-    from views.ai_advisor import show
-    show()
-
-elif page_key == "inventory_manager":
-    from views.inventory_manager import show
+elif page_key == "ai_inventory_manager":
+    from views.ai_inventory_manager import show
     show()
 
 elif page_key == "abc_xyz":

@@ -96,6 +96,14 @@ ANALYSIS_CATEGORIES = [
         "data_keys":  ["supplier_risk", "snapshot"],
         "description": "Highlights low-reliability suppliers and LTF/DLT configuration issues.",
     },
+    {
+        "key":        "value_reduction",
+        "label":      "Inventory Value Reduction",
+        "skill_file": "skill_08_inventory_value_reduction.md",
+        "data_keys":  ["value_summary", "overstock", "safety_gaps", "abc_xyz",
+                       "supplier_risk", "demand_trends", "snapshot"],
+        "description": "Quantifies cash tied up in inventory and proposes ranked cash-release levers.",
+    },
 ]
 
 _CATEGORY_BY_KEY = {c["key"]: c for c in ANALYSIS_CATEGORIES}
@@ -457,6 +465,77 @@ def get_abc_xyz_classification(company_id: int) -> list[dict]:
                "annual_value", "cv", "unit_cost"]].to_dict(orient="records")
 
 
+def get_inventory_value_summary(company_id: int) -> dict:
+    """
+    Headline € figures for the company's inventory.
+
+    Returns a dict with:
+      - on_hand_value:        sum of on_hand × unit_cost
+      - annual_usage_value:   sum of adu × 365 × unit_cost
+      - avg_inventory_target: sum of (TOR + Green/2) × unit_cost
+      - excess_value:         sum of (on_hand - TOG)+ × unit_cost
+      - gap_value:            sum of (TOR - on_hand)+ × unit_cost
+      - value_by_abc:         {"A": €, "B": €, "C": €}
+      - value_by_color:       {"green": €, "yellow": €, "red": €, "dark_red": €, "over_tog": €}
+      - top_items_by_value:   first 10 items by on-hand value
+    """
+    snap = get_inventory_snapshot(company_id)
+    abc  = get_abc_xyz_classification(company_id)
+    abc_by_id = {r["id"]: r for r in abc}
+
+    on_hand_val = 0.0
+    annual_val  = 0.0
+    avg_target  = 0.0
+    excess_val  = 0.0
+    gap_val     = 0.0
+    by_abc:   dict[str, float] = {"A": 0.0, "B": 0.0, "C": 0.0}
+    by_color: dict[str, float] = {}
+    items_rows = []
+
+    for r in snap:
+        unit_cost = r["unit_cost"] or 0.0
+        oh_val    = (r["on_hand"]    or 0.0) * unit_cost
+        ann_val   = (r["adu"]        or 0.0) * 365 * unit_cost
+        on_hand_val += oh_val
+        annual_val  += ann_val
+
+        if r["has_buffer"]:
+            tor   = r["top_of_red"]    or 0.0
+            green_zone = (r["top_of_green"] or 0.0) - (r["top_of_yellow"] or 0.0)
+            avg_target += (tor + green_zone / 2.0) * unit_cost
+            excess_val += max(0.0, (r["on_hand"] or 0.0) - (r["top_of_green"] or 0.0)) * unit_cost
+            gap_val    += max(0.0, tor - (r["on_hand"] or 0.0)) * unit_cost
+
+        abc_cls = (abc_by_id.get(r["id"]) or {}).get("abc", "C")
+        by_abc[abc_cls] = by_abc.get(abc_cls, 0.0) + oh_val
+
+        color = r["execution_color"] or "green"
+        by_color[color] = by_color.get(color, 0.0) + oh_val
+
+        items_rows.append({
+            "part_number":   r["part_number"],
+            "description":   r["description"],
+            "abc":           abc_cls,
+            "on_hand_value": round(oh_val, 2),
+            "annual_value":  round(ann_val, 2),
+            "execution_color": color,
+        })
+
+    items_rows.sort(key=lambda x: x["on_hand_value"], reverse=True)
+
+    return {
+        "on_hand_value":        round(on_hand_val, 2),
+        "annual_usage_value":   round(annual_val, 2),
+        "avg_inventory_target": round(avg_target, 2),
+        "excess_value":         round(excess_val, 2),
+        "gap_value":            round(gap_val, 2),
+        "value_by_abc":         {k: round(v, 2) for k, v in by_abc.items()},
+        "value_by_color":       {k: round(v, 2) for k, v in by_color.items()},
+        "top_items_by_value":   items_rows[:10],
+        "total_items":          len(snap),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 — Collect all raw data once
 # ---------------------------------------------------------------------------
@@ -464,7 +543,7 @@ def get_abc_xyz_classification(company_id: int) -> list[dict]:
 def collect_raw_data(company_id: int) -> dict:
     """
     Gather all data tool outputs upfront. Returns a dict keyed by data_key.
-    Called once before the 7-analysis loop to avoid redundant DB queries.
+    Called once before the 8-analysis loop to avoid redundant DB queries.
     """
     snap = get_inventory_snapshot(company_id)
     return {
@@ -478,6 +557,7 @@ def collect_raw_data(company_id: int) -> dict:
         "data_quality":  get_data_quality_issues(company_id),
         "supplier_risk": get_supplier_risk_items(company_id),
         "abc_xyz":       get_abc_xyz_classification(company_id),
+        "value_summary": get_inventory_value_summary(company_id),
     }
 
 
@@ -673,6 +753,39 @@ def build_focused_context(category_key: str, raw_data: dict) -> str:
             lines.append("No supplier risk items (all suppliers ≥ 90% reliability).")
         lines.append("")
 
+    # ── INVENTORY VALUE SUMMARY ─────────────────────────────────────────
+    if "value_summary" in data_keys:
+        vs = raw_data.get("value_summary") or {}
+        lines.append("=== INVENTORY VALUE SUMMARY (€) ===")
+        if vs:
+            lines.append(f"  On-hand value:        € {vs.get('on_hand_value', 0):>14,.2f}")
+            lines.append(f"  Annual usage value:   € {vs.get('annual_usage_value', 0):>14,.2f}")
+            lines.append(f"  Avg Inventory Target: € {vs.get('avg_inventory_target', 0):>14,.2f}")
+            lines.append(f"  Excess (above TOG):   € {vs.get('excess_value', 0):>14,.2f}")
+            lines.append(f"  Gap (below TOR):      € {vs.get('gap_value', 0):>14,.2f}")
+            by_abc = vs.get("value_by_abc", {}) or {}
+            lines.append(
+                f"  By ABC:  A=€{by_abc.get('A', 0):,.0f}  "
+                f"B=€{by_abc.get('B', 0):,.0f}  "
+                f"C=€{by_abc.get('C', 0):,.0f}"
+            )
+            by_color = vs.get("value_by_color", {}) or {}
+            color_str = "  ".join(f"{k}=€{v:,.0f}" for k, v in by_color.items())
+            if color_str:
+                lines.append(f"  By execution color:  {color_str}")
+            top = vs.get("top_items_by_value", []) or []
+            if top:
+                lines.append("  Top items by on-hand value:")
+                lines.append(f"    {'Part #':<20} {'ABC':>4} {'On-hand €':>14} {'Annual €':>14}")
+                for r in top:
+                    lines.append(
+                        f"    {r['part_number']:<20} {r['abc']:>4} "
+                        f"{r['on_hand_value']:>14,.2f} {r['annual_value']:>14,.2f}"
+                    )
+        else:
+            lines.append("  No value summary available.")
+        lines.append("")
+
     ctx = "\n".join(lines)
     # Cap at ~8k chars per analysis to keep token usage reasonable
     if len(ctx) > 8_000:
@@ -840,7 +953,7 @@ def run_inventory_agent(
     progress_callback: Optional[Callable[[str, str, int], None]] = None,
 ) -> tuple[dict, list[dict]]:
     """
-    Full agent orchestration — 7 sequential focused analyses.
+    Full agent orchestration — 8 sequential focused analyses.
 
     progress_callback(category_key, status, n_signals):
         Called after each analysis completes.
