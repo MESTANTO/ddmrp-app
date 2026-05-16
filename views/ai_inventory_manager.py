@@ -33,7 +33,26 @@ from agents.llm_client import (
     get_api_key,
 )
 from database.auth import get_company_id, get_current_user
-from database.db import SessionLocal, AgentRun, AgentSignal
+from database.db import SessionLocal, AgentRun, AgentSignal, _migrate_agent_tables
+
+
+def _ensure_agent_schema():
+    """
+    Run the agent_runs / agent_signals migration once per Streamlit session.
+
+    init_db() is cached at app boot via @st.cache_resource, so on Streamlit
+    Cloud a stale boot can leave the production DB without the newer
+    columns (analyses_planned, analyses_done, analysis_category). We
+    re-run the idempotent migration here so the page self-heals without
+    waiting for a container restart.
+    """
+    if st.session_state.get("aim_schema_migrated"):
+        return
+    try:
+        _migrate_agent_tables()
+        st.session_state["aim_schema_migrated"] = True
+    except Exception as exc:
+        st.warning(f"Schema migration attempt failed: `{type(exc).__name__}: {exc}`")
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +133,10 @@ def show():
         "tool-calling chat. Ask it where your cash is trapped, run any of the "
         "skills on demand, and let it render charts inline."
     )
+
+    # Self-heal the agent_runs / agent_signals schema if a stale init_db
+    # cache means the new columns aren't yet on prod.
+    _ensure_agent_schema()
 
     api_key = get_api_key()
     if not api_key:
