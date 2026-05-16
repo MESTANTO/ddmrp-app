@@ -842,6 +842,88 @@ def call_nvidia_nim_focused(
 # Phase 3 — Signal parser
 # ---------------------------------------------------------------------------
 
+def _strip_markdown_fences(text: str) -> str:
+    """Remove ```json ... ``` or ``` ... ``` fences if present."""
+    import re
+    m = re.search(r"```(?:json|JSON)?\s*(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text
+
+
+def _extract_json_array(text: str) -> Optional[list]:
+    """
+    Best-effort extraction of a JSON array from raw LLM output.
+
+    Tries, in order:
+      1. Direct json.loads on the whole stripped+fence-stripped string
+         (works when the model obeys the prompt exactly).
+      2. If the result is a dict that wraps the array under "signals"
+         (a common LLM mistake), unwrap it.
+      3. Find the first '[' and bracket-balance forward to the matching ']'
+         — this skips stray '[' / ']' that appear inside prose preambles
+         or inside strings.
+    Returns the parsed list, or None if nothing JSON-array-shaped was found.
+    """
+    stripped = _strip_markdown_fences(text.strip())
+
+    # Attempt 1 — direct parse
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, dict):
+            for key in ("signals", "data", "results", "items"):
+                if isinstance(obj.get(key), list):
+                    return obj[key]
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2 — for each '[' position in the text, bracket-balance forward
+    # to the matching ']' and try to parse the slice. The first slice that
+    # parses to a list wins. Skips stray '[...]' inside prose preambles.
+    pos = 0
+    while True:
+        start = stripped.find("[", pos)
+        if start == -1:
+            return None
+        depth     = 0
+        in_string = False
+        escape    = False
+        matched_end = -1
+        for i in range(start, len(stripped)):
+            ch = stripped[i]
+            if escape:
+                escape = False
+                continue
+            if in_string:
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    matched_end = i
+                    break
+        if matched_end == -1:
+            return None
+        try:
+            obj = json.loads(stripped[start:matched_end + 1])
+            if isinstance(obj, list):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        pos = start + 1
+
+
 def parse_llm_signals(
     raw_response:        str,
     run_id:              int,
@@ -854,19 +936,11 @@ def parse_llm_signals(
     tagged with the given analysis_category.
     On any parse failure returns a single error signal.
     """
-    text  = raw_response.strip()
-    start = text.find("[")
-    end   = text.rfind("]")
-    if start == -1 or end == -1 or end <= start:
+    data = _extract_json_array(raw_response or "")
+    if data is None:
         return [_error_signal(run_id, company_id, analysis_category,
-                              "LLM did not return a JSON array.", raw_response[:500])]
-
-    try:
-        data = json.loads(text[start:end + 1])
-    except json.JSONDecodeError as e:
-        return [_error_signal(run_id, company_id, analysis_category,
-                              f"JSON parse error: {e}", text[start:start + 300])]
-
+                              "LLM did not return a JSON array.",
+                              (raw_response or "")[:500])]
     if not isinstance(data, list):
         return [_error_signal(run_id, company_id, analysis_category,
                               "LLM returned JSON but not an array.", "")]
@@ -1008,13 +1082,25 @@ def run_inventory_agent(
                 api_key=api_key,
             )
 
-            signals = parse_llm_signals(
-                raw_response=raw_resp,
-                run_id=run_id,
-                company_id=company_id,
-                item_id_by_part_num=item_id_map,
-                analysis_category=cat_key,
-            )
+            if status == "error":
+                # API-level failure (timeout, auth, quota, bad model slug, ...).
+                # Surface the actual error rather than running it through the
+                # JSON parser, which would only mis-report it as a parse error.
+                signals = [_error_signal(
+                    run_id            = run_id,
+                    company_id        = company_id,
+                    analysis_category = cat_key,
+                    msg               = f"API call failed for {cat_label}",
+                    detail            = raw_resp[:500],
+                )]
+            else:
+                signals = parse_llm_signals(
+                    raw_response=raw_resp,
+                    run_id=run_id,
+                    company_id=company_id,
+                    item_id_by_part_num=item_id_map,
+                    analysis_category=cat_key,
+                )
 
             # Persist signals for this analysis immediately
             for sig in signals:
