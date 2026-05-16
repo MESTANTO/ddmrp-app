@@ -381,6 +381,85 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
 }
 
 
+# Aliases for tool names that LLMs commonly hallucinate. Maps the wrong
+# name → the real one in TOOL_FUNCTIONS. Lookup is case-insensitive.
+TOOL_NAME_ALIASES = {
+    "get_inventory_summary":   "inventory_value_summary",
+    "inventory_summary":       "inventory_value_summary",
+    "get_inventory_value":     "inventory_value_summary",
+    "value_summary":           "inventory_value_summary",
+    "get_overstock":           "list_overstock",
+    "overstock":               "list_overstock",
+    "get_safety_gaps":         "list_safety_gaps",
+    "safety_gaps":             "list_safety_gaps",
+    "get_low_nfp":             "list_low_nfp",
+    "low_nfp":                 "list_low_nfp",
+    "get_supplier_risk":       "list_supplier_risk",
+    "supplier_risk":           "list_supplier_risk",
+    "get_demand_trends":       "list_demand_trends",
+    "demand_trends":           "list_demand_trends",
+    "get_data_quality":        "list_data_quality",
+    "data_quality":            "list_data_quality",
+    "get_abc_xyz":             "abc_xyz_matrix",
+    "abc_xyz":                 "abc_xyz_matrix",
+    "run_analysis":            "run_skill",
+    "execute_skill":           "run_skill",
+    "value_reduction":         "propose_value_reduction",
+    "reduce_inventory_value":  "propose_value_reduction",
+    "chart":                   "render_chart",
+    "draw_chart":              "render_chart",
+    "plot":                    "render_chart",
+}
+
+
+def resolve_tool_name(name: str) -> str:
+    """Return the canonical tool name, applying alias mapping if needed."""
+    if not name:
+        return ""
+    if name in TOOL_FUNCTIONS:
+        return name
+    lower = name.strip().lower()
+    if lower in TOOL_FUNCTIONS:
+        return lower
+    return TOOL_NAME_ALIASES.get(lower, name)
+
+
+def parse_inline_tool_calls(text: str) -> list[tuple[str, dict]]:
+    """
+    Parse <tool_call>...</tool_call> blocks that some models (Kimi, Qwen,
+    some llama variants) emit as plain text instead of using OpenAI's
+    structured tool_calls field.
+
+    Accepts the common JSON shapes:
+      {"name": "...", "arguments": {...}}
+      {"tool_name": "...", "parameters": {...}}
+      {"function": "...", "args": {...}}
+
+    Returns a list of (canonical_name, args_dict) tuples.
+    """
+    import re
+    if not text or "<tool_call>" not in text:
+        return []
+    results: list[tuple[str, dict]] = []
+    for m in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
+        blob = m.group(1).strip()
+        try:
+            obj = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        raw_name = obj.get("name") or obj.get("tool_name") or obj.get("function") or ""
+        args     = (obj.get("arguments") or obj.get("parameters")
+                    or obj.get("args") or obj.get("input") or {})
+        if not isinstance(args, dict):
+            args = {}
+        canonical = resolve_tool_name(str(raw_name))
+        if canonical:
+            results.append((canonical, args))
+    return results
+
+
 def dispatch(name: str, *, company_id: int, model: str, api_key: str,
              arguments: dict | None = None) -> dict:
     """
@@ -388,14 +467,16 @@ def dispatch(name: str, *, company_id: int, model: str, api_key: str,
     Errors are returned in the result, never raised — the LLM can read them
     and adjust.
     """
-    fn = TOOL_FUNCTIONS.get(name)
+    canonical = resolve_tool_name(name)
+    fn = TOOL_FUNCTIONS.get(canonical)
     if fn is None:
-        return {"error": f"Unknown tool: {name}"}
+        return {"error": f"Unknown tool: {name}",
+                "hint":  f"Valid tools: {sorted(TOOL_FUNCTIONS.keys())}"}
     args = arguments or {}
     try:
         return fn(company_id=company_id, model=model, api_key=api_key, **args)
     except TypeError as exc:
-        return {"error": f"Bad arguments for {name}: {exc}"}
+        return {"error": f"Bad arguments for {canonical}: {exc}"}
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
 

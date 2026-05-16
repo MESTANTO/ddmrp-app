@@ -292,6 +292,28 @@ Hard rules:
 3. Cite the specific tool you used so the user can verify.
 4. Stop calling tools once you have enough information to answer; aim for
    ≤ 3 tool calls per turn.
+
+**Available tools (call by their EXACT names):**
+- `inventory_value_summary` — totals: on-hand €, annual usage €, € by ABC, € by execution color.
+- `list_overstock(top_n)` — items where on_hand > top_of_green, sorted by excess €.
+- `list_safety_gaps(top_n)` — items where on_hand < top_of_red.
+- `list_low_nfp(top_n)` — items with low Net Flow Position.
+- `list_supplier_risk(top_n)` — suppliers with reliability or lead-time risk.
+- `list_demand_trends(top_n)` — items whose recent ADU diverges from stored ADU.
+- `list_data_quality()` — items missing key master data.
+- `abc_xyz_matrix()` — 9-cell ABC/XYZ counts and € per cell.
+- `run_skill(skill_id)` — execute one focused skill (1..8) and return its signals.
+- `propose_value_reduction(target_eur)` — runs skill_08 and returns ranked levers.
+- `render_chart({kind, title, x, y, x_label, y_label})` — renders inline; `x` and `y` MUST be arrays of equal length.
+
+**Tool-call format:** If your runtime supports OpenAI-style structured
+tool calls (function calling), use that. Otherwise, emit each tool call
+as a single line of text exactly like:
+
+    <tool_call>{"name": "list_overstock", "arguments": {"top_n": 10}}</tool_call>
+
+— one tool per `<tool_call>` block, valid JSON inside. The app parses
+both formats. Never invent tool names not listed above.
 """
 
 
@@ -405,29 +427,39 @@ def _run_tool_loop(
         choice  = resp.choices[0]
         message = choice.message
         tool_calls = getattr(message, "tool_calls", None) or []
+        content    = message.content or ""
 
-        if not tool_calls:
-            last_text = message.content or ""
+        # Some models (Kimi, Qwen, some llama variants) emit tool calls as
+        # plain text inside <tool_call>...</tool_call> rather than the
+        # structured tool_calls field. Treat both as equivalent.
+        inline_calls = chat_tools.parse_inline_tool_calls(content)
+
+        if not tool_calls and not inline_calls:
+            last_text = content
             break
 
-        # Echo the assistant message (with tool_calls) into history first
-        api_messages.append({
-            "role":      "assistant",
-            "content":   message.content or "",
-            "tool_calls": [
-                {
-                    "id":   tc.id,
-                    "type": "function",
-                    "function": {
-                        "name":      tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in tool_calls
-            ],
-        })
+        # Echo the assistant message into history. If the model used the
+        # structured field, preserve it; otherwise append the plain text.
+        if tool_calls:
+            api_messages.append({
+                "role":      "assistant",
+                "content":   content,
+                "tool_calls": [
+                    {
+                        "id":   tc.id,
+                        "type": "function",
+                        "function": {
+                            "name":      tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+        else:
+            api_messages.append({"role": "assistant", "content": content})
 
-        # Execute each tool
+        # Execute structured tool calls
         for tc in tool_calls:
             name = tc.function.name
             try:
@@ -440,8 +472,8 @@ def _run_tool_loop(
                 api_key=api_key, arguments=args,
             )
 
-            if name == "render_chart":
-                # Stash chart spec for the view to render
+            canonical = chat_tools.resolve_tool_name(name)
+            if canonical == "render_chart":
                 chart_specs.append(args)
 
             api_messages.append({
@@ -449,6 +481,22 @@ def _run_tool_loop(
                 "tool_call_id": tc.id,
                 "name":         name,
                 "content":      chat_tools.serialise_for_llm(result),
+            })
+
+        # Execute inline (text-form) tool calls. We feed the result back
+        # via a user-role message because the OpenAI 'tool' role requires a
+        # preceding tool_call_id, which inline calls don't have.
+        for canonical, args in inline_calls:
+            result = chat_tools.dispatch(
+                canonical, company_id=company_id, model=model,
+                api_key=api_key, arguments=args,
+            )
+            if canonical == "render_chart":
+                chart_specs.append(args)
+            api_messages.append({
+                "role":    "user",
+                "content": (f"[tool result: {canonical}]\n"
+                            f"{chat_tools.serialise_for_llm(result)}"),
             })
         # loop continues — let the model see tool results and either call
         # more tools or return a final answer
