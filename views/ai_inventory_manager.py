@@ -477,6 +477,10 @@ def _load_runs(company_id: int) -> list[dict]:
                 .order_by(AgentRun.run_at.desc())
                 .limit(50).all())
         return [{c.name: getattr(r, c.name) for c in r.__table__.columns} for r in runs]
+    except Exception as exc:
+        st.error(f"Could not load agent runs: `{type(exc).__name__}: {exc}`. "
+                 "The `agent_runs` table schema may be out of date — try restarting the app.")
+        return []
     finally:
         session.close()
 
@@ -490,6 +494,9 @@ def _load_signals(company_id: int, run_id: int) -> list[dict]:
                 .order_by(AgentSignal.analysis_category, AgentSignal.id)
                 .all())
         return [{c.name: getattr(s, c.name) for c in s.__table__.columns} for s in sigs]
+    except Exception as exc:
+        st.caption(f"⚠️ Could not load signals for run {run_id}: `{type(exc).__name__}: {exc}`")
+        return []
     finally:
         session.close()
 
@@ -513,12 +520,21 @@ def _mark_actioned(signal_id: int, company_id: int, user_id: int):
 
 
 def _is_run_in_progress(company_id: int) -> bool:
+    """
+    Check if there's a running AgentRun. We deliberately select only the `id`
+    column so the query survives even when legacy databases miss some of the
+    newer columns defined on the AgentRun model (the SELECT list is minimal).
+    """
     session = SessionLocal()
     try:
-        return (session.query(AgentRun)
-                .filter(AgentRun.company_id == company_id,
-                        AgentRun.status     == "running")
-                .first()) is not None
+        row = (session.query(AgentRun.id)
+                      .filter(AgentRun.company_id == company_id,
+                              AgentRun.status     == "running")
+                      .first())
+        return row is not None
+    except Exception as exc:
+        st.warning(f"Could not check for running analyses: `{type(exc).__name__}: {exc}`")
+        return False
     finally:
         session.close()
 
