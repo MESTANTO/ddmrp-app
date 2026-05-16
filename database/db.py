@@ -42,12 +42,28 @@ def _get_database_url() -> str:
 
 DATABASE_URL = _get_database_url()
 
-# PostgreSQL needs pool_pre_ping to handle idle connection drops
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    echo=False,
-)
+# PostgreSQL needs pool_pre_ping to handle idle connection drops.
+# On Streamlit Cloud + Supabase the DB sits behind a managed pooler that
+# can close idle connections; pool_recycle forces SQLAlchemy to throw
+# away connections older than 5 minutes so we don't try to reuse a dead
+# socket. connect_timeout fails fast when the DB is unreachable so the
+# user sees an error instead of waiting for a 2-minute TCP timeout.
+_is_pg = DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres://")
+_engine_kwargs: dict = {
+    "pool_pre_ping": True,
+    "echo":          False,
+}
+if _is_pg:
+    _engine_kwargs["pool_recycle"] = 300
+    _engine_kwargs["pool_size"]    = 5
+    _engine_kwargs["max_overflow"] = 5
+    _engine_kwargs["pool_timeout"] = 30
+    _engine_kwargs["connect_args"] = {
+        "connect_timeout": 10,
+        "application_name": "ddmrp-streamlit",
+    }
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
