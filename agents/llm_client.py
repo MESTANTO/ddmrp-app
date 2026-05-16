@@ -16,27 +16,22 @@ from openai import OpenAI
 
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
 
+# The app is pinned to Kimi K2 — a 1T-parameter MoE model hosted on
+# NVIDIA NIM. It is excellent at long-context inventory reasoning and at
+# emitting structured tool calls. Other slugs remain commented out for
+# reference / future experiments only.
+DEFAULT_MODEL = "moonshotai/kimi-k2-instruct"
+
 KNOWN_MODELS = [
-    "deepseek-ai/deepseek-v3-0324",
-    "deepseek-ai/deepseek-r1",
-    "meta/llama-3.3-70b-instruct",
-    "meta/llama-3.1-8b-instruct",
-    "nvidia/llama-3.1-nemotron-70b-instruct",
-    "google/gemma-4-31b-it",
-    "google/gemma-3-27b-it",
-    "google/gemma-3-12b-it",
+    "moonshotai/kimi-k2-instruct",
 ]
 
-DEFAULT_MODEL = "deepseek-ai/deepseek-v3-0324"
-
-# Models that we expect to support OpenAI-style `tools` parameter.
-# Used to pre-select tool mode in the chat; the loop also falls back at
-# runtime if the API rejects the tools parameter.
-TOOL_CAPABLE_MODELS = {
-    "deepseek-ai/deepseek-v3-0324",
-    "meta/llama-3.3-70b-instruct",
-    "nvidia/llama-3.1-nemotron-70b-instruct",
-}
+# Kimi K2 on NVIDIA NIM does NOT expose OpenAI's structured `tools`
+# parameter — it emits tool calls inline as <tool_call>{...}</tool_call>
+# text instead. The chat loop already parses that format, so we leave
+# this set empty: the API is called WITHOUT tools=[...] and we rely on
+# the inline-tool-call parser to dispatch invocations.
+TOOL_CAPABLE_MODELS: set[str] = set()
 
 
 def get_api_key() -> Optional[str]:

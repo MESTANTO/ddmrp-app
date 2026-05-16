@@ -800,7 +800,7 @@ def build_focused_context(category_key: str, raw_data: dict) -> str:
 def call_nvidia_nim_focused(
     category_key: str,
     focused_context: str,
-    model: str = "deepseek-ai/deepseek-v3-0324",
+    model: str = "moonshotai/kimi-k2-instruct",
     api_key: str = "",
     max_tokens: int = 4096,
 ) -> tuple[str, str]:
@@ -1022,7 +1022,7 @@ def _error_signal(
 def run_inventory_agent(
     company_id:        int,
     user_id:           int,
-    model:             str = "deepseek-ai/deepseek-v3-0324",
+    model:             str = "moonshotai/kimi-k2-instruct",
     api_key:           str = "",
     progress_callback: Optional[Callable[[str, str, int], None]] = None,
 ) -> tuple[dict, list[dict]]:

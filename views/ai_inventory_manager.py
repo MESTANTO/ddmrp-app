@@ -27,7 +27,6 @@ from agents import chat_tools
 from agents.inventory_agent import ANALYSIS_CATEGORIES
 from agents.llm_client import (
     DEFAULT_MODEL,
-    KNOWN_MODELS,
     TOOL_CAPABLE_MODELS,
     chat_completion,
     get_api_key,
@@ -148,20 +147,24 @@ def show():
     user       = get_current_user()
     user_id    = user["id"] if user else 0
 
-    # Shared model selector (both tabs use the same)
+    # Model is pinned to Kimi K2 — the app is built and prompt-tuned for it.
+    # An optional override is kept in the sidebar for power users (e.g. to
+    # try a newer Kimi build) but is hidden from the main page.
     with st.sidebar:
         st.divider()
         st.markdown("**🤖 AI Inventory Manager**")
-        default_idx = KNOWN_MODELS.index(DEFAULT_MODEL) if DEFAULT_MODEL in KNOWN_MODELS else 0
-        model_choice = st.selectbox("Model", KNOWN_MODELS, index=default_idx,
-                                    key="aim_model_sel")
-        custom = st.text_input("Custom model slug", "", key="aim_model_custom",
-                               placeholder="overrides the dropdown")
-        model = custom.strip() if custom.strip() else model_choice
-        st.caption(f"`{model}`")
-        tool_capable = model in TOOL_CAPABLE_MODELS
-        st.caption("✅ Tool-calling supported" if tool_capable
-                   else "⚠️ This model may not support tool-calling — chat will fall back.")
+        st.caption(f"Model: `{DEFAULT_MODEL}`")
+        with st.expander("Advanced — override model", expanded=False):
+            override = st.text_input(
+                "Custom model slug",
+                value="",
+                key="aim_model_custom",
+                placeholder=DEFAULT_MODEL,
+                help=("Leave empty to use Kimi K2 (recommended). Only change "
+                      "this if you know the NVIDIA NIM slug you want and "
+                      "understand it may not support tool calls or skills."),
+            )
+        model = override.strip() if override.strip() else DEFAULT_MODEL
         st.divider()
 
     tab_struct, tab_chat = st.tabs([
