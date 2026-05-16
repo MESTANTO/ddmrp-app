@@ -1024,7 +1024,7 @@ def run_inventory_agent(
     user_id:           int,
     model:             str = "moonshotai/kimi-k2-instruct",
     api_key:           str = "",
-    progress_callback: Optional[Callable[[str, str, int], None]] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> tuple[dict, list[dict]]:
     """
     Full agent orchestration — 8 sequential focused analyses.
@@ -1117,8 +1117,24 @@ def run_inventory_agent(
             session.flush()
 
             if progress_callback:
-                cb_status = "done" if status == "ok" else "error"
-                progress_callback(cat_key, cb_status, n_sigs)
+                if status == "error":
+                    cb_status = "error"
+                elif signals and signals[0].signal_type == "portfolio" \
+                        and signals[0].severity == "info" \
+                        and signals[0].title.startswith("Agent parse error"):
+                    # parser-level failure (LLM returned junk) — still "error"
+                    cb_status = "error"
+                else:
+                    cb_status = "done"
+                # First signal's detail carries the API/parse error message
+                err_msg = ""
+                if cb_status == "error" and signals:
+                    err_msg = (signals[0].detail or signals[0].title or "")[:300]
+                try:
+                    progress_callback(cat_key, cb_status, n_sigs, err_msg)
+                except TypeError:
+                    # Back-compat: callbacks with the old (key,status,n) signature
+                    progress_callback(cat_key, cb_status, n_sigs)
 
         # Finalise run record
         duration = time.time() - t_start

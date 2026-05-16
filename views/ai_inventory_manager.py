@@ -681,12 +681,14 @@ def _show_run_analysis_summary(run: dict):
 def _execute_run(company_id: int, user_id: int, model: str, api_key: str):
     from agents.inventory_agent import run_inventory_agent
 
-    progress_state = {c["key"]: {"status": "pending", "n": 0}
+    progress_state = {c["key"]: {"status": "pending", "n": 0, "err": ""}
                       for c in ANALYSIS_CATEGORIES}
     progress_placeholder = st.empty()
 
     def _render_progress():
         rows = []
+        any_error = False
+        first_error = ""
         for cat in ANALYSIS_CATEGORIES:
             key  = cat["key"]
             s    = progress_state[key]
@@ -700,19 +702,28 @@ def _execute_run(company_id: int, user_id: int, model: str, api_key: str):
                 n_str = f"{s['n']} signal{'s' if s['n'] != 1 else ''}"
             else:
                 status_str = "❌ Error"
-                n_str = f"{s['n']} signal{'s' if s['n'] != 1 else ''}"
+                n_str = (s["err"][:80] + "…") if len(s.get("err", "")) > 80 \
+                        else (s.get("err") or "see signal detail")
+                any_error = True
+                if not first_error:
+                    first_error = s.get("err") or ""
             rows.append({"Analysis": f"{icon} {cat['label']}",
                          "Status":   status_str,
-                         "Signals":  n_str})
+                         "Detail":   n_str})
         with progress_placeholder.container():
-            st.markdown(f"**Running {model.split('/')[-1]}** — "
+            st.markdown(f"**Running `{model}`** — "
                         f"{len(ANALYSIS_CATEGORIES)} analyses queued")
             st.dataframe(pd.DataFrame(rows), use_container_width=True,
                          hide_index=True, height=320)
+            if any_error and first_error:
+                st.error(f"**First failure reason:**\n\n```\n{first_error}\n```")
 
-    def _progress_callback(category_key: str, status: str, n_signals: int):
+    def _progress_callback(category_key: str, status: str, n_signals: int,
+                           error_msg: str = ""):
         progress_state[category_key]["status"] = status
         progress_state[category_key]["n"]      = n_signals
+        if error_msg:
+            progress_state[category_key]["err"] = error_msg
         _render_progress()
 
     _render_progress()
