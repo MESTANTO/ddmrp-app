@@ -755,20 +755,29 @@ def _add_columns_safely(table: str, cols):
     cols: list of tuples (name, sqlite_def, pg_def).
     Uses the right ALTER TABLE syntax for each dialect and silently skips if
     the column already exists.
+
+    Each ALTER runs on its own connection: in PostgreSQL, if one statement
+    raises (e.g. table missing), the transaction is aborted and every
+    follow-up on the same connection would also fail with
+    "current transaction is aborted". A fresh connection per statement
+    sidesteps that and guarantees the second/third migration still runs.
     """
     import sqlalchemy
+    import logging
+    log = logging.getLogger(__name__)
     is_pg = DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres://")
-    with engine.connect() as conn:
-        for name, sqlite_def, pg_def in cols:
-            if is_pg:
-                stmt = f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{name}" {pg_def}'
-            else:
-                stmt = f"ALTER TABLE {table} ADD COLUMN {name} {sqlite_def}"
-            try:
+    for name, sqlite_def, pg_def in cols:
+        if is_pg:
+            stmt = f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{name}" {pg_def}'
+        else:
+            stmt = f"ALTER TABLE {table} ADD COLUMN {name} {sqlite_def}"
+        try:
+            with engine.begin() as conn:  # begin() auto-commits on success
                 conn.execute(sqlalchemy.text(stmt))
-                conn.commit()
-            except Exception:
-                pass  # column already exists — ignore
+        except Exception as exc:
+            # Likely "column already exists" on dialects without IF NOT EXISTS
+            # support. Log it so genuine failures are still visible in app logs.
+            log.warning("Skipped migration on %s.%s: %s", table, name, exc)
 
 
 def get_session():
