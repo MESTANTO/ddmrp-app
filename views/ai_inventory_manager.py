@@ -459,33 +459,67 @@ def _run_tool_loop(
     return last_text or "_(empty reply)_", chart_specs
 
 
+def _coerce_axis(val) -> list:
+    """
+    Coerce a chart axis value coming from the LLM into a plain Python list.
+    Accepts: list, tuple, dict (uses keys), scalar (wraps in [val]), None.
+    """
+    if val is None:
+        return []
+    if isinstance(val, dict):
+        # LLMs often pass {label: value} maps; caller decides which side to use.
+        return list(val.keys())
+    if isinstance(val, (list, tuple)):
+        return list(val)
+    # Scalar string / number — wrap so DataFrame doesn't choke on "all scalar".
+    return [val]
+
+
 def _render_chart_spec(spec: dict):
     """Render a chart from the `render_chart` tool spec inline in the chat."""
     kind  = (spec.get("kind") or "bar").lower()
     title = spec.get("title") or ""
-    x     = spec.get("x") or []
-    y     = spec.get("y") or []
     xl    = spec.get("x_label") or ""
     yl    = spec.get("y_label") or ""
 
-    if not x or not y or len(x) != len(y):
-        st.caption(f"⚠️ Chart skipped (mismatched x/y): {title}")
-        return
+    raw_x = spec.get("x")
+    raw_y = spec.get("y")
 
-    df = pd.DataFrame({xl or "x": x, yl or "y": y})
+    # Accept {"x": {"A": 1, "B": 2}} as a convenience encoding too.
+    if isinstance(raw_x, dict) and raw_y is None:
+        x = list(raw_x.keys())
+        y = list(raw_x.values())
+    else:
+        x = _coerce_axis(raw_x)
+        y = _coerce_axis(raw_y)
+
+    if not x or not y:
+        st.caption(f"⚠️ Chart skipped — missing x or y data ({title or kind})")
+        return
+    if len(x) != len(y):
+        # Truncate to common length rather than dropping the chart entirely.
+        n = min(len(x), len(y))
+        x, y = x[:n], y[:n]
+        if n == 0:
+            st.caption(f"⚠️ Chart skipped (mismatched x/y, n=0): {title}")
+            return
+
+    x_col = xl or "x"
+    y_col = yl or "y"
     try:
+        df = pd.DataFrame({x_col: x, y_col: y})
         if kind == "pie":
-            fig = px.pie(df, names=xl or "x", values=yl or "y", title=title)
+            fig = px.pie(df, names=x_col, values=y_col, title=title)
         elif kind == "scatter":
-            fig = px.scatter(df, x=xl or "x", y=yl or "y", title=title)
+            fig = px.scatter(df, x=x_col, y=y_col, title=title)
         elif kind == "line":
-            fig = px.line(df, x=xl or "x", y=yl or "y", title=title, markers=True)
+            fig = px.line(df, x=x_col, y=y_col, title=title, markers=True)
         else:
-            fig = px.bar(df, x=xl or "x", y=yl or "y", title=title)
+            fig = px.bar(df, x=x_col, y=y_col, title=title)
         fig.update_layout(height=320, margin=dict(t=40, b=20))
         st.plotly_chart(fig, use_container_width=True)
     except Exception as exc:
-        st.caption(f"⚠️ Chart render failed: {exc}")
+        st.caption(f"⚠️ Chart render failed ({type(exc).__name__}): {exc}")
 
 
 # ===========================================================================
