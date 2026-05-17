@@ -20,10 +20,10 @@ NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
 # NVIDIA NIM. It is excellent at long-context inventory reasoning and at
 # emitting structured tool calls. Other slugs remain commented out for
 # reference / future experiments only.
-DEFAULT_MODEL = "moonshotai/kimi-k2-instruct"
+DEFAULT_MODEL = "moonshotai/kimi-k2-instruct-0905"
 
 KNOWN_MODELS = [
-    "moonshotai/kimi-k2-instruct",
+    "moonshotai/kimi-k2-instruct-0905",
 ]
 
 # Kimi K2 on NVIDIA NIM does NOT expose OpenAI's structured `tools`
