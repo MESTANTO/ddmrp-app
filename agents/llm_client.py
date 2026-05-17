@@ -16,22 +16,21 @@ from openai import OpenAI
 
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
 
-# The app is pinned to DeepSeek V4 Pro — DeepSeek's flagship model on
-# NVIDIA NIM. It supports OpenAI-style structured tool calls natively
-# and produces clean JSON output for the 8 structured skills.
-DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
+# The app is pinned to Kimi K2.6 — Moonshot's latest MoE model on NIM.
+# Fast, strong long-context reasoning, and well-suited for inventory
+# analysis. It emits tool calls inline as <tool_call>{...}</tool_call>
+# rather than via OpenAI's structured `tools` field.
+DEFAULT_MODEL = "moonshotai/kimi-k2.6"
 
 KNOWN_MODELS = [
-    "deepseek-ai/deepseek-v4-pro",
+    "moonshotai/kimi-k2.6",
 ]
 
-# Models that expose OpenAI's structured `tools` parameter on NIM. When
-# the active model is in this set the chat loop sends tools=[...] and
-# tool_choice="auto"; otherwise it relies on the inline <tool_call>{...}
-# </tool_call> text parser. DeepSeek V4 Pro supports structured calls.
-TOOL_CAPABLE_MODELS: set[str] = {
-    "deepseek-ai/deepseek-v4-pro",
-}
+# Kimi K2.6 on NVIDIA NIM does NOT expose OpenAI's structured `tools`
+# parameter — it emits tool calls inline as <tool_call>{...}</tool_call>
+# text instead. The chat loop's inline parser dispatches those calls,
+# so we leave this set empty: the API is called WITHOUT tools=[...].
+TOOL_CAPABLE_MODELS: set[str] = set()
 
 
 def get_api_key() -> Optional[str]:
