@@ -53,6 +53,7 @@ PAGES = {
     "📈  Demand & Supply":           "demand_supply",
     "🔗  Process Designer":          "process_designer",
     "🧬  BOM & Auto DLT":            "bom_engine",
+    "🎯  MRP Type":                  "mrp_type",
     "🚦  Replenishment Signals":     "signal_engine",
     "🚨  Execution Alarms":          "alarms",
     "📐  Prioritized Share":         "share_allocator",
@@ -143,6 +144,10 @@ elif page_key == "alarms":
 
 elif page_key == "bom_engine":
     from modules.bom_engine import show
+    show()
+
+elif page_key == "mrp_type":
+    from views.mrp_type import show
     show()
 
 elif page_key == "share_allocator":

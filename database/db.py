@@ -196,6 +196,20 @@ class Item(Base):
     # Default supplier
     default_supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
 
+    # ── Strategic Buffer Positioning (DDMRP book, ch.6 + deck slides 30-38) ──
+    # The six positioning factors used by `modules/positioning_engine.py` to
+    # decide whether an item should be a decoupling point (DDMRP-buffered)
+    # or stay in standard MRP. Nullable → "incomplete data" state in the UI.
+    customer_tolerance_time   = Column(Integer, nullable=True)   # CTT (days)
+    market_potential_lt       = Column(Integer, nullable=True)   # MPLT (days)
+    order_visibility_horizon  = Column(Integer, nullable=True)   # SOVH (days)
+    demand_variability_score  = Column(String,  nullable=True)   # low | medium | high
+    supply_variability_score  = Column(String,  nullable=True)   # low | medium | high
+    inventory_leverage_score  = Column(String,  nullable=True)   # low | medium | high
+    critical_operation        = Column(Boolean, nullable=True)   # True if feeds/uses a critical resource
+    # 'auto' = use computed recommendation; 'DDMRP'/'MRP' = manual override
+    mrp_type_override         = Column(String,  default="auto")
+
     # Multi-tenancy
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
 
@@ -523,6 +537,7 @@ def init_db():
     # Add any new columns to existing tables (safe, idempotent, cross-dialect)
     _migrate_buffer_columns()
     _migrate_item_columns()
+    _migrate_positioning_columns()
     _migrate_bom_columns()
     _migrate_process_node_items()
     _migrate_supplier_columns()
@@ -636,6 +651,20 @@ def _migrate_item_columns():
         ("buffer_profile_id",      "INTEGER",            "INTEGER"),
         ("spike_horizon_days",     "INTEGER",            "INTEGER"),
         ("spike_threshold_factor", "REAL",               "DOUBLE PRECISION"),
+    ])
+
+
+def _migrate_positioning_columns():
+    """Add Strategic Buffer Positioning fields to existing `items` tables (idempotent)."""
+    _add_columns_safely("items", [
+        ("customer_tolerance_time",  "INTEGER",                  "INTEGER"),
+        ("market_potential_lt",      "INTEGER",                  "INTEGER"),
+        ("order_visibility_horizon", "INTEGER",                  "INTEGER"),
+        ("demand_variability_score", "TEXT",                     "VARCHAR"),
+        ("supply_variability_score", "TEXT",                     "VARCHAR"),
+        ("inventory_leverage_score", "TEXT",                     "VARCHAR"),
+        ("critical_operation",       "INTEGER",                  "BOOLEAN"),
+        ("mrp_type_override",        "TEXT DEFAULT 'auto'",      "VARCHAR DEFAULT 'auto'"),
     ])
 
 

@@ -273,12 +273,23 @@ def _show_item_list():
         rows = []
         for it in items:
             zones = calculate_zones(it, session=session)
+            # Strategic positioning completeness flag
+            _positioning_missing = (
+                it.customer_tolerance_time   is None or
+                it.market_potential_lt       is None or
+                it.order_visibility_horizon  is None or
+                not it.demand_variability_score or
+                not it.supply_variability_score or
+                not it.inventory_leverage_score or
+                it.critical_operation        is None
+            )
             rows.append({
                 "Part Number": it.part_number,
                 "Description": it.description,
                 "Category": it.category,
                 "UoM": it.unit_of_measure,
                 "Type": it.item_type or "P",
+                "Positioning": "❓ Incomplete" if _positioning_missing else "✅ Complete",
                 "Profile": it.buffer_profile.name if it.buffer_profile else "",
                 "ADU": it.adu,
                 "DLT (days)": it.dlt,
@@ -406,6 +417,48 @@ def _show_add_item():
         sup_label = st.selectbox("Default Supplier", supplier_options,
                                  help="The supplier this part is normally purchased from.")
 
+        st.markdown(
+            "**🎯 Strategic Positioning** (optional — used by **MRP Type** page "
+            "to recommend DDMRP vs MRP)"
+        )
+        sp1, sp2, sp3 = st.columns(3)
+        with sp1:
+            ctt = st.number_input(
+                "Customer Tolerance Time (days)", min_value=0, value=0, step=1,
+                help="Days the customer is willing to wait. 0 → leave blank (incomplete).",
+            )
+            mplt = st.number_input(
+                "Market Potential LT (days)", min_value=0, value=0, step=1,
+                help="Quoted LT at which the market opens up / wins business.",
+            )
+            sovh = st.number_input(
+                "Sales Order Visibility (days)", min_value=0, value=0, step=1,
+                help="How far in advance customer orders are typically visible.",
+            )
+        with sp2:
+            dem_var = st.selectbox(
+                "Demand Variability", options=["(not set)", "low", "medium", "high"],
+                help="High variability favours decoupling here.",
+            )
+            sup_var = st.selectbox(
+                "Supply Variability", options=["(not set)", "low", "medium", "high"],
+                help="Unreliable supply → decouple to dampen.",
+            )
+            leverage = st.selectbox(
+                "Inventory Leverage", options=["(not set)", "low", "medium", "high"],
+                help="High = common part used by many parents → buffer here.",
+            )
+        with sp3:
+            crit_op = st.selectbox(
+                "Critical Operation", options=["(not set)", "No", "Yes"],
+                help="Yes if the item feeds/uses a constrained/critical resource.",
+            )
+            mrp_override = st.selectbox(
+                "MRP Type Override",
+                options=["auto", "DDMRP", "MRP"],
+                help="'auto' = use the computed recommendation; otherwise force a type.",
+            )
+
         submitted = st.form_submit_button("Add Item", type="primary")
 
     if submitted:
@@ -454,6 +507,16 @@ def _show_add_item():
                 ordering_cost=ordering_cost,
                 holding_cost_pct=holding_pct / 100.0,
                 default_supplier_id=suppliers[sup_label]["id"] if sup_label != "— None —" else None,
+                # Strategic positioning (None where the user left it unset)
+                customer_tolerance_time   = int(ctt)   if ctt   else None,
+                market_potential_lt       = int(mplt)  if mplt  else None,
+                order_visibility_horizon  = int(sovh)  if sovh  else None,
+                demand_variability_score  = dem_var    if dem_var  != "(not set)" else None,
+                supply_variability_score  = sup_var    if sup_var  != "(not set)" else None,
+                inventory_leverage_score  = leverage   if leverage != "(not set)" else None,
+                critical_operation        = (True  if crit_op == "Yes"
+                                             else False if crit_op == "No" else None),
+                mrp_type_override         = mrp_override,
                 company_id=get_company_id(),
             )
             session.add(item)
@@ -575,6 +638,56 @@ def _show_edit_item():
                     help="Leave 0 to use global default.",
                 )
 
+            st.markdown(
+                "**🎯 Strategic Positioning** (optional — used by **MRP Type** page)"
+            )
+            sp1, sp2, sp3 = st.columns(3)
+            with sp1:
+                ctt = st.number_input(
+                    "Customer Tolerance Time (days)", min_value=0, step=1,
+                    value=int(item.customer_tolerance_time or 0),
+                    help="0 → leave unset (incomplete).",
+                )
+                mplt = st.number_input(
+                    "Market Potential LT (days)", min_value=0, step=1,
+                    value=int(item.market_potential_lt or 0),
+                )
+                sovh = st.number_input(
+                    "Sales Order Visibility (days)", min_value=0, step=1,
+                    value=int(item.order_visibility_horizon or 0),
+                )
+            _var_opts = ["(not set)", "low", "medium", "high"]
+            with sp2:
+                dem_var = st.selectbox(
+                    "Demand Variability", options=_var_opts,
+                    index=_var_opts.index(item.demand_variability_score)
+                    if item.demand_variability_score in _var_opts else 0,
+                )
+                sup_var = st.selectbox(
+                    "Supply Variability", options=_var_opts,
+                    index=_var_opts.index(item.supply_variability_score)
+                    if item.supply_variability_score in _var_opts else 0,
+                )
+                leverage = st.selectbox(
+                    "Inventory Leverage", options=_var_opts,
+                    index=_var_opts.index(item.inventory_leverage_score)
+                    if item.inventory_leverage_score in _var_opts else 0,
+                )
+            with sp3:
+                _crit_label = ("Yes" if item.critical_operation is True
+                               else "No" if item.critical_operation is False
+                               else "(not set)")
+                crit_op = st.selectbox(
+                    "Critical Operation", options=["(not set)", "No", "Yes"],
+                    index=["(not set)", "No", "Yes"].index(_crit_label),
+                )
+                _override_opts = ["auto", "DDMRP", "MRP"]
+                mrp_override = st.selectbox(
+                    "MRP Type Override", options=_override_opts,
+                    index=_override_opts.index(item.mrp_type_override)
+                    if item.mrp_type_override in _override_opts else 0,
+                )
+
             col_save, col_delete = st.columns([3, 1])
             save = col_save.form_submit_button("Save Changes", type="primary")
             delete = col_delete.form_submit_button("Delete Item", type="secondary")
@@ -614,6 +727,16 @@ def _show_edit_item():
                 it.unit_cost = unit_cost
                 it.ordering_cost = ordering_cost
                 it.holding_cost_pct = holding_pct / 100.0
+                # Strategic positioning fields
+                it.customer_tolerance_time   = int(ctt)  if ctt  else None
+                it.market_potential_lt       = int(mplt) if mplt else None
+                it.order_visibility_horizon  = int(sovh) if sovh else None
+                it.demand_variability_score  = dem_var   if dem_var  != "(not set)" else None
+                it.supply_variability_score  = sup_var   if sup_var  != "(not set)" else None
+                it.inventory_leverage_score  = leverage  if leverage != "(not set)" else None
+                it.critical_operation        = (True  if crit_op == "Yes"
+                                                else False if crit_op == "No" else None)
+                it.mrp_type_override         = mrp_override
                 session2.commit()
                 st.success("Item updated successfully!")
                 st.rerun()
