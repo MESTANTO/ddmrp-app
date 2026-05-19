@@ -272,7 +272,7 @@ def _show_item_list():
 
         rows = []
         for it in items:
-            zones = calculate_zones(it)
+            zones = calculate_zones(it, session=session)
             rows.append({
                 "Part Number": it.part_number,
                 "Description": it.description,

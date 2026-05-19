@@ -192,18 +192,23 @@ def _adjustment_active(adj: BufferAdjustment, on_date: date) -> bool:
 
 
 def get_active_factors(item: Item, on_date: date,
-                       adjustments: Optional[List[BufferAdjustment]] = None) -> AdjustmentFactors:
+                       adjustments: Optional[List[BufferAdjustment]] = None,
+                       session=None) -> AdjustmentFactors:
     """
     Return the composite adjustment factors active for `item` on `on_date`.
     Multiple overlapping adjustments multiply together (per the deck — stacking).
     Pass `adjustments` to avoid re-querying inside per-day loops.
+    Pass an existing `session` to reuse a connection instead of opening a new one.
     """
     if adjustments is None:
-        session = get_session()
+        _own_session = session is None
+        if _own_session:
+            session = get_session()
         try:
             adjustments = session.query(BufferAdjustment).filter_by(item_id=item.id).all()
         finally:
-            session.close()
+            if _own_session:
+                session.close()
 
     f = AdjustmentFactors()
     for adj in adjustments:
@@ -226,16 +231,22 @@ def load_item_adjustments(item_id: int) -> List[BufferAdjustment]:
         session.close()
 
 
-def calculate_dynamic_adu(item: Item, window_days: int = ADU_WINDOW_DAYS) -> float:
+def calculate_dynamic_adu(item: Item, window_days: int = ADU_WINDOW_DAYS,
+                          session=None) -> float:
     """
     Calculate ADU from actual demand entries in the past `window_days`.
     Formula: Σ(actual demand in last window_days) / window_days
     Falls back to item.adu if no demand data is available.
+
+    Pass an existing `session` to avoid opening a new DB connection (useful
+    when iterating over many items to avoid N+1 connection exhaustion).
     """
     today_dt  = datetime.utcnow()
     start_dt  = today_dt - timedelta(days=window_days)
 
-    session = get_session()
+    _own_session = session is None
+    if _own_session:
+        session = get_session()
     try:
         entries = (
             session.query(DemandEntry)
@@ -247,7 +258,8 @@ def calculate_dynamic_adu(item: Item, window_days: int = ADU_WINDOW_DAYS) -> flo
             ).all()
         )
     finally:
-        session.close()
+        if _own_session:
+            session.close()
 
     if not entries:
         return item.adu if item.adu > 0 else 0.0
@@ -261,7 +273,8 @@ def calculate_dynamic_adu(item: Item, window_days: int = ADU_WINDOW_DAYS) -> flo
 
 def calculate_zones(item: Item, adu_override: float = None,
                     on_date: Optional[date] = None,
-                    adjustments: Optional[List[BufferAdjustment]] = None) -> BufferZones:
+                    adjustments: Optional[List[BufferAdjustment]] = None,
+                    session=None) -> BufferZones:
     """
     Calculate Red / Yellow / Green buffer zones for an item.
 
@@ -286,7 +299,7 @@ def calculate_zones(item: Item, adu_override: float = None,
       Top of Yellow   = Red + Yellow
       Top of Green    = Red + Yellow + Green
     """
-    adu = adu_override if adu_override is not None else calculate_dynamic_adu(item)
+    adu = adu_override if adu_override is not None else calculate_dynamic_adu(item, session=session)
     dlt = item.dlt
     ltf = item.lead_time_factor
     vf  = item.variability_factor
@@ -295,7 +308,7 @@ def calculate_zones(item: Item, adu_override: float = None,
 
     # Apply planned adjustments active on `on_date`
     eval_date = on_date or date.today()
-    factors   = get_active_factors(item, eval_date, adjustments)
+    factors   = get_active_factors(item, eval_date, adjustments, session=session)
     adu_eff   = adu * factors.daf
     dlt_eff   = dlt * factors.ltaf
 
