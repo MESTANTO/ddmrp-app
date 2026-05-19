@@ -95,6 +95,12 @@ def compute_model_velocity(
     return rows
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _compute_model_velocity_cached(company_id: int, window_days: int) -> list[dict]:
+    """Cached wrapper; re-keyed on company + window."""
+    return compute_model_velocity(window_days)
+
+
 # ---------------------------------------------------------------------------
 # Streamlit page
 # ---------------------------------------------------------------------------
@@ -112,7 +118,7 @@ def show():
         key="mv_window",
     )
 
-    rows = compute_model_velocity(int(window))
+    rows = _compute_model_velocity_cached(get_company_id(), int(window))
 
     if not rows:
         st.info("No items with calculated buffers found. Run buffer calculations first.")

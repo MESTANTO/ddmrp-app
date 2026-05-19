@@ -6,6 +6,7 @@ Allows users to create, view, edit, and delete items with DDMRP parameters.
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
+from sqlalchemy.orm import joinedload
 from database.db import get_session, Item, BufferProfile, Supplier, DemandEntry
 from database.auth import get_company_id
 from modules.buffer_engine import calculate_zones
@@ -264,7 +265,13 @@ def _show_item_list():
 
     session = get_session()
     try:
-        items = session.query(Item).filter(Item.company_id == get_company_id()).order_by(Item.part_number).all()
+        items = (
+            session.query(Item)
+            .options(joinedload(Item.buffer_profile), joinedload(Item.supplier))
+            .filter(Item.company_id == get_company_id())
+            .order_by(Item.part_number)
+            .all()
+        )
 
         if not items:
             st.info("No items yet. Go to the **Add Item** tab to create one.")

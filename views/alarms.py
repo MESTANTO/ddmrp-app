@@ -76,7 +76,7 @@ def show():
         min_value=7, max_value=180, value=30, step=7,
     )
 
-    rows, signals = _load_state(int(horizon))
+    rows, signals = _load_state_cached(get_company_id(), int(horizon))
     if not rows:
         st.info("No items found. Add items in **Material Master** first.")
         return
@@ -110,6 +110,12 @@ def show():
 # ---------------------------------------------------------------------------
 # Data loading — one pass for the whole page
 # ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_state_cached(company_id: int, horizon: int):
+    """Cached wrapper around `_load_state`. Re-keyed on company + horizon."""
+    return _load_state(horizon)
+
 
 def _load_state(horizon: int):
     """
