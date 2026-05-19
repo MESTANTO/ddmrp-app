@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime, ForeignKey, Text, Boolean
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.pool import NullPool
 from datetime import datetime
 import os
 
@@ -42,22 +43,18 @@ def _get_database_url() -> str:
 
 DATABASE_URL = _get_database_url()
 
-# PostgreSQL needs pool_pre_ping to handle idle connection drops.
-# On Streamlit Cloud + Supabase the DB sits behind a managed pooler that
-# can close idle connections; pool_recycle forces SQLAlchemy to throw
-# away connections older than 5 minutes so we don't try to reuse a dead
-# socket. connect_timeout fails fast when the DB is unreachable so the
-# user sees an error instead of waiting for a 2-minute TCP timeout.
+# On Streamlit Cloud + Supabase free tier, the DB is behind pgbouncer and
+# the direct-connection limit is ~10. Streamlit can have multiple worker
+# processes that each hold a persistent pool → exhausts the limit fast.
+#
+# Fix: NullPool — no connections are held between requests. Each session
+# borrows a connection from pgbouncer, runs its queries, and returns it
+# immediately. This is safe for both direct and pooler URLs and never
+# accumulates idle connections across Streamlit reruns.
 _is_pg = DATABASE_URL.startswith("postgresql") or DATABASE_URL.startswith("postgres://")
-_engine_kwargs: dict = {
-    "pool_pre_ping": True,
-    "echo":          False,
-}
+_engine_kwargs: dict = {"echo": False}
 if _is_pg:
-    _engine_kwargs["pool_recycle"] = 300
-    _engine_kwargs["pool_size"]    = 5
-    _engine_kwargs["max_overflow"] = 5
-    _engine_kwargs["pool_timeout"] = 30
+    _engine_kwargs["poolclass"]    = NullPool
     _engine_kwargs["connect_args"] = {
         "connect_timeout": 10,
         "application_name": "ddmrp-streamlit",
