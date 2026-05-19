@@ -1,7 +1,10 @@
 """
-Dashboard — Streamlit page.
-Visual overview of all buffer statuses, NFP trends, and the process map
-overlaid with buffer health colours.
+Dashboard — Tactical Supply Chain Operations View.
+
+Designed for a supply chain manager who needs to oversee all operations in
+a single glance: spot stockout risks early, see where cash is trapped,
+understand inventory value distribution by ABC class, and prioritise the
+day's actions.
 """
 
 import streamlit as st
@@ -11,32 +14,39 @@ import plotly.express as px
 from datetime import datetime, timedelta
 from database.db import get_session, Item, Buffer
 from database.auth import get_company_id
-from modules.buffer_engine import recalculate_all_buffers, calculate_zones
+from modules.buffer_engine import recalculate_all_buffers
 
 
-STATUS_COLOR = {"red": "#E74C3C", "yellow": "#F1C40F", "green": "#2ECC71"}
-STATUS_BG = {"red": "#FADBD8", "yellow": "#FDEBD0", "green": "#D5F5E3"}
+# ── Execution-band palette (deck slides 109-118) ───────────────────────────
 
-# Execution colour palette (deck slides 109-118) — distinct from planning colour
 EXEC_COLOR = {
-    "over_tog": "#3498DB",   # blue — excess inventory above TOG
+    "over_tog": "#3498DB",   # blue — excess
     "green":    "#2ECC71",
     "yellow":   "#F1C40F",
     "red":      "#E74C3C",
-    "dark_red": "#7B241C",   # critical / stockout
+    "dark_red": "#7B241C",   # stockout
 }
 EXEC_LABEL = {
-    "over_tog": "📘 Over-TOG",
-    "green":    "🟢 OK",
-    "yellow":   "🟡 Watch",
-    "red":      "🔴 Critical",
-    "dark_red": "⚫ Stockout",
+    "over_tog": "Over-TOG",
+    "green":    "OK",
+    "yellow":   "Watch",
+    "red":      "Critical",
+    "dark_red": "Stockout",
+}
+EXEC_EMOJI = {
+    "over_tog": "📘",
+    "green":    "🟢",
+    "yellow":   "🟡",
+    "red":      "🔴",
+    "dark_red": "⚫",
 }
 
 
-@st.cache_data(ttl=60)
+# ── Data loading (cached 60 s) ─────────────────────────────────────────────
+
+@st.cache_data(ttl=60, show_spinner=False)
 def _load_dashboard_data(company_id: int) -> list:
-    """Load items, buffers and calculate zones — cached 60 s."""
+    """One-shot loader; computes every per-item € metric the dashboard needs."""
     session = get_session()
     try:
         items = session.query(Item).filter(Item.company_id == company_id).all()
@@ -47,288 +57,383 @@ def _load_dashboard_data(company_id: int) -> list:
     rows = []
     for item in items:
         buf = buf_map.get(item.id)
-        try:
-            z = calculate_zones(item)
-        except Exception:
-            z = None
+        adu       = float(item.adu       or 0.0)
+        unit_cost = float(item.unit_cost or 0.0)
+        on_hand   = float(item.on_hand   or 0.0)
+
+        tor = float(buf.top_of_red    or 0.0) if buf else 0.0
+        toy = float(buf.top_of_yellow or 0.0) if buf else 0.0
+        tog = float(buf.top_of_green  or 0.0) if buf else 0.0
+
+        excess_units    = max(0.0, on_hand - tog) if tog > 0 else 0.0
+        shortfall_units = max(0.0, tor - on_hand) if tor > 0 else 0.0
+
         rows.append({
-            "item_id": item.id,
-            "part_number": item.part_number,
-            "description": item.description,
-            "on_hand": item.on_hand,
-            "status": buf.status if buf else "unknown",
-            "nfp": buf.net_flow_position if buf else 0.0,
-            "tor": buf.top_of_red if buf else 0.0,
-            "toy": buf.top_of_yellow if buf else 0.0,
-            "tog": buf.top_of_green if buf else 0.0,
-            "suggested_qty": buf.suggested_order_qty if buf else 0.0,
-            "last_calc": buf.last_calculated if buf else None,
-            "buffer_status_pct": (buf.buffer_status_pct or 0.0) if buf else 0.0,
-            "execution_color":  (buf.execution_color or "green") if buf else "green",
-            "avg_inv_target":      z.avg_inventory_target     if z else 0.0,
-            "order_freq_days":     z.avg_order_frequency_days if z else 0.0,
-            "safety_days":         z.safety_days              if z else 0.0,
-            "avg_active_orders":   z.avg_active_orders        if z else 0.0,
+            "item_id":            item.id,
+            "part_number":        item.part_number,
+            "description":        item.description or "",
+            "category":           item.category or "(unset)",
+            "adu":                adu,
+            "unit_cost":          unit_cost,
+            "on_hand":            on_hand,
+            "tor":                tor,
+            "toy":                toy,
+            "tog":                tog,
+            "nfp":                float(buf.net_flow_position or 0.0) if buf else 0.0,
+            "suggested_qty":      float(buf.suggested_order_qty or 0.0) if buf else 0.0,
+            "buffer_status_pct":  float(buf.buffer_status_pct or 0.0) if buf else 0.0,
+            "execution_color":    (buf.execution_color or "green") if buf else "green",
+            "status":             buf.status if buf else "unknown",
+            "annual_usage_value": adu * 365.0 * unit_cost,
+            "on_hand_value":      on_hand * unit_cost,
+            "excess_units":       excess_units,
+            "excess_value":       excess_units    * unit_cost,
+            "shortfall_units":    shortfall_units,
+            "shortfall_value":    shortfall_units * unit_cost,
+            # 7-day lost-sale exposure if the item stays below TOR
+            "weekly_risk_value":  adu * 7.0 * unit_cost,
+            "suggested_value":    float(buf.suggested_order_qty or 0.0) * unit_cost if buf else 0.0,
         })
     return rows
 
 
-def show():
-    st.header("DDMRP Dashboard")
-    st.caption("Live overview of all buffer levels across the manufacturing process.")
+def _compute_abc(df: pd.DataFrame) -> pd.DataFrame:
+    """Tag each row with A/B/C class using 80/15/5 Pareto on annual usage €."""
+    if df.empty:
+        df["abc"] = []
+        return df
+    total = df["annual_usage_value"].sum()
+    if total <= 0:
+        df["abc"] = "C"
+        return df
+    sorted_df = df.sort_values("annual_usage_value", ascending=False).copy()
+    sorted_df["_cum_pct"] = sorted_df["annual_usage_value"].cumsum() / total
 
-    col_refresh, col_ts = st.columns([1, 3])
+    def _class(p: float) -> str:
+        if p <= 0.80: return "A"
+        if p <= 0.95: return "B"
+        return "C"
+
+    abc_map = dict(zip(sorted_df["item_id"], sorted_df["_cum_pct"].apply(_class)))
+    df["abc"] = df["item_id"].map(abc_map).fillna("C")
+    return df
+
+
+# ── Page entry point ──────────────────────────────────────────────────────
+
+def show():
+    st.header("Supply Chain Tactical Dashboard")
+    st.caption(
+        "One-screen overview for operations: where the money is, where the risk is, "
+        "and what to act on today."
+    )
+
+    col_refresh, _ = st.columns([1, 5])
     with col_refresh:
-        if st.button("Refresh Buffers", type="primary", use_container_width=True):
-            with st.spinner("Recalculating..."):
+        if st.button("🔄 Refresh Buffers", type="primary", use_container_width=True):
+            with st.spinner("Recalculating…"):
                 recalculate_all_buffers(company_id=get_company_id())
-            _load_dashboard_data.clear()   # invalidate cache so new data shows immediately
+            _load_dashboard_data.clear()
             st.success("Buffers refreshed.")
 
     rows = _load_dashboard_data(get_company_id())
-
     if not rows:
         st.info("No items found. Start in **Material Master** to add items.")
         return
 
-    df = pd.DataFrame(rows)
+    df = _compute_abc(pd.DataFrame(rows))
 
-    # -----------------------------------------------------------------------
-    # KPI Row
-    # -----------------------------------------------------------------------
+    # ── 1. Headline KPI strip ─────────────────────────────────────────────
     st.divider()
-    _kpi_row(df)
+    _headline_kpis(df)
 
-    # -----------------------------------------------------------------------
-    # Canonical DDMRP KPIs (slide 59 / 92)
-    # -----------------------------------------------------------------------
-    _ddmrp_kpi_row(df)
-
-    # -----------------------------------------------------------------------
-    # Execution view — Buffer Status % (deck slides 109-118)
-    # -----------------------------------------------------------------------
-    _execution_row(df)
-
-    # -----------------------------------------------------------------------
-    # Buffer Status Board
-    # -----------------------------------------------------------------------
+    # ── 2. Health donut + Inventory € by ABC ──────────────────────────────
     st.divider()
-    st.subheader("Buffer Status Board")
-    _buffer_status_board(df)
+    col1, col2 = st.columns([1, 1.4])
+    with col1:
+        _health_donut(df)
+    with col2:
+        _value_by_abc(df)
 
-    # -----------------------------------------------------------------------
-    # NFP vs Zones Bar Chart
-    # -----------------------------------------------------------------------
+    # ── 3. Action items: stockout risks + overstock ──────────────────────
     st.divider()
-    st.subheader("Net Flow Position vs Buffer Zones")
-    _nfp_zone_chart(df)
+    st.subheader("🎯 Immediate Action Items")
+    st.caption("Sorted by € impact — start at the top.")
+    col1, col2 = st.columns(2)
+    with col1:
+        _top_stockout_risks(df)
+    with col2:
+        _top_overstock(df)
 
-    # -----------------------------------------------------------------------
-    # Demand Horizon
-    # -----------------------------------------------------------------------
+    # ── 4. Reorder pipeline + ABC × execution heatmap ────────────────────
     st.divider()
-    st.subheader("Demand Horizon (Next 30 Days)")
+    col1, col2 = st.columns([1, 1.2])
+    with col1:
+        _reorder_pipeline(df)
+    with col2:
+        _risk_concentration(df)
+
+    # ── 5. Forward demand (next 30 days) ─────────────────────────────────
+    st.divider()
+    st.subheader("📅 Demand Horizon (Next 30 Days)")
     _demand_horizon_chart()
 
 
-# ---------------------------------------------------------------------------
-# KPI Row
-# ---------------------------------------------------------------------------
+# ── 1. Headline KPI strip ─────────────────────────────────────────────────
 
-def _kpi_row(df: pd.DataFrame):
-    total = len(df)
-    red = len(df[df.status == "red"])
-    yellow = len(df[df.status == "yellow"])
-    green = len(df[df.status == "green"])
-    reorder_val = df[df.status.isin(["red", "yellow"])]["suggested_qty"].sum()
+def _headline_kpis(df: pd.DataFrame):
+    total_value     = df["on_hand_value"].sum()
+    excess_value    = df["excess_value"].sum()
+    n_stockout      = int((df["execution_color"] == "dark_red").sum())
+    n_critical      = int((df["execution_color"] == "red").sum())
+    n_overstock     = int((df["execution_color"] == "over_tog").sum())
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total Items", total)
-    c2.metric("🔴 Critical", red)
-    c3.metric("🟡 Attention", yellow)
-    c4.metric("🟢 OK", green)
-    c5.metric("Total Reorder Qty", f"{reorder_val:,.0f}")
+    # Service level proxy = items NOT below TOR / total buffered items
+    buffered = df[df["tor"] > 0]
+    healthy  = buffered[~buffered["execution_color"].isin(["red", "dark_red"])]
+    service_pct = (len(healthy) / len(buffered) * 100) if len(buffered) > 0 else 0.0
+
+    # Stockout exposure € — 7-day lost-sale risk for items below TOR
+    at_risk = df[df["execution_color"].isin(["red", "dark_red"])]
+    exposure_value = at_risk["weekly_risk_value"].sum()
+
+    reorder_value = df["suggested_value"].sum()
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric(
+        "💰 Inventory Value",
+        f"€{total_value:,.0f}",
+        help="Σ on-hand × unit cost across all items",
+    )
+    c2.metric(
+        "📈 Service Level",
+        f"{service_pct:.0f}%",
+        help="% of buffered items not in Red/Stockout",
+    )
+    c3.metric(
+        "🔴 Items at Risk",
+        f"{n_critical + n_stockout}",
+        help=f"{n_critical} Critical + {n_stockout} Stockout",
+    )
+    c4.metric(
+        "⚫ 7-day Lost-Sale Risk",
+        f"€{exposure_value:,.0f}",
+        help="Σ ADU × 7 × unit cost for items below TOR — revenue at risk this week",
+    )
+    c5.metric(
+        "💸 Cash Trapped (Overstock)",
+        f"€{excess_value:,.0f}",
+        help=f"Σ (on-hand − TOG) × unit cost over {n_overstock} item(s) above target",
+    )
+    c6.metric(
+        "🛒 Suggested Orders",
+        f"€{reorder_value:,.0f}",
+        help="Σ suggested order qty × unit cost — what to release today",
+    )
 
 
-def _ddmrp_kpi_row(df: pd.DataFrame):
-    """
-    Canonical DDMRP fleet-level KPIs (deck slides 59 / 92):
-      - Avg Inventory Target (sum across items) = Σ (Red + Green/2)
-      - Avg Order Frequency (median across items) — Green / ADU
-      - Avg Safety Days (median across items)    — Red / ADU
-      - Avg Active Orders (mean across items)    — Yellow / Green
-    """
-    if df.empty:
+# ── 2a. Inventory Health donut ────────────────────────────────────────────
+
+def _health_donut(df: pd.DataFrame):
+    st.subheader("Inventory Health")
+    bands = ["dark_red", "red", "yellow", "green", "over_tog"]
+    counts = df["execution_color"].value_counts().reindex(bands, fill_value=0)
+    if counts.sum() == 0:
+        st.info("No buffered items yet.")
         return
 
-    total_avg_inv = df["avg_inv_target"].sum()
-    valid_freq    = df.loc[df["order_freq_days"]   > 0, "order_freq_days"]
-    valid_safety  = df.loc[df["safety_days"]       > 0, "safety_days"]
-    valid_active  = df.loc[df["avg_active_orders"] > 0, "avg_active_orders"]
+    fig = go.Figure(go.Pie(
+        labels=[f"{EXEC_EMOJI[b]} {EXEC_LABEL[b]}" for b in bands],
+        values=counts.values.tolist(),
+        marker=dict(colors=[EXEC_COLOR[b] for b in bands]),
+        hole=0.58,
+        textinfo="value+percent",
+        sort=False,
+        direction="clockwise",
+    ))
 
-    median_freq   = valid_freq.median()   if not valid_freq.empty   else 0.0
-    median_safety = valid_safety.median() if not valid_safety.empty else 0.0
-    mean_active   = valid_active.mean()   if not valid_active.empty else 0.0
+    # Centre annotation — % healthy (green or above)
+    ok_pct = (counts.get("green", 0) + counts.get("over_tog", 0)) / counts.sum() * 100
+    fig.update_layout(
+        height=340,
+        margin=dict(t=10, b=10, l=10, r=10),
+        showlegend=True,
+        legend=dict(orientation="v", x=1.02, y=0.5, font=dict(size=11)),
+        annotations=[dict(
+            text=f"<b style='font-size:1.6em;color:#2C3E50'>{ok_pct:.0f}%</b>"
+                 f"<br><span style='font-size:0.75em;color:#7A92BB'>at or above target</span>",
+            x=0.5, y=0.5, showarrow=False,
+        )],
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📦 Avg Inventory Target", f"{total_avg_inv:,.0f} units",
-              help="Σ (Red + Green/2) across all items — DDMRP canonical inventory target")
-    c2.metric("🔁 Median Order Frequency", f"{median_freq:.1f} days",
-              help="Green / ADU — median days between orders across the fleet")
-    c3.metric("🛡️ Median Safety Days", f"{median_safety:.1f} days",
-              help="Red / ADU — median days of safety stock across the fleet")
-    c4.metric("📨 Avg Active Orders", f"{mean_active:.2f}",
-              help="Yellow / Green — mean number of simultaneously open replenishment orders")
 
+# ── 2b. Inventory Value by ABC class ──────────────────────────────────────
 
-def _execution_row(df: pd.DataFrame):
-    """
-    Execution-side dashboard row (deck slides 109-118).
-    Shows Buffer Status % distribution across the 5 execution colour bands:
-      over_tog | green | yellow | red | dark_red
-    """
+def _value_by_abc(df: pd.DataFrame):
+    st.subheader("Inventory Value by ABC Class")
+    st.caption("Stacked by execution status — spot risk concentration where the money is.")
     if df.empty:
+        st.info("No data.")
         return
 
-    counts = df["execution_color"].value_counts().to_dict()
-    n_over = counts.get("over_tog", 0)
-    n_grn  = counts.get("green",    0)
-    n_yel  = counts.get("yellow",   0)
-    n_red  = counts.get("red",      0)
-    n_drk  = counts.get("dark_red", 0)
-
-    valid = df[df["tor"] > 0]
-    avg_pct    = (valid["buffer_status_pct"].mean() * 100) if not valid.empty else 0.0
-    median_pct = (valid["buffer_status_pct"].median() * 100) if not valid.empty else 0.0
-
-    st.divider()
-    st.subheader("Execution View — Buffer Status %")
-    st.caption("On-Hand / Top-of-Red. 100% = at TOR; <50% triggers a Current-Stock alarm.")
-
-    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.metric("📘 Over-TOG", n_over, help="On-Hand above Top of Green (excess)")
-    c2.metric("🟢 OK",       n_grn)
-    c3.metric("🟡 Watch",    n_yel, help="On-Hand between 50% and 100% of TOR")
-    c4.metric("🔴 Critical", n_red, help="On-Hand below 50% of TOR")
-    c5.metric("⚫ Stockout", n_drk, help="On-Hand <= 0")
-    c6.metric("Avg Status %",    f"{avg_pct:.0f}%")
-    c7.metric("Median Status %", f"{median_pct:.0f}%")
-
-
-# ---------------------------------------------------------------------------
-# Buffer Status Board (card-style)
-# ---------------------------------------------------------------------------
-
-def _buffer_status_board(df: pd.DataFrame):
-    priority = {"red": 0, "yellow": 1, "green": 2, "unknown": 3}
-    sorted_df = df.sort_values("status", key=lambda s: s.map(priority))
-
-    from modules.ui_helpers import top_n_selector
-    total = len(sorted_df)
-    n = top_n_selector(total, key="dash_board_n", default=10, label="Show top")
-    st.caption(f"Showing {min(n, total):,} of {total:,} items (sorted by status priority).")
-    sorted_df = sorted_df.head(n)
-
-    cols_per_row = 4
-    rows_data = [sorted_df.iloc[i:i + cols_per_row]
-                 for i in range(0, len(sorted_df), cols_per_row)]
-
-    for row_data in rows_data:
-        cols = st.columns(cols_per_row)
-        for col, (_, r) in zip(cols, row_data.iterrows()):
-            status = r["status"]
-            bg = STATUS_BG.get(status, "#F8F9FA")
-            emoji = {"red": "🔴", "yellow": "🟡", "green": "🟢"}.get(status, "⚪")
-
-            exec_band = r.get("execution_color", "green")
-            exec_lbl  = EXEC_LABEL.get(exec_band, exec_band)
-            exec_clr  = EXEC_COLOR.get(exec_band, "#888")
-            pct       = (r.get("buffer_status_pct") or 0.0) * 100.0
-
-            col.markdown(
-                f"""
-                <div style="background:{bg}; border-radius:8px; padding:12px;
-                            border-left:4px solid {STATUS_COLOR.get(status,'#ccc')};">
-                  <b style="font-size:1.0em">{emoji} {r['part_number']}</b><br>
-                  <span style="font-size:0.8em; color:#555">{r['description'][:30]}</span><br>
-                  <span style="font-size:0.9em">NFP: <b>{r['nfp']:.1f}</b></span><br>
-                  <span style="font-size:0.8em">TOG: {r['tog']:.1f} | TOR: {r['tor']:.1f}</span><br>
-                  <span style="font-size:0.8em">Status %: <b style="color:{exec_clr}">{pct:.0f}%</b> &middot; {exec_lbl}</span><br>
-                  {'<span style="color:#E74C3C; font-size:0.85em"><b>Order: ' + str(round(r["suggested_qty"],1)) + ' units</b></span>' if r["suggested_qty"] > 0 else '<span style="color:#27AE60; font-size:0.85em">No action needed</span>'}
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-
-# ---------------------------------------------------------------------------
-# NFP vs Zones horizontal bar chart
-# ---------------------------------------------------------------------------
-
-def _nfp_zone_chart(df: pd.DataFrame):
-    if df.empty:
-        return
-
-    from modules.ui_helpers import top_n_selector
-    # Sort by NFP penetration (lowest first → most critical) so the top-N is meaningful
-    sorted_df = df.copy()
-    sorted_df["_penetration"] = (sorted_df["nfp"] - sorted_df["tor"]) / (sorted_df["tog"] - sorted_df["tor"]).replace(0, 1)
-    sorted_df = sorted_df.sort_values("_penetration")
-
-    total = len(sorted_df)
-    n = top_n_selector(total, key="dash_nfp_n", default=10, label="Show top")
-    st.caption(f"Showing {min(n, total):,} of {total:,} items (most critical first by NFP penetration).")
-    sorted_df = sorted_df.head(n).sort_values("part_number")
+    grouped = df.groupby(["abc", "execution_color"])["on_hand_value"].sum().reset_index()
+    abc_order = ["A", "B", "C"]
+    bands_order = ["dark_red", "red", "yellow", "green", "over_tog"]
 
     fig = go.Figure()
-
-    # Red zone bar (baseline)
-    fig.add_trace(go.Bar(
-        name="Red Zone", x=sorted_df["tor"], y=sorted_df["part_number"],
-        orientation="h", marker_color="#FADBD8", marker_line_color="#E74C3C",
-        marker_line_width=1,
-    ))
-    # Yellow zone increment
-    fig.add_trace(go.Bar(
-        name="Yellow Zone",
-        x=sorted_df["toy"] - sorted_df["tor"],
-        y=sorted_df["part_number"],
-        orientation="h", marker_color="#FDEBD0", marker_line_color="#F39C12",
-        marker_line_width=1,
-    ))
-    # Green zone increment
-    fig.add_trace(go.Bar(
-        name="Green Zone",
-        x=sorted_df["tog"] - sorted_df["toy"],
-        y=sorted_df["part_number"],
-        orientation="h", marker_color="#D5F5E3", marker_line_color="#27AE60",
-        marker_line_width=1,
-    ))
-
-    # NFP marker
-    fig.add_trace(go.Scatter(
-        name="Net Flow Position",
-        x=sorted_df["nfp"], y=sorted_df["part_number"],
-        mode="markers",
-        marker=dict(size=12, color="#2C3E50", symbol="diamond"),
-    ))
-
+    for band in bands_order:
+        sub = grouped[grouped["execution_color"] == band].set_index("abc").reindex(abc_order, fill_value=0)
+        if sub["on_hand_value"].sum() == 0:
+            continue
+        fig.add_trace(go.Bar(
+            name=f"{EXEC_EMOJI[band]} {EXEC_LABEL[band]}",
+            x=abc_order,
+            y=sub["on_hand_value"].values,
+            marker_color=EXEC_COLOR[band],
+            hovertemplate="<b>Class %{x}</b><br>" + EXEC_LABEL[band]
+                          + ": €%{y:,.0f}<extra></extra>",
+        ))
     fig.update_layout(
         barmode="stack",
-        height=max(300, len(df) * 50),
-        xaxis_title="Units",
-        yaxis_title="",
-        legend=dict(orientation="h", y=-0.15),
-        margin=dict(l=10, r=10, t=10, b=60),
+        height=340,
+        xaxis_title="ABC Class (A = top 80% of usage €)",
+        yaxis_title="On-Hand Value (€)",
+        legend=dict(orientation="h", y=-0.22),
+        margin=dict(t=10, b=70, l=10, r=10),
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("Diamond marker = Net Flow Position. Coloured bars = buffer zones.")
+
+    # Summary strip under the chart
+    totals = df.groupby("abc")["on_hand_value"].sum()
+    total = totals.sum()
+    cols = st.columns(3)
+    for col, cls in zip(cols, abc_order):
+        v = totals.get(cls, 0.0)
+        n = int((df["abc"] == cls).sum())
+        pct = (v / total * 100) if total > 0 else 0.0
+        col.metric(f"Class {cls}", f"€{v:,.0f}", f"{n} items · {pct:.0f}% of €")
 
 
-# ---------------------------------------------------------------------------
-# Demand Horizon
-# ---------------------------------------------------------------------------
+# ── 3a. Top Stockout Risks ────────────────────────────────────────────────
+
+def _top_stockout_risks(df: pd.DataFrame):
+    st.markdown("**🚨 Top Stockout Risks** &nbsp; *(by 7-day lost-sale €)*")
+    risks = df[df["execution_color"].isin(["red", "dark_red"])].copy()
+    if risks.empty:
+        st.success("✅ No items in Red or Stockout band.")
+        return
+
+    risks = risks.sort_values("weekly_risk_value", ascending=False).head(10)
+    table = pd.DataFrame({
+        "Status":      risks["execution_color"].map(lambda b: f"{EXEC_EMOJI.get(b, '⚪')} {EXEC_LABEL.get(b, b)}"),
+        "ABC":         risks["abc"],
+        "Part":        risks["part_number"],
+        "Description": risks["description"].str.slice(0, 40),
+        "On Hand":     risks["on_hand"].round(1),
+        "TOR":         risks["tor"].round(1),
+        "Order Now":   risks["suggested_qty"].round(0),
+        "7d Risk (€)": risks["weekly_risk_value"].round(0),
+    })
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+# ── 3b. Top Overstock — Cash Trapped ──────────────────────────────────────
+
+def _top_overstock(df: pd.DataFrame):
+    st.markdown("**💸 Top Overstock** &nbsp; *(cash trapped above TOG)*")
+    over = df[df["excess_value"] > 0].copy()
+    if over.empty:
+        st.success("✅ No items above Top of Green.")
+        return
+
+    over = over.sort_values("excess_value", ascending=False).head(10)
+    table = pd.DataFrame({
+        "ABC":             over["abc"],
+        "Part":            over["part_number"],
+        "Description":     over["description"].str.slice(0, 40),
+        "On Hand":         over["on_hand"].round(1),
+        "TOG":             over["tog"].round(1),
+        "Excess Units":    over["excess_units"].round(1),
+        "Cash Trapped (€)": over["excess_value"].round(0),
+    })
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+# ── 4a. Reorder Pipeline ─────────────────────────────────────────────────
+
+def _reorder_pipeline(df: pd.DataFrame):
+    st.subheader("🛒 Reorder Pipeline")
+    st.caption("Suggested orders today, grouped by ABC class.")
+    pipe = df[df["suggested_qty"] > 0].copy()
+    if pipe.empty:
+        st.success("✅ No replenishment orders suggested.")
+        return
+
+    summary = pipe.groupby("abc").agg(
+        items=("item_id", "count"),
+        units=("suggested_qty", "sum"),
+        value=("suggested_value", "sum"),
+    ).reindex(["A", "B", "C"], fill_value=0).reset_index()
+
+    fig = go.Figure(go.Bar(
+        x=summary["abc"],
+        y=summary["value"],
+        marker_color=["#2C3E50", "#5D6D7E", "#AAB7B8"],
+        text=[f"€{v:,.0f}<br>{int(n)} items" for v, n in zip(summary["value"], summary["items"])],
+        textposition="outside",
+        hovertemplate="<b>Class %{x}</b><br>€%{y:,.0f}<extra></extra>",
+    ))
+    fig.update_layout(
+        height=300,
+        xaxis_title="ABC Class",
+        yaxis_title="Suggested Order Value (€)",
+        margin=dict(t=20, b=40, l=10, r=10),
+        plot_bgcolor="white",
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ── 4b. Risk concentration heatmap (ABC × execution band) ────────────────
+
+def _risk_concentration(df: pd.DataFrame):
+    st.subheader("🌡️ Risk Concentration — ABC × Execution Band")
+    st.caption("Item counts. A-items in Red/Stockout are the highest priority.")
+
+    bands = ["dark_red", "red", "yellow", "green", "over_tog"]
+    band_labels = [f"{EXEC_EMOJI[b]} {EXEC_LABEL[b]}" for b in bands]
+    abc_order = ["A", "B", "C"]
+
+    mat = []
+    for cls in abc_order:
+        row = []
+        for b in bands:
+            row.append(int(((df["abc"] == cls) & (df["execution_color"] == b)).sum()))
+        mat.append(row)
+
+    fig = go.Figure(go.Heatmap(
+        z=mat,
+        x=band_labels,
+        y=abc_order,
+        colorscale=[[0, "#F8F9FA"], [0.5, "#F5B041"], [1, "#922B21"]],
+        text=mat,
+        texttemplate="%{text}",
+        textfont={"size": 13, "color": "#1A1A1A"},
+        hovertemplate="Class %{y} · %{x}<br>%{z} items<extra></extra>",
+        showscale=False,
+    ))
+    fig.update_layout(
+        height=300,
+        margin=dict(t=10, b=30, l=10, r=10),
+        xaxis=dict(side="bottom"),
+        yaxis=dict(autorange="reversed"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ── 5. Forward Demand Horizon ────────────────────────────────────────────
 
 def _demand_horizon_chart():
     from database.db import DemandEntry
@@ -341,30 +446,33 @@ def _demand_horizon_chart():
             session.query(DemandEntry, Item)
             .join(Item, DemandEntry.item_id == Item.id)
             .filter(DemandEntry.demand_date >= today,
-                    DemandEntry.demand_date <= horizon)
+                    DemandEntry.demand_date <= horizon,
+                    Item.company_id == get_company_id())
             .all()
         )
         if not entries:
             st.info("No demand entries in the next 30 days.")
             return
-
         rows = [{
-            "Date": e.demand_date.date(),
-            "Part": it.part_number,
+            "Date":     e.demand_date.date(),
+            "Part":     it.part_number,
             "Quantity": e.quantity,
-            "Type": e.demand_type,
         } for e, it in entries]
     finally:
         session.close()
 
     df_demand = pd.DataFrame(rows)
     df_demand["Date"] = pd.to_datetime(df_demand["Date"])
-
     fig = px.bar(
         df_demand.groupby(["Date", "Part"])["Quantity"].sum().reset_index(),
         x="Date", y="Quantity", color="Part",
-        barmode="group",
+        barmode="stack",
         labels={"Quantity": "Demand Qty"},
     )
-    fig.update_layout(height=350, margin=dict(t=10, b=40, l=10, r=10))
+    fig.update_layout(
+        height=320,
+        margin=dict(t=10, b=40, l=10, r=10),
+        plot_bgcolor="white",
+        legend=dict(orientation="h", y=-0.25),
+    )
     st.plotly_chart(fig, use_container_width=True)
