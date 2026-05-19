@@ -53,8 +53,28 @@ _CSS = """
    RESET & GLOBAL
 ═══════════════════════════════════════════════════════════════ */
 *, *::before, *::after {
-    font-family: var(--font-ui) !important;
     box-sizing: border-box;
+}
+
+/* App-wide UI font — scoped to the main app/sidebar containers so it
+   does NOT override Streamlit's Material Symbols icon font (which renders
+   ligatures like `arrow_right`, `keyboard_double_arrow_left`, etc.). */
+[data-testid="stAppViewContainer"],
+[data-testid="stAppViewContainer"] *:not([class*="material-symbols"]):not([class*="material-icons"]):not([data-testid*="Icon"]):not([data-testid*="icon"]):not(i):not(svg):not(svg *),
+[data-testid="stSidebar"],
+[data-testid="stSidebar"] *:not([class*="material-symbols"]):not([class*="material-icons"]):not([data-testid*="Icon"]):not([data-testid*="icon"]):not(i):not(svg):not(svg *),
+[data-testid="stHeader"],
+[data-testid="stHeader"] *:not([class*="material-symbols"]):not([class*="material-icons"]):not([data-testid*="Icon"]):not([data-testid*="icon"]):not(i):not(svg):not(svg *) {
+    font-family: var(--font-ui) !important;
+}
+
+/* Explicitly preserve Material Symbols / Material Icons font on icon spans */
+[class*="material-symbols"],
+[class*="material-icons"],
+span.material-symbols-rounded,
+span.material-symbols-outlined,
+span.material-symbols-sharp {
+    font-family: 'Material Symbols Rounded', 'Material Symbols Outlined', 'Material Icons' !important;
 }
 
 /* Monospace for numbers in widgets */

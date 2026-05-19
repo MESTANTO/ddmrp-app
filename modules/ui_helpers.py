@@ -109,13 +109,19 @@ def limited_dataframe(
     shown = len(df_view)
     st.caption(f"Showing {shown:,} of {total:,} rows")
 
-    st.dataframe(
-        df_view,
-        use_container_width=use_container_width,
-        hide_index=hide_index,
-        column_config=column_config,
-        height=height,
-    )
+    # Only forward `height` when caller supplied a valid value — newer Streamlit
+    # releases reject an explicit `height=None` via `validate_height`.
+    df_kwargs: dict = {
+        "use_container_width": use_container_width,
+        "hide_index":          hide_index,
+        "column_config":       column_config,
+    }
+    if isinstance(height, int) and height > 0:
+        df_kwargs["height"] = height
+    elif height == "auto":
+        df_kwargs["height"] = "auto"
+
+    st.dataframe(df_view, **df_kwargs)
     return df_view
 
 
