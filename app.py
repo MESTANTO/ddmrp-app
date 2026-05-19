@@ -46,25 +46,67 @@ if not has_company():
 # Sidebar navigation
 # ---------------------------------------------------------------------------
 
-PAGES = {
-    "📊  Dashboard":                 "dashboard",
-    "📋  Material Master":           "material_master",
-    "🏭  Supplier Master":           "supplier_master",
-    "📈  Demand & Supply":           "demand_supply",
-    "🔗  Process Designer":          "process_designer",
-    "🧬  BOM & Auto DLT":            "bom_engine",
-    "🎯  MRP Type":                  "mrp_type",
-    "🚦  Replenishment Signals":     "signal_engine",
-    "🚨  Execution Alarms":          "alarms",
-    "📐  Prioritized Share":         "share_allocator",
-    "📉  Model Velocity":            "model_velocity",
-    "🤖  AI Inventory Manager":      "ai_inventory_manager",
-    "🔠  ABC / XYZ / ACV²":          "abc_xyz",
-    "🛡️  Safety Stock & EOQ":        "safety_stock",
-    "🎛️  Buffer Adjustments":        "buffer_adjustments",
-    "📤  Export to Excel":           "export",
-    "⚙️  Settings":                  "settings",
+# Top-level pages (rendered as standalone buttons, no group)
+TOP_LEVEL: list[tuple[str, str]] = [
+    ("📊  Dashboard",             "dashboard"),
+]
+
+# Grouped pages — each group is an expander with buttons inside
+GROUPS: dict[str, list[tuple[str, str]]] = {
+    "📁  Master Data": [
+        ("📋  Material Master",       "material_master"),
+        ("🏭  Supplier Master",       "supplier_master"),
+        ("📈  Demand & Supply",       "demand_supply"),
+        ("🔗  Process Designer",      "process_designer"),
+        ("🧬  BOM & Auto DLT",        "bom_engine"),
+    ],
+    "🎯  DDMRP": [
+        ("🎯  MRP Type",              "mrp_type"),
+        ("🚦  Replenishment Signals", "signal_engine"),
+        ("🚨  Execution Alarms",      "alarms"),
+        ("📐  Prioritized Share",     "share_allocator"),
+        ("🎛️  Buffer Adjustments",    "buffer_adjustments"),
+        ("🛡️  Safety Stock & EOQ",    "safety_stock"),
+    ],
+    "📈  Analysis": [
+        ("🔠  ABC / XYZ / ACV²",      "abc_xyz"),
+        ("📉  Model Velocity",        "model_velocity"),
+        ("📤  Export to Excel",       "export"),
+    ],
 }
+
+# Bottom-level standalone pages
+BOTTOM_LEVEL: list[tuple[str, str]] = [
+    ("🤖  AI Inventory Manager", "ai_inventory_manager"),
+    ("⚙️  Settings",              "settings"),
+]
+
+# Flat lookup: slug → label (used to label the active page later if needed)
+ALL_PAGES: dict[str, str] = {}
+for _lbl, _slug in TOP_LEVEL + BOTTOM_LEVEL:
+    ALL_PAGES[_slug] = _lbl
+for _items in GROUPS.values():
+    for _lbl, _slug in _items:
+        ALL_PAGES[_slug] = _lbl
+
+
+# Active-page state lives in session_state so clicks survive reruns
+if "active_page" not in st.session_state:
+    st.session_state.active_page = "dashboard"
+
+
+def _nav_button(label: str, slug: str) -> None:
+    """Render a sidebar nav button; highlights the active page."""
+    is_active = (st.session_state.active_page == slug)
+    if st.sidebar.button(
+        label,
+        key=f"nav_{slug}",
+        use_container_width=True,
+        type="primary" if is_active else "secondary",
+    ):
+        st.session_state.active_page = slug
+        st.rerun()
+
 
 _user = get_current_user()
 _company_id = _user.get("company_id")
@@ -84,11 +126,31 @@ with st.sidebar:
     st.divider()
     st.caption("MODULES")
 
-    selection = st.radio(
-        "Navigate to",
-        list(PAGES.keys()),
-        label_visibility="collapsed",
-    )
+# Top-level entries
+for _lbl, _slug in TOP_LEVEL:
+    _nav_button(_lbl, _slug)
+
+# Grouped entries — expander auto-opens if the active page is inside
+for _group_label, _items in GROUPS.items():
+    _slugs_in_group = {s for _, s in _items}
+    _expanded = st.session_state.active_page in _slugs_in_group
+    with st.sidebar.expander(_group_label, expanded=_expanded):
+        for _lbl, _slug in _items:
+            _is_active = (st.session_state.active_page == _slug)
+            if st.button(
+                _lbl,
+                key=f"nav_{_slug}",
+                use_container_width=True,
+                type="primary" if _is_active else "secondary",
+            ):
+                st.session_state.active_page = _slug
+                st.rerun()
+
+# Bottom-level entries
+for _lbl, _slug in BOTTOM_LEVEL:
+    _nav_button(_lbl, _slug)
+
+with st.sidebar:
     st.divider()
 
     # User / company info + logout
@@ -112,7 +174,7 @@ with st.sidebar:
 # Page routing
 # ---------------------------------------------------------------------------
 
-page_key = PAGES[selection]
+page_key = st.session_state.active_page
 
 if page_key == "dashboard":
     from views.dashboard import show
