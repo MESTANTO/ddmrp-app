@@ -283,13 +283,17 @@ def _value_by_abc(df: pd.DataFrame):
 
     fig = go.Figure()
     for band in bands_order:
-        sub = grouped[grouped["execution_color"] == band].set_index("abc").reindex(abc_order, fill_value=0)
-        if sub["on_hand_value"].sum() == 0:
+        sub_series = (
+            grouped.loc[grouped["execution_color"] == band]
+            .set_index("abc")["on_hand_value"]
+            .reindex(abc_order, fill_value=0.0)
+        )
+        if sub_series.sum() == 0:
             continue
         fig.add_trace(go.Bar(
             name=f"{EXEC_EMOJI[band]} {EXEC_LABEL[band]}",
             x=abc_order,
-            y=sub["on_hand_value"].values,
+            y=sub_series.values,
             marker_color=EXEC_COLOR[band],
             hovertemplate="<b>Class %{x}</b><br>" + EXEC_LABEL[band]
                           + ": €%{y:,.0f}<extra></extra>",
