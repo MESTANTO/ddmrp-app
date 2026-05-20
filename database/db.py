@@ -441,6 +441,36 @@ class AgentSignal(Base):
     run  = relationship("AgentRun", back_populates="signals")
 
 
+class AgentAction(Base):
+    """
+    One row per write change proposed by the chat agent.
+
+    The propose_* tools insert rows with status='pending'; the Pending
+    Changes tab in views/ai_inventory_manager.py shows them, and the
+    action_applier handlers flip them to 'applied' / 'rejected' / 'failed'
+    after the user clicks Approve/Reject.
+
+    `before_json` is captured at propose-time for update_*/delete_*.
+    `after_json`  is captured at apply-time (post-write snapshot of the row).
+    """
+    __tablename__ = "agent_actions"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    company_id   = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    user_id      = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at   = Column(DateTime, default=datetime.utcnow, nullable=False)
+    applied_at   = Column(DateTime, nullable=True)
+    status       = Column(String, default="pending")    # pending | applied | rejected | failed
+    action_type  = Column(String, nullable=False)       # update_item | create_item | delete_item | ...
+    target_table = Column(String, nullable=False)       # items | suppliers | buffer_adjustments
+    target_id    = Column(Integer, nullable=True)       # null for create_*
+    payload_json = Column(Text, nullable=False)         # proposed fields + values
+    before_json  = Column(Text, nullable=True)          # snapshot pre-apply
+    after_json   = Column(Text, nullable=True)          # snapshot post-apply
+    reason       = Column(Text, default="")             # LLM's stated reason
+    notes        = Column(Text, default="")             # rejection reason / error message
+
+
 # ---------------------------------------------------------------------------
 # BOM (Bill of Materials) — used by compute_dlt() in bom_engine.py
 # ---------------------------------------------------------------------------
@@ -773,9 +803,10 @@ def _ensure_demo_user():
 
 def _migrate_agent_tables():
     """
-    Ensure agent_runs and agent_signals tables exist and have all current columns.
-    create_all() creates missing tables; _add_columns_safely handles new columns
-    on existing tables (idempotent, cross-dialect).
+    Ensure agent_runs, agent_signals, and agent_actions tables exist and have
+    all current columns. create_all() creates missing tables;
+    _add_columns_safely handles new columns on existing tables
+    (idempotent, cross-dialect).
     """
     Base.metadata.create_all(engine)
     # New columns added in the per-category analysis redesign
@@ -785,6 +816,16 @@ def _migrate_agent_tables():
     ])
     _add_columns_safely("agent_signals", [
         ("analysis_category", "TEXT DEFAULT ''", "VARCHAR DEFAULT ''"),
+    ])
+    # agent_actions is created by create_all above. Add defensive column
+    # migrations in case a previous deploy created the table without them.
+    _add_columns_safely("agent_actions", [
+        ("applied_at",   "DATETIME",          "TIMESTAMP"),
+        ("before_json",  "TEXT",              "TEXT"),
+        ("after_json",   "TEXT",              "TEXT"),
+        ("reason",       "TEXT DEFAULT ''",   "TEXT DEFAULT ''"),
+        ("notes",        "TEXT DEFAULT ''",   "TEXT DEFAULT ''"),
+        ("target_id",    "INTEGER",           "INTEGER"),
     ])
 
 

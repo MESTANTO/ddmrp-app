@@ -16,9 +16,15 @@ current DB state.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any, Callable
 
 from agents import inventory_agent
+from agents.action_applier import (
+    BUFFER_ADJ_FIELDS,
+    ITEM_FIELDS,
+    SUPPLIER_FIELDS,
+)
 from agents.inventory_agent import (
     ANALYSIS_CATEGORIES,
     build_focused_context,
@@ -35,6 +41,87 @@ from agents.inventory_agent import (
     get_supplier_risk_items,
     parse_llm_signals,
 )
+from database.db import (
+    AgentAction,
+    BufferAdjustment,
+    Item,
+    SessionLocal,
+    Supplier,
+)
+
+
+# ---------------------------------------------------------------------------
+# Write-tool helpers
+# ---------------------------------------------------------------------------
+
+# Cap proposals per turn to prevent runaway tool loops
+_MAX_PROPOSALS_PER_TURN = 10
+_propose_counter: dict[int, int] = {}   # company_id -> count this turn
+
+
+def reset_propose_counter(company_id: int) -> None:
+    """Call at the start of every chat turn so the rate-limit resets."""
+    _propose_counter[company_id] = 0
+
+
+def _check_rate_limit(company_id: int) -> dict | None:
+    """Return an error dict if the per-turn cap is exhausted, else None."""
+    n = _propose_counter.get(company_id, 0)
+    if n >= _MAX_PROPOSALS_PER_TURN:
+        return {
+            "error": "too many proposals in one turn",
+            "hint":  f"Cap is {_MAX_PROPOSALS_PER_TURN}. Ask the user to approve "
+                     "the queued changes before proposing more.",
+        }
+    _propose_counter[company_id] = n + 1
+    return None
+
+
+def _allowlist(fields: dict | None, allowed: set) -> dict:
+    if not isinstance(fields, dict):
+        return {}
+    return {k: v for k, v in fields.items() if k in allowed}
+
+
+def _snapshot_dict(obj, fields: set) -> dict:
+    return {f: getattr(obj, f, None) for f in fields}
+
+
+def _queue(action: AgentAction, session) -> dict:
+    session.add(action)
+    session.commit()
+    return {
+        "queued":      True,
+        "action_id":   action.id,
+        "action_type": action.action_type,
+        "summary":     _summarise(action),
+    }
+
+
+def _summarise(action: AgentAction) -> str:
+    try:
+        p = json.loads(action.payload_json or "{}")
+    except Exception:
+        p = {}
+    if action.action_type == "update_item":
+        return f"Update item id={action.target_id} fields={list((p.get('fields') or {}).keys())}"
+    if action.action_type == "create_item":
+        return f"Create item part_number={p.get('part_number')}"
+    if action.action_type == "delete_item":
+        return f"Delete item id={action.target_id}"
+    if action.action_type == "update_supplier":
+        return f"Update supplier id={action.target_id} fields={list((p.get('fields') or {}).keys())}"
+    if action.action_type == "create_supplier":
+        return f"Create supplier code={p.get('code')}"
+    if action.action_type == "delete_supplier":
+        return f"Delete supplier id={action.target_id}"
+    if action.action_type == "create_buffer_adjustment":
+        return (f"Buffer adjustment item_id={p.get('item_id')} "
+                f"daf={p.get('daf', 1.0)} ltaf={p.get('ltaf', 1.0)} "
+                f"({p.get('start_date')} -> {p.get('end_date')})")
+    if action.action_type == "delete_buffer_adjustment":
+        return f"Delete buffer adjustment id={action.target_id}"
+    return action.action_type
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +318,191 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # -----------------------------------------------------------------------
+    # WRITE tools — every propose_* queues a change for human approval.
+    # No data changes until the user clicks Approve on the Pending Changes tab.
+    # -----------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_update_item",
+            "description": (
+                "Queue an update to an item's master data / DDMRP parameters. "
+                "The change is NOT applied immediately — it goes to a Pending "
+                "Changes queue for the user to Approve/Reject. Pass only "
+                "fields that should change; unknown keys are dropped. "
+                "Always state your reasoning in `reason`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "integer",
+                                "description": "Internal id of the item to update."},
+                    "fields":  {"type": "object",
+                                "description": "Dict of field → new value. "
+                                               "Allowed: adu, dlt, lead_time_factor, "
+                                               "variability_factor, min_order_qty, "
+                                               "order_cycle, on_hand, unit_cost, "
+                                               "buffer_profile_id, default_supplier_id, "
+                                               "description, category, item_type, etc."},
+                    "reason":  {"type": "string",
+                                "description": "Short explanation of why this change is proposed."},
+                },
+                "required": ["item_id", "fields", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_create_item",
+            "description": (
+                "Queue creation of a new item. Goes to the Pending Changes queue. "
+                "Provide `part_number` and any other allowed fields."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "part_number": {"type": "string"},
+                    "fields":      {"type": "object",
+                                    "description": "Allowed item fields (adu, dlt, "
+                                                   "description, category, …)."},
+                    "reason":      {"type": "string"},
+                },
+                "required": ["part_number", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_delete_item",
+            "description": (
+                "Queue deletion of an item. The applier will refuse if BOM lines, "
+                "demand entries, or supply entries reference the item."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "integer"},
+                    "reason":  {"type": "string"},
+                },
+                "required": ["item_id", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_create_buffer_adjustment",
+            "description": (
+                "Queue a new time-bounded buffer adjustment (DAF/LTAF/ZAF) for an "
+                "item. A factor of 1.0 = neutral. end_date may be null (open-ended)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":    {"type": "integer"},
+                    "start_date": {"type": "string",
+                                   "description": "YYYY-MM-DD"},
+                    "end_date":   {"type": ["string", "null"],
+                                   "description": "YYYY-MM-DD or null for open-ended"},
+                    "daf":        {"type": "number", "description": "Demand Adj Factor × ADU (default 1.0)"},
+                    "ltaf":       {"type": "number", "description": "Lead-Time Adj Factor × DLT (default 1.0)"},
+                    "red_zaf":    {"type": "number"},
+                    "yellow_zaf": {"type": "number"},
+                    "green_zaf":  {"type": "number"},
+                    "note":       {"type": "string"},
+                    "reason":     {"type": "string"},
+                },
+                "required": ["item_id", "start_date", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_delete_buffer_adjustment",
+            "description": "Queue deletion of an existing buffer adjustment by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "adjustment_id": {"type": "integer"},
+                    "reason":        {"type": "string"},
+                },
+                "required": ["adjustment_id", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_update_supplier",
+            "description": (
+                "Queue an update to a supplier's master data (reliability, lead "
+                "time, contacts, payment terms, …)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "supplier_id": {"type": "integer"},
+                    "fields":      {"type": "object"},
+                    "reason":      {"type": "string"},
+                },
+                "required": ["supplier_id", "fields", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_create_supplier",
+            "description": "Queue creation of a new supplier. `code` is mandatory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code":   {"type": "string"},
+                    "fields": {"type": "object"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["code", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_delete_supplier",
+            "description": (
+                "Queue deletion of a supplier. Refused if any item references it "
+                "as its default supplier."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "supplier_id": {"type": "integer"},
+                    "reason":      {"type": "string"},
+                },
+                "required": ["supplier_id", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_pending_actions",
+            "description": (
+                "List currently pending write proposals for the company (queue state)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -363,6 +635,267 @@ def _t_render_chart(company_id: int, **kwargs) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# WRITE tools — queue pending AgentAction rows for human approval
+# ---------------------------------------------------------------------------
+
+def _t_propose_update_item(company_id: int, user_id: int | None = None,
+                           item_id: int = 0, fields: dict | None = None,
+                           reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        it = session.query(Item).get(int(item_id))
+        if it is None:
+            return {"error": f"Item id={item_id} not found"}
+        if it.company_id != company_id:
+            return {"error": "Cross-company access blocked"}
+        cleaned = _allowlist(fields, ITEM_FIELDS)
+        if not cleaned:
+            return {"error": "No valid fields to update",
+                    "hint": f"Allowed: {sorted(ITEM_FIELDS)}"}
+        before = _snapshot_dict(it, ITEM_FIELDS) | {"id": it.id, "part_number": it.part_number}
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="update_item", target_table="items", target_id=it.id,
+            payload_json=json.dumps({"fields": cleaned}, default=str),
+            before_json=json.dumps(before, default=str),
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_create_item(company_id: int, user_id: int | None = None,
+                           part_number: str = "", fields: dict | None = None,
+                           reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not part_number:
+        return {"error": "part_number is required"}
+    cleaned = _allowlist(fields, ITEM_FIELDS)
+    cleaned["part_number"] = str(part_number).strip().upper()
+    session = SessionLocal()
+    try:
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="create_item", target_table="items", target_id=None,
+            payload_json=json.dumps({"part_number": cleaned["part_number"],
+                                     "fields": cleaned}, default=str),
+            before_json=None,
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_delete_item(company_id: int, user_id: int | None = None,
+                           item_id: int = 0, reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        it = session.query(Item).get(int(item_id))
+        if it is None:
+            return {"error": f"Item id={item_id} not found"}
+        if it.company_id != company_id:
+            return {"error": "Cross-company access blocked"}
+        before = _snapshot_dict(it, ITEM_FIELDS) | {"id": it.id, "part_number": it.part_number}
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="delete_item", target_table="items", target_id=it.id,
+            payload_json=json.dumps({}, default=str),
+            before_json=json.dumps(before, default=str),
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_create_buffer_adjustment(company_id: int, user_id: int | None = None,
+                                        item_id: int = 0,
+                                        start_date: str = "", end_date: str | None = None,
+                                        daf: float = 1.0, ltaf: float = 1.0,
+                                        red_zaf: float = 1.0, yellow_zaf: float = 1.0,
+                                        green_zaf: float = 1.0, note: str = "",
+                                        reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not item_id or not start_date:
+        return {"error": "item_id and start_date are required"}
+    session = SessionLocal()
+    try:
+        it = session.query(Item).get(int(item_id))
+        if it is None:
+            return {"error": f"Item id={item_id} not found"}
+        if it.company_id != company_id:
+            return {"error": "Cross-company access blocked"}
+        payload = {
+            "item_id":    int(item_id),
+            "start_date": start_date,
+            "end_date":   end_date,
+            "daf":        float(daf),
+            "ltaf":       float(ltaf),
+            "red_zaf":    float(red_zaf),
+            "yellow_zaf": float(yellow_zaf),
+            "green_zaf":  float(green_zaf),
+            "note":       str(note or "").strip(),
+        }
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="create_buffer_adjustment",
+            target_table="buffer_adjustments", target_id=None,
+            payload_json=json.dumps(payload, default=str),
+            before_json=None,
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_delete_buffer_adjustment(company_id: int, user_id: int | None = None,
+                                        adjustment_id: int = 0, reason: str = "",
+                                        **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not adjustment_id:
+        return {"error": "adjustment_id is required"}
+    session = SessionLocal()
+    try:
+        adj = session.query(BufferAdjustment).get(int(adjustment_id))
+        if adj is None:
+            return {"error": f"BufferAdjustment id={adjustment_id} not found"}
+        it = session.query(Item).get(adj.item_id)
+        if it is None or it.company_id != company_id:
+            return {"error": "Cross-company access blocked"}
+        before = _snapshot_dict(adj, BUFFER_ADJ_FIELDS) | {"id": adj.id}
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="delete_buffer_adjustment",
+            target_table="buffer_adjustments", target_id=adj.id,
+            payload_json=json.dumps({}, default=str),
+            before_json=json.dumps(before, default=str),
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_update_supplier(company_id: int, user_id: int | None = None,
+                               supplier_id: int = 0, fields: dict | None = None,
+                               reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not supplier_id:
+        return {"error": "supplier_id is required"}
+    session = SessionLocal()
+    try:
+        s = session.query(Supplier).get(int(supplier_id))
+        if s is None:
+            return {"error": f"Supplier id={supplier_id} not found"}
+        if s.company_id != company_id:
+            return {"error": "Cross-company access blocked"}
+        cleaned = _allowlist(fields, SUPPLIER_FIELDS)
+        if not cleaned:
+            return {"error": "No valid fields to update",
+                    "hint": f"Allowed: {sorted(SUPPLIER_FIELDS)}"}
+        before = _snapshot_dict(s, SUPPLIER_FIELDS) | {"id": s.id, "code": s.code}
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="update_supplier", target_table="suppliers", target_id=s.id,
+            payload_json=json.dumps({"fields": cleaned}, default=str),
+            before_json=json.dumps(before, default=str),
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_create_supplier(company_id: int, user_id: int | None = None,
+                               code: str = "", fields: dict | None = None,
+                               reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not code:
+        return {"error": "code is required"}
+    cleaned = _allowlist(fields, SUPPLIER_FIELDS)
+    cleaned["code"] = str(code).strip()
+    session = SessionLocal()
+    try:
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="create_supplier", target_table="suppliers", target_id=None,
+            payload_json=json.dumps({"code": cleaned["code"],
+                                     "fields": cleaned}, default=str),
+            before_json=None,
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_delete_supplier(company_id: int, user_id: int | None = None,
+                               supplier_id: int = 0, reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not supplier_id:
+        return {"error": "supplier_id is required"}
+    session = SessionLocal()
+    try:
+        s = session.query(Supplier).get(int(supplier_id))
+        if s is None:
+            return {"error": f"Supplier id={supplier_id} not found"}
+        if s.company_id != company_id:
+            return {"error": "Cross-company access blocked"}
+        before = _snapshot_dict(s, SUPPLIER_FIELDS) | {"id": s.id, "code": s.code}
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="delete_supplier", target_table="suppliers", target_id=s.id,
+            payload_json=json.dumps({}, default=str),
+            before_json=json.dumps(before, default=str),
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_list_pending_actions(company_id: int, limit: int = 20, **_) -> dict:
+    session = SessionLocal()
+    try:
+        rows = (session.query(AgentAction)
+                .filter(AgentAction.company_id == company_id,
+                        AgentAction.status == "pending")
+                .order_by(AgentAction.created_at.desc())
+                .limit(max(1, int(limit)))
+                .all())
+        out = []
+        for a in rows:
+            out.append({
+                "action_id":   a.id,
+                "action_type": a.action_type,
+                "target_table":a.target_table,
+                "target_id":   a.target_id,
+                "reason":      a.reason or "",
+                "created_at":  a.created_at.isoformat() if a.created_at else None,
+            })
+        return {"count": len(out), "items": out}
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
 
@@ -378,6 +911,16 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
     "run_skill":               _t_run_skill,
     "propose_value_reduction": _t_propose_value_reduction,
     "render_chart":            _t_render_chart,
+    # Write tools — queue pending changes for human approval
+    "propose_update_item":              _t_propose_update_item,
+    "propose_create_item":              _t_propose_create_item,
+    "propose_delete_item":              _t_propose_delete_item,
+    "propose_create_buffer_adjustment": _t_propose_create_buffer_adjustment,
+    "propose_delete_buffer_adjustment": _t_propose_delete_buffer_adjustment,
+    "propose_update_supplier":          _t_propose_update_supplier,
+    "propose_create_supplier":          _t_propose_create_supplier,
+    "propose_delete_supplier":          _t_propose_delete_supplier,
+    "list_pending_actions":             _t_list_pending_actions,
 }
 
 
@@ -409,6 +952,29 @@ TOOL_NAME_ALIASES = {
     "chart":                   "render_chart",
     "draw_chart":              "render_chart",
     "plot":                    "render_chart",
+    # write-tool aliases
+    "update_item":                  "propose_update_item",
+    "modify_item":                  "propose_update_item",
+    "edit_item":                    "propose_update_item",
+    "create_item":                  "propose_create_item",
+    "add_item":                     "propose_create_item",
+    "delete_item":                  "propose_delete_item",
+    "remove_item":                  "propose_delete_item",
+    "update_supplier":              "propose_update_supplier",
+    "modify_supplier":              "propose_update_supplier",
+    "edit_supplier":                "propose_update_supplier",
+    "create_supplier":              "propose_create_supplier",
+    "add_supplier":                 "propose_create_supplier",
+    "delete_supplier":              "propose_delete_supplier",
+    "remove_supplier":              "propose_delete_supplier",
+    "create_buffer_adjustment":     "propose_create_buffer_adjustment",
+    "add_buffer_adjustment":        "propose_create_buffer_adjustment",
+    "add_adjustment":               "propose_create_buffer_adjustment",
+    "delete_buffer_adjustment":     "propose_delete_buffer_adjustment",
+    "remove_buffer_adjustment":     "propose_delete_buffer_adjustment",
+    "list_pending":                 "list_pending_actions",
+    "pending_actions":              "list_pending_actions",
+    "pending_changes":              "list_pending_actions",
 }
 
 
@@ -461,6 +1027,7 @@ def parse_inline_tool_calls(text: str) -> list[tuple[str, dict]]:
 
 
 def dispatch(name: str, *, company_id: int, model: str, api_key: str,
+             user_id: int | None = None,
              arguments: dict | None = None) -> dict:
     """
     Execute a tool by name. Always returns a JSON-serialisable dict.
@@ -474,7 +1041,8 @@ def dispatch(name: str, *, company_id: int, model: str, api_key: str,
                 "hint":  f"Valid tools: {sorted(TOOL_FUNCTIONS.keys())}"}
     args = arguments or {}
     try:
-        return fn(company_id=company_id, model=model, api_key=api_key, **args)
+        return fn(company_id=company_id, model=model, api_key=api_key,
+                  user_id=user_id, **args)
     except TypeError as exc:
         return {"error": f"Bad arguments for {canonical}: {exc}"}
     except Exception as exc:

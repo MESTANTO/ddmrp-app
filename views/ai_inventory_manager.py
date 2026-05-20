@@ -24,6 +24,7 @@ import plotly.express as px
 import streamlit as st
 
 from agents import chat_tools
+from agents.action_applier import apply_action, reject_action
 from agents.inventory_agent import ANALYSIS_CATEGORIES
 from agents.llm_client import (
     DEFAULT_MODEL,
@@ -32,7 +33,16 @@ from agents.llm_client import (
     get_api_key,
 )
 from database.auth import get_company_id, get_current_user
-from database.db import SessionLocal, AgentRun, AgentSignal, _migrate_agent_tables
+from database.db import (
+    AgentAction,
+    AgentRun,
+    AgentSignal,
+    BufferAdjustment,
+    Item,
+    SessionLocal,
+    Supplier,
+    _migrate_agent_tables,
+)
 
 
 def _ensure_agent_schema():
@@ -167,16 +177,24 @@ def show():
         model = override.strip() if override.strip() else DEFAULT_MODEL
         st.divider()
 
-    tab_struct, tab_chat = st.tabs([
+    pending_count = _count_pending_actions(company_id)
+    pending_label = (f"🛠️ Pending Changes ({pending_count})"
+                     if pending_count else "🛠️ Pending Changes")
+
+    tab_struct, tab_chat, tab_pending = st.tabs([
         "📊 Structured Analysis (8 skills)",
         "💬 Chat",
+        pending_label,
     ])
 
     with tab_struct:
         _show_structured_tab(company_id, user_id, model, api_key)
 
     with tab_chat:
-        _show_chat_tab(company_id, model, api_key)
+        _show_chat_tab(company_id, user_id, model, api_key)
+
+    with tab_pending:
+        _show_pending_tab(company_id, user_id)
 
 
 # ===========================================================================
@@ -317,13 +335,47 @@ as a single line of text exactly like:
 
 — one tool per `<tool_call>` block, valid JSON inside. The app parses
 both formats. Never invent tool names not listed above.
+
+---
+
+**WRITE TOOLS — Pending Changes queue**
+
+You can also propose changes to the app's data using `propose_*` tools.
+These DO NOT take effect immediately: they queue an entry on the
+Pending Changes tab, where the user reviews and clicks Approve or
+Reject. Always state your reasoning in the `reason` argument — that text
+is shown to the user on the approval card.
+
+- `propose_update_item(item_id, fields, reason)` — change item master data /
+  DDMRP params (adu, dlt, lead_time_factor, variability_factor,
+  min_order_qty, on_hand, unit_cost, default_supplier_id, ...).
+- `propose_create_item(part_number, fields, reason)` / `propose_delete_item`.
+- `propose_update_supplier(supplier_id, fields, reason)` — reliability_pct,
+  lead_time_days, contacts, etc.
+- `propose_create_supplier(code, fields, reason)` / `propose_delete_supplier`.
+- `propose_create_buffer_adjustment(item_id, daf, ltaf, red_zaf,
+  yellow_zaf, green_zaf, start_date, end_date, note, reason)`.
+- `propose_delete_buffer_adjustment(adjustment_id, reason)`.
+- `list_pending_actions(limit)` — show what is currently queued.
+
+Hard rules for write tools:
+1. Never propose more than ~3 changes in one turn. After queueing, stop
+   and tell the user where to review them. The system hard-caps you at
+   10 per turn.
+2. Always inspect current data via a read tool first (e.g. for item_id
+   look-ups). Never invent ids.
+3. State the WHY in `reason` ("ADU drift +38% vs stored", "supplier
+   reliability dropped to 60% per last 90 days", ...).
+4. When the user explicitly asks you to change something, propose it.
+   When you discover an issue, suggest it in plain English and ask the
+   user if they want you to queue a proposal.
 """
 
 
-def _show_chat_tab(company_id: int, model: str, api_key: str):
+def _show_chat_tab(company_id: int, user_id: int, model: str, api_key: str):
     # Initialise per-session state buckets
     st.session_state.setdefault("aim_chat_messages", [])  # display messages
-    st.session_state.setdefault("aim_chat_charts",   {})  # idx → list of chart specs
+    st.session_state.setdefault("aim_chat_charts",   {})  # idx -> list of chart specs
 
     # Header / controls row
     c_refresh, c_clear = st.columns([1, 1])
@@ -342,7 +394,7 @@ def _show_chat_tab(company_id: int, model: str, api_key: str):
     for i, (label, prompt) in enumerate(QUICK_PROMPTS):
         if btn_cols[i % 3].button(label, key=f"aim_qp_{i}",
                                   use_container_width=True):
-            _handle_user_turn(prompt, company_id, model, api_key)
+            _handle_user_turn(prompt, company_id, user_id, model, api_key)
             st.rerun()
 
     st.divider()
@@ -356,19 +408,23 @@ def _show_chat_tab(company_id: int, model: str, api_key: str):
                 _render_chart_spec(spec)
 
     # ── Input ─────────────────────────────────────────────────────────
-    user_input = st.chat_input("Ask anything about your inventory…")
+    user_input = st.chat_input("Ask anything about your inventory...")
     if user_input:
-        _handle_user_turn(user_input, company_id, model, api_key)
+        _handle_user_turn(user_input, company_id, user_id, model, api_key)
         st.rerun()
 
 
-def _handle_user_turn(user_text: str, company_id: int, model: str, api_key: str):
+def _handle_user_turn(user_text: str, company_id: int, user_id: int,
+                      model: str, api_key: str):
     """
     Append the user message, run the tool-calling loop, append the assistant
     message and any chart specs to session state. Renders happen on rerun.
     """
     msgs = st.session_state["aim_chat_messages"]
     msgs.append({"role": "user", "content": user_text})
+
+    # Reset the per-turn propose-tool rate-limit counter
+    chat_tools.reset_propose_counter(company_id)
 
     # Build API messages — keep the last 8 turns to bound context
     history_for_api = []
@@ -380,10 +436,11 @@ def _handle_user_turn(user_text: str, company_id: int, model: str, api_key: str)
         *history_for_api,
     ]
 
-    with st.spinner(f"Asking {model.split('/')[-1]}…"):
+    with st.spinner(f"Asking {model.split('/')[-1]}..."):
         try:
             assistant_text, chart_specs = _run_tool_loop(
-                api_messages, model=model, company_id=company_id, api_key=api_key,
+                api_messages, model=model, company_id=company_id,
+                user_id=user_id, api_key=api_key,
             )
         except Exception as exc:
             assistant_text = f"❌ {type(exc).__name__}: {exc}"
@@ -395,7 +452,8 @@ def _handle_user_turn(user_text: str, company_id: int, model: str, api_key: str)
 
 
 def _run_tool_loop(
-    api_messages: list[dict], *, model: str, company_id: int, api_key: str,
+    api_messages: list[dict], *, model: str, company_id: int,
+    user_id: int, api_key: str,
     max_iter: int = 6,
 ) -> tuple[str, list[dict]]:
     """
@@ -472,7 +530,7 @@ def _run_tool_loop(
 
             result = chat_tools.dispatch(
                 name, company_id=company_id, model=model,
-                api_key=api_key, arguments=args,
+                api_key=api_key, user_id=user_id, arguments=args,
             )
 
             canonical = chat_tools.resolve_tool_name(name)
@@ -492,7 +550,7 @@ def _run_tool_loop(
         for canonical, args in inline_calls:
             result = chat_tools.dispatch(
                 canonical, company_id=company_id, model=model,
-                api_key=api_key, arguments=args,
+                api_key=api_key, user_id=user_id, arguments=args,
             )
             if canonical == "render_chart":
                 chart_specs.append(args)
@@ -941,3 +999,207 @@ def _show_signal_detail(sig: dict, company_id: int, user_id: int):
             at = sig["actioned_at"]
             ts = at.strftime("%Y-%m-%d %H:%M") if at else "unknown time"
             st.success(f"Actioned on {ts}")
+
+
+# ===========================================================================
+# TAB 3 — Pending Changes (write-tool approval queue)
+# ===========================================================================
+
+def _count_pending_actions(company_id: int) -> int:
+    session = SessionLocal()
+    try:
+        return (session.query(AgentAction)
+                .filter(AgentAction.company_id == company_id,
+                        AgentAction.status == "pending")
+                .count())
+    except Exception:
+        return 0
+    finally:
+        session.close()
+
+
+def _load_actions(company_id: int, statuses: tuple[str, ...] | None = None,
+                  limit: int = 200) -> list[dict]:
+    session = SessionLocal()
+    try:
+        q = (session.query(AgentAction)
+             .filter(AgentAction.company_id == company_id))
+        if statuses:
+            q = q.filter(AgentAction.status.in_(statuses))
+        q = q.order_by(AgentAction.created_at.desc()).limit(limit)
+        out: list[dict] = []
+        for a in q.all():
+            out.append({c.name: getattr(a, c.name) for c in a.__table__.columns})
+        return out
+    finally:
+        session.close()
+
+
+def _resolve_target_label(target_table: str, target_id: int | None) -> str:
+    """Pretty label like 'P-1234' or 'ACME-01' resolved at render time."""
+    if not target_id:
+        return "(new)"
+    session = SessionLocal()
+    try:
+        if target_table == "items":
+            it = session.query(Item).get(target_id)
+            return it.part_number if it else f"item#{target_id}"
+        if target_table == "suppliers":
+            s = session.query(Supplier).get(target_id)
+            return s.code if s else f"supplier#{target_id}"
+        if target_table == "buffer_adjustments":
+            adj = session.query(BufferAdjustment).get(target_id)
+            if adj is None:
+                return f"adj#{target_id}"
+            it = session.query(Item).get(adj.item_id)
+            return f"adj#{adj.id} ({it.part_number if it else '?'})"
+    except Exception:
+        pass
+    finally:
+        session.close()
+    return f"{target_table}#{target_id}"
+
+
+def _show_pending_tab(company_id: int, user_id: int):
+    st.caption(
+        "Changes proposed by the chat agent land here for review. Approve to "
+        "apply through the same write paths the UI uses. Reject leaves data "
+        "untouched. Every action keeps a before/after audit trail."
+    )
+
+    pending = _load_actions(company_id, statuses=("pending",))
+    history = _load_actions(company_id, statuses=("applied", "rejected", "failed"))
+
+    if not pending and not history:
+        st.info("No agent actions yet. Ask the chat to propose a change "
+                "(e.g. *'Set ADU of P-1234 to 2.5'*) and it will show up here.")
+        return
+
+    # Pending section
+    st.subheader(f"🛠️ Pending ({len(pending)})")
+    if not pending:
+        st.caption("Nothing to review right now.")
+    else:
+        for a in pending:
+            _render_pending_card(a, company_id, user_id)
+
+    # History section
+    st.divider()
+    with st.expander(f"📚 History ({len(history)})", expanded=False):
+        if not history:
+            st.caption("No applied or rejected actions yet.")
+        else:
+            rows = []
+            for a in history:
+                rows.append({
+                    "When":    a["applied_at"].strftime("%Y-%m-%d %H:%M") if a.get("applied_at")
+                               else (a["created_at"].strftime("%Y-%m-%d %H:%M") if a.get("created_at") else ""),
+                    "Status":  a["status"],
+                    "Action":  a["action_type"],
+                    "Target":  _resolve_target_label(a["target_table"], a.get("target_id")),
+                    "Reason":  (a.get("reason") or "")[:80],
+                    "Notes":   (a.get("notes")  or "")[:80],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _render_pending_card(a: dict, company_id: int, user_id: int):
+    aid          = a["id"]
+    action_type  = a["action_type"]
+    target_label = _resolve_target_label(a["target_table"], a.get("target_id"))
+    created      = a["created_at"].strftime("%Y-%m-%d %H:%M") if a.get("created_at") else "-"
+
+    title = f"{_action_icon(action_type)}  {action_type} — {target_label}  ·  {created}"
+    with st.expander(title, expanded=False):
+        reason = (a.get("reason") or "").strip()
+        if reason:
+            st.markdown(f"**Reason:** {reason}")
+        else:
+            st.caption("_(no reason provided by the agent)_")
+
+        try:
+            payload = json.loads(a.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        try:
+            before = json.loads(a.get("before_json") or "{}") if a.get("before_json") else None
+        except Exception:
+            before = None
+
+        if action_type in ("update_item", "update_supplier") and before:
+            fields = payload.get("fields") or {}
+            if fields:
+                diff_rows = []
+                for k, new_v in fields.items():
+                    old_v = before.get(k)
+                    if old_v == new_v:
+                        continue
+                    diff_rows.append({"Field": k,
+                                      "Before": _fmt_val(old_v),
+                                      "After":  _fmt_val(new_v)})
+                if diff_rows:
+                    st.markdown("**Proposed changes:**")
+                    st.dataframe(pd.DataFrame(diff_rows),
+                                 use_container_width=True, hide_index=True)
+                else:
+                    st.caption("_(no field changes — same values)_")
+            else:
+                st.caption("_(empty fields dict)_")
+        elif action_type in ("create_item", "create_supplier",
+                             "create_buffer_adjustment"):
+            st.markdown("**Proposed new record:**")
+            display = payload.get("fields") if "fields" in payload else payload
+            st.json(display, expanded=False)
+        elif action_type in ("delete_item", "delete_supplier",
+                             "delete_buffer_adjustment"):
+            st.markdown("**Record to delete:**")
+            st.json(before or {}, expanded=False)
+
+        # Approve / Reject controls
+        col_app, col_rej, _ = st.columns([1, 1, 4])
+        approve_key = f"aim_approve_{aid}"
+        reject_key  = f"aim_reject_{aid}"
+        reason_key  = f"aim_reject_reason_{aid}"
+
+        if col_app.button("✅ Approve", key=approve_key, type="primary"):
+            res = apply_action(aid)
+            if res.get("ok"):
+                if res.get("already_applied"):
+                    st.info(f"Already {res.get('status')}.")
+                else:
+                    st.success("Applied.")
+            else:
+                st.error(f"Failed: {res.get('error', 'unknown error')}")
+            st.rerun()
+
+        st.text_input("Rejection reason (optional)",
+                      key=reason_key, label_visibility="collapsed",
+                      placeholder="Rejection reason (optional)")
+        if col_rej.button("❌ Reject", key=reject_key):
+            res = reject_action(aid, st.session_state.get(reason_key, ""))
+            if res.get("ok"):
+                st.info("Rejected.")
+            else:
+                st.error(f"Failed: {res.get('error', 'unknown error')}")
+            st.rerun()
+
+
+def _action_icon(action_type: str) -> str:
+    return {
+        "update_item":              "✏️",
+        "create_item":              "➕",
+        "delete_item":              "🗑️",
+        "update_supplier":          "✏️",
+        "create_supplier":          "➕",
+        "delete_supplier":          "🗑️",
+        "create_buffer_adjustment": "🎚️",
+        "delete_buffer_adjustment": "🗑️",
+    }.get(action_type, "🔧")
+
+
+def _fmt_val(v) -> str:
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
