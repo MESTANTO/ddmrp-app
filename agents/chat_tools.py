@@ -490,6 +490,68 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "lookup_item",
+            "description": (
+                "Resolve an item's numeric id from its part_number. Returns "
+                "{id, part_number, description, adu, dlt, on_hand, unit_cost, "
+                "default_supplier_id, ...} for the matching row, or "
+                "{error: 'not found'} if no item matches. Use this before "
+                "calling propose_update_item / propose_delete_item / "
+                "propose_create_buffer_adjustment when you only have the "
+                "part_number from a read tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "part_number": {"type": "string",
+                                    "description": "Exact part number (case-insensitive)."},
+                },
+                "required": ["part_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_supplier",
+            "description": (
+                "Resolve a supplier's numeric id from its code. Returns "
+                "{id, code, name, reliability_pct, lead_time_days, ...} or "
+                "{error: 'not found'}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_items",
+            "description": (
+                "List items with their numeric id + part_number + description "
+                "for the company. Use this when you need to find an item id "
+                "but `lookup_item` by exact part_number didn't match. Supports "
+                "optional substring filter on part_number/description."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filter": {"type": "string",
+                               "description": "Optional substring filter on part_number or description."},
+                    "limit":  {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_pending_actions",
             "description": (
                 "List currently pending write proposals for the company (queue state)."
@@ -871,6 +933,92 @@ def _t_propose_delete_supplier(company_id: int, user_id: int | None = None,
         session.close()
 
 
+def _t_lookup_item(company_id: int, part_number: str = "", **_) -> dict:
+    """Resolve an item by exact part_number (case-insensitive)."""
+    if not part_number:
+        return {"error": "part_number is required"}
+    pn = str(part_number).strip().upper()
+    session = SessionLocal()
+    try:
+        from sqlalchemy import func as _func
+        it = (session.query(Item)
+              .filter(Item.company_id == company_id,
+                      _func.upper(Item.part_number) == pn)
+              .first())
+        if it is None:
+            return {"error": "not found", "part_number": pn,
+                    "hint": "Try list_items(filter=...) to search by substring."}
+        return {
+            "id":                  it.id,
+            "part_number":         it.part_number,
+            "description":         it.description,
+            "adu":                 it.adu,
+            "dlt":                 it.dlt,
+            "lead_time_factor":    it.lead_time_factor,
+            "variability_factor":  it.variability_factor,
+            "min_order_qty":       it.min_order_qty,
+            "order_cycle":         it.order_cycle,
+            "on_hand":             it.on_hand,
+            "unit_cost":           it.unit_cost,
+            "category":            it.category,
+            "item_type":           it.item_type,
+            "default_supplier_id": it.default_supplier_id,
+            "buffer_profile_id":   it.buffer_profile_id,
+        }
+    finally:
+        session.close()
+
+
+def _t_lookup_supplier(company_id: int, code: str = "", **_) -> dict:
+    """Resolve a supplier by exact code (case-insensitive)."""
+    if not code:
+        return {"error": "code is required"}
+    c = str(code).strip().upper()
+    session = SessionLocal()
+    try:
+        from sqlalchemy import func as _func
+        s = (session.query(Supplier)
+             .filter(Supplier.company_id == company_id,
+                     _func.upper(Supplier.code) == c)
+             .first())
+        if s is None:
+            return {"error": "not found", "code": c}
+        return {
+            "id":               s.id,
+            "code":             s.code,
+            "name":             s.name,
+            "reliability_pct":  s.reliability_pct,
+            "lead_time_days":   s.lead_time_days,
+            "payment_terms":    s.payment_terms,
+            "contact_email":    s.contact_email,
+        }
+    finally:
+        session.close()
+
+
+def _t_list_items(company_id: int, filter: str = "", limit: int = 50, **_) -> dict:
+    """List items for the company, optionally filtering by part_number/description substring."""
+    session = SessionLocal()
+    try:
+        q = session.query(Item.id, Item.part_number, Item.description).filter(
+            Item.company_id == company_id
+        )
+        if filter:
+            like = f"%{filter.strip()}%"
+            from sqlalchemy import or_
+            q = q.filter(
+                or_(Item.part_number.ilike(like), Item.description.ilike(like))
+            )
+        rows = q.order_by(Item.part_number).limit(max(1, int(limit))).all()
+        return {
+            "count": len(rows),
+            "items": [{"id": r.id, "part_number": r.part_number,
+                        "description": r.description} for r in rows],
+        }
+    finally:
+        session.close()
+
+
 def _t_list_pending_actions(company_id: int, limit: int = 20, **_) -> dict:
     session = SessionLocal()
     try:
@@ -921,6 +1069,10 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
     "propose_create_supplier":          _t_propose_create_supplier,
     "propose_delete_supplier":          _t_propose_delete_supplier,
     "list_pending_actions":             _t_list_pending_actions,
+    # Lookup / search tools — bridge part_number → numeric id
+    "lookup_item":                      _t_lookup_item,
+    "lookup_supplier":                  _t_lookup_supplier,
+    "list_items":                       _t_list_items,
 }
 
 
@@ -975,6 +1127,15 @@ TOOL_NAME_ALIASES = {
     "list_pending":                 "list_pending_actions",
     "pending_actions":              "list_pending_actions",
     "pending_changes":              "list_pending_actions",
+    # lookup aliases
+    "get_item":                     "lookup_item",
+    "find_item":                    "lookup_item",
+    "resolve_item":                 "lookup_item",
+    "get_supplier":                 "lookup_supplier",
+    "find_supplier":                "lookup_supplier",
+    "resolve_supplier":             "lookup_supplier",
+    "search_items":                 "list_items",
+    "get_items":                    "list_items",
 }
 
 

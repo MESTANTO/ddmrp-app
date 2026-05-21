@@ -358,12 +358,24 @@ is shown to the user on the approval card.
 - `propose_delete_buffer_adjustment(adjustment_id, reason)`.
 - `list_pending_actions(limit)` — show what is currently queued.
 
+**LOOKUP TOOLS — resolve part_number → numeric id before proposing**
+
+Read tools (list_demand_trends, list_data_quality, etc.) return
+`part_number` strings. Propose tools need the numeric `item_id` or
+`supplier_id`. Use these helpers first:
+
+- `lookup_item(part_number)` — returns {id, part_number, adu, dlt, ...}
+  for an exact match (case-insensitive).  If not found, use:
+- `list_items(filter, limit)` — substring search on part_number or
+  description; returns [{id, part_number, description}, ...].
+- `lookup_supplier(code)` — returns {id, code, reliability_pct, ...}.
+
 Hard rules for write tools:
-1. Never propose more than ~3 changes in one turn. After queueing, stop
+1. ALWAYS call `lookup_item` (or `list_items`) to get the numeric id
+   before calling any `propose_*` tool — never invent ids.
+2. Never propose more than ~3 changes in one turn. After queueing, stop
    and tell the user where to review them. The system hard-caps you at
    10 per turn.
-2. Always inspect current data via a read tool first (e.g. for item_id
-   look-ups). Never invent ids.
 3. State the WHY in `reason` ("ADU drift +38% vs stored", "supplier
    reliability dropped to 60% per last 90 days", ...).
 4. When the user explicitly asks you to change something, propose it.
