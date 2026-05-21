@@ -66,6 +66,11 @@ from modules.positioning_engine import (
     score_positioning as _score_positioning,
 )
 from modules.classification import compute_abc_xyz as _compute_abc_xyz
+from modules.forecasting import (
+    forecast_item as _forecast_item,
+    seasonal_analysis_item as _seasonal_analysis_item,
+    accuracy_report_item as _accuracy_report_item,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -303,17 +308,17 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "run_skill",
             "description": (
-                "Run one of the 8 focused inventory analyses (a single LLM-backed "
+                "Run one of the 9 focused inventory analyses (a single LLM-backed "
                 "skill) and return its parsed signals. Skills: 1=data_quality, "
                 "2=buffer_nfp, 3=abc_xyz, 4=demand_variability, 5=safety_stock, "
-                "6=overstock, 7=supplier_risk, 8=value_reduction. Use when the user "
-                "asks for a full analysis of a specific area."
+                "6=overstock, 7=supplier_risk, 8=value_reduction, "
+                "9=demand_forecasting. Use when the user asks for a full analysis."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "skill_id": {"type": "integer", "minimum": 1, "maximum": 8,
-                                 "description": "Skill number 1–8."},
+                    "skill_id": {"type": "integer", "minimum": 1, "maximum": 9,
+                                 "description": "Skill number 1–9 (9=Demand Forecasting)."},
                 },
                 "required": ["skill_id"],
             },
@@ -799,6 +804,82 @@ TOOL_SCHEMAS: list[dict] = [
                 "Writes directly — no approval needed."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    # -----------------------------------------------------------------------
+    # FORECASTING TOOLS
+    # -----------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "forecast_item_demand",
+            "description": (
+                "Forecast future demand for one item using the selected method. "
+                "Returns the demand history (monthly), next N forecast periods with "
+                "±1σ confidence bands, mean, std, CV, seasonal indices (if ≥12 months "
+                "of data), and trend slope. Methods: sma_3 (3-month SMA), sma_6, "
+                "wma (weighted 45/35/20%), seasonal (SMA × monthly index), trend "
+                "(linear projection)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":        {"type": "integer"},
+                    "method":         {"type": "string", "default": "sma_3",
+                                       "enum": ["sma_3", "sma_6", "wma", "seasonal", "trend"],
+                                       "description": "Forecasting method to use."},
+                    "periods":        {"type": "integer", "default": 3,
+                                       "minimum": 1, "maximum": 12,
+                                       "description": "Number of future months to forecast."},
+                    "lookback_months":{"type": "integer", "default": 24,
+                                       "minimum": 3, "maximum": 60},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "item_seasonality_analysis",
+            "description": (
+                "Compute monthly seasonal indices (Jan–Dec) for one item and "
+                "identify peak months (index ≥1.2) and trough months (index ≤0.8). "
+                "Requires ≥12 months of demand history for reliable results."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":        {"type": "integer"},
+                    "lookback_months":{"type": "integer", "default": 36,
+                                       "minimum": 12, "maximum": 72},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forecast_accuracy_report",
+            "description": (
+                "Walk-forward accuracy report: computes what the forecast would "
+                "have predicted for the last N months vs actual demand. Returns "
+                "MAE, MAPE (%), and bias per period. MAPE < 10% = good, 10–20% = "
+                "acceptable, > 20% = poor."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":        {"type": "integer"},
+                    "method":         {"type": "string", "default": "sma_3",
+                                       "enum": ["sma_3", "sma_6", "wma", "seasonal"]},
+                    "holdout_months": {"type": "integer", "default": 3,
+                                       "minimum": 1, "maximum": 12},
+                    "lookback_months":{"type": "integer", "default": 24},
+                },
+                "required": ["item_id"],
+            },
         },
     },
     {
@@ -1454,6 +1535,56 @@ def _t_propose_apply_item_params(company_id: int, user_id: int | None = None,
         session.close()
 
 
+def _t_forecast_item_demand(company_id: int, item_id: int = 0,
+                             method: str = "sma_3", periods: int = 3,
+                             lookback_months: int = 24, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        result = _forecast_item(item, method=method, periods=int(periods),
+                                lookback_months=int(lookback_months))
+        return _dc_to_dict(result)
+    finally:
+        session.close()
+
+
+def _t_item_seasonality_analysis(company_id: int, item_id: int = 0,
+                                  lookback_months: int = 36, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        result = _seasonal_analysis_item(item, lookback_months=int(lookback_months))
+        return _dc_to_dict(result)
+    finally:
+        session.close()
+
+
+def _t_forecast_accuracy_report(company_id: int, item_id: int = 0,
+                                  method: str = "sma_3", holdout_months: int = 3,
+                                  lookback_months: int = 24, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        result = _accuracy_report_item(item, method=method,
+                                       holdout_months=int(holdout_months),
+                                       lookback_months=int(lookback_months))
+        return _dc_to_dict(result)
+    finally:
+        session.close()
+
+
 def _t_lookup_item(company_id: int, part_number: str = "", **_) -> dict:
     """Resolve an item by exact part_number (case-insensitive)."""
     if not part_number:
@@ -1606,6 +1737,10 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
     "refresh_item_buffer":              _t_refresh_item_buffer,
     "refresh_all_buffers":              _t_refresh_all_buffers,
     "propose_apply_item_params":        _t_propose_apply_item_params,
+    # Forecasting tools
+    "forecast_item_demand":             _t_forecast_item_demand,
+    "item_seasonality_analysis":        _t_item_seasonality_analysis,
+    "forecast_accuracy_report":         _t_forecast_accuracy_report,
 }
 
 
@@ -1660,6 +1795,15 @@ TOOL_NAME_ALIASES = {
     "list_pending":                 "list_pending_actions",
     "pending_actions":              "list_pending_actions",
     "pending_changes":              "list_pending_actions",
+    # forecasting aliases
+    "forecast_demand":          "forecast_item_demand",
+    "demand_forecast":          "forecast_item_demand",
+    "forecast":                 "forecast_item_demand",
+    "seasonality_analysis":     "item_seasonality_analysis",
+    "seasonal_analysis":        "item_seasonality_analysis",
+    "seasonality":              "item_seasonality_analysis",
+    "accuracy_report":          "forecast_accuracy_report",
+    "forecast_accuracy":        "forecast_accuracy_report",
     # calculation tool aliases
     "calc_item_params":             "calculate_item_params",
     "recalculate_item_params":      "calculate_item_params",

@@ -27,6 +27,7 @@ from database.db import (
     Supplier, AgentRun, AgentSignal,
 )
 from modules.classification import compute_abc_xyz
+from modules.forecasting import get_demand_forecast_data
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -103,6 +104,13 @@ ANALYSIS_CATEGORIES = [
         "data_keys":  ["value_summary", "overstock", "safety_gaps", "abc_xyz",
                        "supplier_risk", "demand_trends", "snapshot"],
         "description": "Quantifies cash tied up in inventory and proposes ranked cash-release levers.",
+    },
+    {
+        "key":        "demand_forecasting",
+        "label":      "Demand Forecasting",
+        "skill_file": "skill_09_demand_forecasting.md",
+        "data_keys":  ["forecast_data", "demand_trends", "snapshot"],
+        "description": "Identifies items with stale ADU, seasonal patterns, growing/declining trends, and recommends forecast method updates and buffer adjustments.",
     },
 ]
 
@@ -558,6 +566,7 @@ def collect_raw_data(company_id: int) -> dict:
         "supplier_risk": get_supplier_risk_items(company_id),
         "abc_xyz":       get_abc_xyz_classification(company_id),
         "value_summary": get_inventory_value_summary(company_id),
+        "forecast_data": get_demand_forecast_data(company_id),
     }
 
 
@@ -708,6 +717,31 @@ def build_focused_context(category_key: str, raw_data: dict) -> str:
                 )
         else:
             lines.append("No significant demand trend deviations detected.")
+        lines.append("")
+
+    # ── DEMAND FORECAST DATA ─────────────────────────────────────────────
+    if "forecast_data" in data_keys:
+        fc = raw_data.get("forecast_data", [])
+        lines.append("=== DEMAND FORECAST DATA (SMA-3 + trend, sorted by |ADU divergence|) ===")
+        if fc:
+            lines.append(
+                f"{'Part #':<20} {'Months':>6} {'MeanMo':>8} {'CV':>6} "
+                f"{'SMA3Fct':>8} {'StrdADU':>8} {'ImpADU':>8} {'ADUDiv%':>8} {'Trend':>7} {'Seas':>5}"
+            )
+            for r in fc[:30]:
+                trend = "↑up" if r["trend_slope"] > 1 else ("↓dn" if r["trend_slope"] < -1 else "→ flat")
+                seas  = "Y" if r["has_seasonality"] else "N"
+                lines.append(
+                    f"{r['part_number']:<20} {r['months_of_data']:>6} "
+                    f"{r['mean_monthly']:>8.1f} {r['cv']:>6.3f} "
+                    f"{r['sma3_forecast']:>8.1f} {(r['stored_adu'] or 0):>8.4f} "
+                    f"{r['implied_adu']:>8.4f} {r['adu_divergence_pct']:>8.1f} "
+                    f"{trend:>7} {seas:>5}"
+                )
+            if len(fc) > 30:
+                lines.append(f"  ... ({len(fc) - 30} more items)")
+        else:
+            lines.append("No forecast data available (items may lack demand history).")
         lines.append("")
 
     # ── ABC/XYZ ──────────────────────────────────────────────────────────

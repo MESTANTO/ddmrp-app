@@ -419,6 +419,38 @@ RECOMMENDED WORKFLOW for a parameter update:
   3. `preview_item_buffer(item_id)` → see current buffer zones
   4. If drift is significant → `propose_apply_item_params(item_id, reason)`
   5. After user approves → `refresh_item_buffer(item_id)` to update zones
+
+---
+
+**FORECASTING TOOLS — demand patterns, seasonal adjustment, forecast accuracy**
+
+FORECASTING (item-level, no DB write):
+- `forecast_item_demand(item_id, method, periods)` — forecast next N months.
+  Methods: `sma_3` (stable demand), `sma_6` (slow-movers), `wma` (recent-
+  trend sensitive), `seasonal` (seasonal-adjusted SMA), `trend` (linear).
+  Returns history, forecast with confidence bands, seasonal indices.
+- `item_seasonality_analysis(item_id)` — monthly seasonal indices Jan–Dec,
+  peak months (index ≥1.2), trough months (index ≤0.8).
+- `forecast_accuracy_report(item_id, method, holdout_months)` — walk-forward
+  accuracy: MAE, MAPE, bias. MAPE <10% = good, 10–20% = acceptable, >20% = poor.
+
+RUN FULL ANALYSIS (LLM-backed, all items):
+- `run_skill(skill_id=9)` → Demand Forecasting skill: identifies items with
+  stale ADU, seasonal patterns, growing/declining trends across all items.
+
+FORECASTING DECISION GUIDE:
+- "What will demand for ITEM-X be next 3 months?" → forecast_item_demand
+- "Does ITEM-X have a seasonal pattern?" → item_seasonality_analysis
+- "Is our forecast accurate?" → forecast_accuracy_report
+- "Which items have stale ADU across the whole portfolio?" → run_skill(9)
+- "ADU looks off for ITEM-X" → calculate_item_params → propose_apply_item_params
+
+WHEN TO USE EACH FORECAST METHOD:
+- sma_3: default; stable demand, no clear trend
+- sma_6: slow-moving items with sparse demand
+- wma: demand is shifting (campaign just ended, new season starting)
+- seasonal: item has confirmed seasonal pattern (use after item_seasonality_analysis)
+- trend: item has consistent upward or downward growth trend
 """
 
 
