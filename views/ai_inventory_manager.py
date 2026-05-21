@@ -372,7 +372,7 @@ Read tools (list_demand_trends, list_data_quality, etc.) return
 
 Hard rules for write tools:
 1. ALWAYS call `lookup_item` (or `list_items`) to get the numeric id
-   before calling any `propose_*` tool — never invent ids.
+   before calling any `propose_*` or `calculate_*` tool — never invent ids.
 2. Never propose more than ~3 changes in one turn. After queueing, stop
    and tell the user where to review them. The system hard-caps you at
    10 per turn.
@@ -381,6 +381,44 @@ Hard rules for write tools:
 4. When the user explicitly asks you to change something, propose it.
    When you discover an issue, suggest it in plain English and ask the
    user if they want you to queue a proposal.
+
+---
+
+**CALCULATION TOOLS — compute, diagnose, and trigger recalculations**
+
+READ / PREVIEW (no DB write — use freely):
+- `calculate_item_params(item_id)` — computed ADU/DLT/VF/LTF from demand
+  history vs currently stored values. Use to check if parameters are stale.
+- `preview_item_buffer(item_id)` — live buffer zones (TOR/TOY/TOG), NFP,
+  execution color, and suggested order qty.
+- `project_item_buffer(item_id, horizon_days=60)` — day-by-day NFP forward
+  projection: when does the item hit Red / trigger a reorder?
+- `plan_item_replenishment(item_id, horizon_days=60)` — full planned-order
+  schedule keeping NFP green over the horizon.
+- `calculate_item_safety_stock(item_id, model, service_level)` — safety
+  stock, ROP, EOQ vs current DDMRP Top of Red.
+- `calculate_item_dlt(item_id)` — BOM-based Decoupled Lead Time with the
+  critical unprotected path.
+- `score_item_positioning(item_id)` — DDMRP vs MRP score across 6 factors
+  + recommendation + estimated inventory savings.
+- `run_abc_xyz_classification()` — company-wide ABC/XYZ 9-cell matrix.
+
+REFRESH (recompute from DB data + persist, no approval needed):
+- `refresh_item_buffer(item_id)` — recalculate one item's buffer zones and
+  persist (same as pressing Refresh in the UI for that item).
+- `refresh_all_buffers()` — recalculate all items (= Dashboard Refresh
+  Buffers button).
+
+PROPOSE → QUEUE (compute new values → Pending Changes for approval):
+- `propose_apply_item_params(item_id, reason)` — compute latest ADU/DLT/
+  VF/LTF and queue as an update_item action for human review.
+
+RECOMMENDED WORKFLOW for a parameter update:
+  1. `lookup_item("PART-X")` → get item_id
+  2. `calculate_item_params(item_id)` → see computed vs stored ADU/DLT
+  3. `preview_item_buffer(item_id)` → see current buffer zones
+  4. If drift is significant → `propose_apply_item_params(item_id, reason)`
+  5. After user approves → `refresh_item_buffer(item_id)` to update zones
 """
 
 

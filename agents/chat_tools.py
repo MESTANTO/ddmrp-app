@@ -44,10 +44,28 @@ from agents.inventory_agent import (
 from database.db import (
     AgentAction,
     BufferAdjustment,
+    DemandEntry,
     Item,
     SessionLocal,
     Supplier,
 )
+from modules.param_calculator import calculate_params as _calc_params
+from modules.buffer_engine import (
+    calculate_zones as _calc_zones,
+    calculate_net_flow_position as _calc_nfp,
+    execution_color as _exec_color,
+    recalculate_buffer as _recalc_buffer,
+    recalculate_all_buffers as _recalc_all_buffers,
+    project_buffer_forward as _project_forward,
+    plan_replenishment_orders as _plan_replenishment,
+)
+from modules.safety_stock import calculate_for_item as _calc_ss
+from modules.bom_engine import compute_dlt as _compute_dlt
+from modules.positioning_engine import (
+    compute_cumulative_lt as _cumulative_lt,
+    score_positioning as _score_positioning,
+)
+from modules.classification import compute_abc_xyz as _compute_abc_xyz
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +103,33 @@ def _allowlist(fields: dict | None, allowed: set) -> dict:
 
 def _snapshot_dict(obj, fields: set) -> dict:
     return {f: getattr(obj, f, None) for f in fields}
+
+
+def _dc_to_dict(obj) -> dict:
+    """Serialize a dataclass (possibly nested) to a JSON-safe dict."""
+    import dataclasses
+    import datetime as _dt
+    d = dataclasses.asdict(obj)
+    def _fix(v):
+        if isinstance(v, dict):  return {k: _fix(w) for k, w in v.items()}
+        if isinstance(v, list):  return [_fix(i) for i in v]
+        if isinstance(v, (_dt.date, _dt.datetime)): return v.isoformat()
+        return v
+    return _fix(d)
+
+
+def _invalidate_caches() -> None:
+    """Clear page-level Streamlit caches after a buffer write."""
+    try:
+        from views.dashboard import _load_dashboard_data
+        _load_dashboard_data.clear()
+    except Exception:
+        pass
+    try:
+        from views.inventory_manager import _load_state_cached
+        _load_state_cached.clear()
+    except Exception:
+        pass
 
 
 def _queue(action: AgentAction, session) -> dict:
@@ -549,6 +594,238 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # -----------------------------------------------------------------------
+    # CALCULATION TOOLS — trigger module computations from the chat
+    # -----------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_item_params",
+            "description": (
+                "Compute what the latest ADU, DLT, lead_time_factor (LTF), and "
+                "variability_factor (VF) would be for an item based on its recent "
+                "demand and supply history. Does NOT write to the database — use "
+                "propose_apply_item_params to queue the update for approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":      {"type": "integer"},
+                    "lookback_days":{"type": "integer", "default": 60,
+                                     "description": "Days of demand history to use."},
+                    "forward_days": {"type": "integer", "default": 30,
+                                     "description": "Days of forward demand to blend."},
+                    "adu_method":   {"type": "string", "default": "blended",
+                                     "enum": ["blended", "past_only", "forward_only"]},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "preview_item_buffer",
+            "description": (
+                "Show the current buffer zones (TOR/TOY/TOG), Net Flow Position, "
+                "execution color, and suggested order quantity for one item — "
+                "computed live from the item's stored parameters. Does NOT write."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "integer"},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "project_item_buffer",
+            "description": (
+                "Day-by-day NFP projection for an item over a forward horizon. "
+                "Returns the date the item hits Red (trigger date), the order-by "
+                "date, suggested order quantity, and daily NFP trace."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":      {"type": "integer"},
+                    "horizon_days": {"type": "integer", "default": 60,
+                                     "minimum": 1, "maximum": 365},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_item_replenishment",
+            "description": (
+                "Generate a full replenishment plan (list of planned orders) for "
+                "an item over a forward horizon, keeping NFP in the green zone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":      {"type": "integer"},
+                    "horizon_days": {"type": "integer", "default": 60,
+                                     "minimum": 1, "maximum": 365},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_item_safety_stock",
+            "description": (
+                "Compute safety stock, reorder point, EOQ, and total inventory "
+                "cost for one item using statistical models. Compares the result "
+                "against the current DDMRP Top of Red."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":       {"type": "integer"},
+                    "model":         {"type": "string", "default": "basic",
+                                      "enum": ["basic", "demand_only", "kings"],
+                                      "description": "SS calculation model."},
+                    "service_level": {"type": "number", "default": 95.0,
+                                      "description": "Target service level %."},
+                    "safety_factor": {"type": "number", "default": 1.0},
+                    "ordering_cost": {"type": "number", "default": 50.0,
+                                      "description": "Fixed cost per order (€)."},
+                    "holding_pct":   {"type": "number", "default": 0.25,
+                                      "description": "Annual holding cost as fraction of value."},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_item_dlt",
+            "description": (
+                "Compute the Decoupled Lead Time (DLT) for an item by traversing "
+                "the BOM graph and finding the longest unprotected path. Returns "
+                "computed DLT and the critical path as a list of part numbers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "integer"},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "score_item_positioning",
+            "description": (
+                "Score an item across 6 DDMRP positioning factors (CTT, MPLT, "
+                "SOVH, variability, leverage, critical operation) and return "
+                "a recommendation: DDMRP or MRP. Includes estimated inventory "
+                "value saving if switched to DDMRP."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":   {"type": "integer"},
+                    "threshold": {"type": "integer", "default": 30,
+                                  "description": "Score threshold for DDMRP recommendation."},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_abc_xyz_classification",
+            "description": (
+                "Run ABC/XYZ classification for all company items. Returns a "
+                "9-cell matrix (A-X through C-Z) with item counts and annual € "
+                "values per cell. Optionally override the default thresholds."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "abc_a":  {"type": "number", "default": 0.8,
+                               "description": "Cumulative value % threshold for A class."},
+                    "abc_ab": {"type": "number", "default": 0.95,
+                               "description": "Cumulative value % threshold for A+B."},
+                    "xyz_x":  {"type": "number", "default": 0.5,
+                               "description": "CV threshold for X class (low variability)."},
+                    "xyz_y":  {"type": "number", "default": 1.0,
+                               "description": "CV threshold for Y class."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "refresh_item_buffer",
+            "description": (
+                "Recalculate and persist the buffer zones + NFP for one item "
+                "(equivalent to pressing Refresh in the UI for a single item). "
+                "Writes directly to the Buffer table — no approval needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "integer"},
+                },
+                "required": ["item_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "refresh_all_buffers",
+            "description": (
+                "Recalculate and persist buffer zones + NFP for ALL items in the "
+                "company (equivalent to the Dashboard '🔄 Refresh Buffers' button). "
+                "Writes directly — no approval needed."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_apply_item_params",
+            "description": (
+                "Compute the latest ADU/DLT/VF/LTF for an item from its demand "
+                "history and queue the update for human approval (goes to Pending "
+                "Changes tab). The approval card shows the before vs computed "
+                "values so the user can review before applying."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id":      {"type": "integer"},
+                    "lookback_days":{"type": "integer", "default": 60},
+                    "forward_days": {"type": "integer", "default": 30},
+                    "adu_method":   {"type": "string", "default": "blended",
+                                     "enum": ["blended", "past_only", "forward_only"]},
+                    "reason":       {"type": "string",
+                                     "description": "Why you're proposing this update."},
+                },
+                "required": ["item_id", "reason"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -933,6 +1210,250 @@ def _t_propose_delete_supplier(company_id: int, user_id: int | None = None,
         session.close()
 
 
+def _t_calculate_item_params(company_id: int, item_id: int = 0,
+                             lookback_days: int = 60, forward_days: int = 30,
+                             adu_method: str = "blended", **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        result = _calc_params(item, lookback_days=int(lookback_days),
+                              forward_days=int(forward_days), adu_method=adu_method)
+        return _dc_to_dict(result)
+    finally:
+        session.close()
+
+
+def _t_preview_item_buffer(company_id: int, item_id: int = 0, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        zones = _calc_zones(item)
+        nfp   = _calc_nfp(item)
+        color, pct = _exec_color(item.on_hand or 0, zones)
+        from modules.buffer_engine import calculate_suggested_order, determine_status
+        status  = determine_status(nfp, zones)
+        suggest = calculate_suggested_order(nfp, zones)
+        return {
+            "item_id":          item.id,
+            "part_number":      item.part_number,
+            "on_hand":          item.on_hand,
+            "top_of_red":       zones.top_of_red,
+            "top_of_yellow":    zones.top_of_yellow,
+            "top_of_green":     zones.top_of_green,
+            "net_flow_position":nfp,
+            "status":           status,
+            "execution_color":  color,
+            "buffer_pct":       round(pct, 2),
+            "suggested_order":  suggest,
+            "adu":              zones.adu,
+            "dlt":              zones.dlt,
+        }
+    finally:
+        session.close()
+
+
+def _t_project_item_buffer(company_id: int, item_id: int = 0,
+                            horizon_days: int = 60, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        result = _project_forward(item, horizon_days=int(horizon_days))
+        d = _dc_to_dict(result)
+        # Truncate daily projection to keep response small
+        if "daily" in d and len(d["daily"]) > 14:
+            d["daily"] = d["daily"][:14]
+            d["daily_truncated_at"] = 14
+        return d
+    finally:
+        session.close()
+
+
+def _t_plan_item_replenishment(company_id: int, item_id: int = 0,
+                                horizon_days: int = 60, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        result = _plan_replenishment(item, horizon_days=int(horizon_days))
+        d = _dc_to_dict(result)
+        # Drop daily arrays to keep payload manageable
+        d.pop("daily_planned", None)
+        d.pop("daily_unplanned", None)
+        return d
+    finally:
+        session.close()
+
+
+def _t_calculate_item_safety_stock(company_id: int, item_id: int = 0,
+                                    model: str = "basic", service_level: float = 95.0,
+                                    safety_factor: float = 1.0,
+                                    ordering_cost: float = 50.0,
+                                    holding_pct: float = 0.25,
+                                    lookback_days: int = 90, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        result = _calc_ss(
+            item,
+            model=model,
+            service_level=float(service_level),
+            safety_factor=float(safety_factor),
+            default_ordering_cost=float(ordering_cost),
+            default_holding_pct=float(holding_pct),
+            lookback_days=int(lookback_days),
+        )
+        return _dc_to_dict(result)
+    finally:
+        session.close()
+
+
+def _t_calculate_item_dlt(company_id: int, item_id: int = 0, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        result = _compute_dlt(item)
+        return _dc_to_dict(result)
+    finally:
+        session.close()
+
+
+def _t_score_item_positioning(company_id: int, item_id: int = 0,
+                               threshold: int = 30, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        cumulative_lt = _cumulative_lt(item)
+        result = _score_positioning(item, cumulative_lt, threshold=int(threshold))
+        return _dc_to_dict(result)
+    finally:
+        session.close()
+
+
+def _t_run_abc_xyz_classification(company_id: int,
+                                   abc_a: float = 0.8, abc_ab: float = 0.95,
+                                   xyz_x: float = 0.5, xyz_y: float = 1.0,
+                                   **_) -> dict:
+    session = SessionLocal()
+    try:
+        items   = session.query(Item).filter(Item.company_id == company_id).all()
+        demands = (session.query(DemandEntry)
+                   .filter(DemandEntry.item_id.in_([i.id for i in items]))
+                   .all())
+        df = _compute_abc_xyz(items, demands,
+                              abc_a_thr=float(abc_a), abc_ab_thr=float(abc_ab),
+                              xyz_x_thr=float(xyz_x), xyz_y_thr=float(xyz_y))
+        from collections import defaultdict
+        counts: dict = defaultdict(int)
+        values: dict = defaultdict(float)
+        for _, row in df.iterrows():
+            cell = row.get("acvs", "??")
+            counts[cell] += 1
+            values[cell] += float(row.get("annual_value", 0) or 0)
+        cells = ["A-X", "A-Y", "A-Z", "B-X", "B-Y", "B-Z", "C-X", "C-Y", "C-Z"]
+        return {
+            "cells": [
+                {"cell": c, "count": counts.get(c, 0),
+                 "annual_value": round(values.get(c, 0), 2)}
+                for c in cells
+            ],
+            "total_items":        sum(counts.values()),
+            "total_annual_value": round(sum(values.values()), 2),
+        }
+    finally:
+        session.close()
+
+
+def _t_refresh_item_buffer(company_id: int, item_id: int = 0, **_) -> dict:
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+    finally:
+        session.close()
+    status = _recalc_buffer(item)
+    _invalidate_caches()
+    d = _dc_to_dict(status)
+    d.pop("zones", None)  # keep response compact
+    d["refreshed"] = True
+    return d
+
+
+def _t_refresh_all_buffers(company_id: int, **_) -> dict:
+    results = _recalc_all_buffers(company_id=company_id)
+    _invalidate_caches()
+    return {
+        "refreshed": True,
+        "count":     len(results),
+        "summary":   f"Recalculated buffers for {len(results)} items.",
+    }
+
+
+def _t_propose_apply_item_params(company_id: int, user_id: int | None = None,
+                                  item_id: int = 0, lookback_days: int = 60,
+                                  forward_days: int = 30, adu_method: str = "blended",
+                                  reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not item_id:
+        return {"error": "item_id is required"}
+    session = SessionLocal()
+    try:
+        item = session.query(Item).get(int(item_id))
+        if item is None or item.company_id != company_id:
+            return {"error": "Item not found or cross-company access blocked"}
+        calc = _calc_params(item, lookback_days=int(lookback_days),
+                            forward_days=int(forward_days), adu_method=adu_method)
+        fields = {
+            "adu":               calc.adu,
+            "dlt":               calc.dlt,
+            "lead_time_factor":  calc.lead_time_factor,
+            "variability_factor":calc.variability_factor,
+        }
+        auto_reason = (
+            reason or
+            f"Computed from {calc.n_demand_days}d demand history "
+            f"(ADU {calc.current_adu:.2f}→{calc.adu:.2f}, "
+            f"DLT {calc.current_dlt:.1f}→{calc.dlt:.1f})"
+        )
+        # Delegate to the existing propose_update_item logic
+        return _t_propose_update_item(
+            company_id=company_id, user_id=user_id,
+            item_id=item_id, fields=fields, reason=auto_reason,
+        )
+    finally:
+        session.close()
+
+
 def _t_lookup_item(company_id: int, part_number: str = "", **_) -> dict:
     """Resolve an item by exact part_number (case-insensitive)."""
     if not part_number:
@@ -1073,6 +1594,18 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
     "lookup_item":                      _t_lookup_item,
     "lookup_supplier":                  _t_lookup_supplier,
     "list_items":                       _t_list_items,
+    # Calculation tools — trigger module computations
+    "calculate_item_params":            _t_calculate_item_params,
+    "preview_item_buffer":              _t_preview_item_buffer,
+    "project_item_buffer":              _t_project_item_buffer,
+    "plan_item_replenishment":          _t_plan_item_replenishment,
+    "calculate_item_safety_stock":      _t_calculate_item_safety_stock,
+    "calculate_item_dlt":               _t_calculate_item_dlt,
+    "score_item_positioning":           _t_score_item_positioning,
+    "run_abc_xyz_classification":       _t_run_abc_xyz_classification,
+    "refresh_item_buffer":              _t_refresh_item_buffer,
+    "refresh_all_buffers":              _t_refresh_all_buffers,
+    "propose_apply_item_params":        _t_propose_apply_item_params,
 }
 
 
@@ -1127,6 +1660,30 @@ TOOL_NAME_ALIASES = {
     "list_pending":                 "list_pending_actions",
     "pending_actions":              "list_pending_actions",
     "pending_changes":              "list_pending_actions",
+    # calculation tool aliases
+    "calc_item_params":             "calculate_item_params",
+    "recalculate_item_params":      "calculate_item_params",
+    "get_item_buffer":              "preview_item_buffer",
+    "item_buffer":                  "preview_item_buffer",
+    "buffer_zones":                 "preview_item_buffer",
+    "project_buffer":               "project_item_buffer",
+    "buffer_projection":            "project_item_buffer",
+    "replenishment_plan":           "plan_item_replenishment",
+    "plan_replenishment":           "plan_item_replenishment",
+    "safety_stock":                 "calculate_item_safety_stock",
+    "calc_safety_stock":            "calculate_item_safety_stock",
+    "item_dlt":                     "calculate_item_dlt",
+    "dlt":                          "calculate_item_dlt",
+    "positioning_score":            "score_item_positioning",
+    "ddmrp_score":                  "score_item_positioning",
+    "abc_xyz":                      "run_abc_xyz_classification",
+    "classify_items":               "run_abc_xyz_classification",
+    "refresh_buffer":               "refresh_item_buffer",
+    "recalculate_buffer":           "refresh_item_buffer",
+    "refresh_buffers":              "refresh_all_buffers",
+    "recalculate_all_buffers":      "refresh_all_buffers",
+    "apply_item_params":            "propose_apply_item_params",
+    "update_params":                "propose_apply_item_params",
     # lookup aliases
     "get_item":                     "lookup_item",
     "find_item":                    "lookup_item",
