@@ -71,6 +71,8 @@ GROUPS: dict[str, list[tuple[str, str]]] = {
     "📈  Analysis": [
         ("🔠  ABC / XYZ / ACV²",      "abc_xyz"),
         ("📉  Model Velocity",        "model_velocity"),
+        ("💰  Total Cost of Ownership","tco_analysis"),
+        ("⚠️  Risk Register",          "risk_register"),
         ("📤  Export to Excel",       "export"),
     ],
 }
@@ -234,6 +236,14 @@ elif page_key == "safety_stock":
 
 elif page_key == "buffer_adjustments":
     from modules.buffer_adjustments import show
+    show()
+
+elif page_key == "tco_analysis":
+    from views.tco_analysis import show
+    show()
+
+elif page_key == "risk_register":
+    from views.risk_register import show
     show()
 
 elif page_key == "export":

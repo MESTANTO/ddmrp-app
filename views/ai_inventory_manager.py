@@ -451,6 +451,87 @@ WHEN TO USE EACH FORECAST METHOD:
 - wma: demand is shifting (campaign just ended, new season starting)
 - seasonal: item has confirmed seasonal pattern (use after item_seasonality_analysis)
 - trend: item has consistent upward or downward growth trend
+
+---
+
+**TCO TOOLS — Total Cost of Ownership analysis for suppliers**
+
+READ / COMPUTE (no DB write):
+- `compute_supplier_tco(supplier_id, period_start, period_end)` — auto-compute
+  TCO for one supplier from supply entries × unit cost. Returns purchase,
+  quality, delivery, service, technology, risk components, total €, TCO/unit.
+  Dates are ISO `YYYY-MM-DD`. Default window: last 365 days.
+- `compare_supplier_tco(period_start, period_end)` — ranks every supplier in
+  the company by TCO/unit (lowest = best). Use when the user asks "who is our
+  cheapest supplier overall?" or "rank suppliers by full cost".
+- `list_supplier_tco_snapshots(supplier_id?, limit=50)` — list previously
+  saved TCO snapshots. Omit `supplier_id` to list all.
+
+PROPOSE (queue snapshot for human approval):
+- `propose_save_supplier_tco(supplier_id, period_start, period_end,
+   overrides?, notes, reason)` — compute baseline then persist a snapshot.
+  Pass `overrides` as a dict with any of `purchase_cost`, `quality_cost`,
+  `delivery_cost`, `service_cost`, `technology_cost`, `risk_cost` to override
+  the auto-computed values (e.g. user knows true defect cost is higher).
+
+TCO COMPONENT MODEL (so you can explain results):
+- `purchase_cost`  = units × unit_cost from supply entries
+- `quality_cost`   = purchase × (1 − reliability) × quality_factor   (~0.5)
+- `delivery_cost`  = purchase × (1 − reliability) × delivery_factor  (~0.3)
+- `service_cost`   = purchase × service_factor                        (~2%)
+- `technology_cost`= 0 unless overridden by user
+- `risk_cost`      = Σ(open/mitigating risk inherent scores) × € per point
+- `total_cost`     = sum of the six above
+- `tco_per_unit`   = total_cost / units_delivered
+
+TCO DECISION GUIDE:
+- "What's our true cost with ACME?" → compute_supplier_tco(supplier_id)
+- "Rank suppliers by total cost" → compare_supplier_tco()
+- "Save this TCO as a baseline" → propose_save_supplier_tco(...)
+- "Why is ACME expensive?" → look at component breakdown — high quality_cost
+  means low reliability; high risk_cost means open risks tagged to supplier.
+
+---
+
+**RISK REGISTER TOOLS — supply-chain risk management**
+
+READ:
+- `list_risks(supplier_id?, status?, limit=100)` — list risks. Status one of
+  `open`, `mitigating`, `closed`, `transferred`. Filter by supplier_id if asked.
+- `risk_summary()` — counts by status × category, top-5 by inherent score.
+
+PROPOSE (queue for human approval):
+- `propose_create_risk(title, fields, reason)` — create a risk. `fields` may
+  include: description, category, node, likelihood (1–5), impact (1–5),
+  mitigation_strategy, mitigation_notes, residual_likelihood,
+  residual_impact, status, owner, due_date (ISO), supplier_id, item_id.
+- `propose_update_risk(risk_id, fields, reason)` — same allowlist as create.
+- `propose_close_risk(risk_id, reason)` — convenience: sets status=`closed`.
+- `propose_delete_risk(risk_id, reason)` — remove the risk row entirely.
+
+RISK TAXONOMY:
+- category: operational | disruption | financial | quality | compliance |
+            geopolitical | environmental
+- node:     supplier | producer | distributor | customer | internal | network
+- mitigation_strategy (Tang's nine):  postponement, strategic_stock,
+            flexible_supply, make_and_buy, economic_incentives,
+            flexible_transportation, revenue_management, dynamic_assortment,
+            silent_rollover, other
+- inherent_score   = likelihood × impact (1–25)
+- residual_score   = residual_likelihood × residual_impact (after mitigation)
+
+RISK + TCO FEEDBACK LOOP:
+- A risk tagged to a supplier feeds into that supplier's `risk_cost` in TCO.
+- Closing a risk drops the supplier's TCO; adding a high-score risk raises it.
+- So "this supplier is expensive" sometimes means "they have N open risks".
+
+RISK DECISION GUIDE:
+- "What risks do we have with ACME?" → list_risks(supplier_id=...)
+- "Show me our risk landscape" → risk_summary()
+- "Add a quality risk for ACME (L4 × I4)" → propose_create_risk(...)
+- "Mark risk #12 as mitigated" → propose_update_risk(12, {status: 'mitigating',
+   residual_likelihood: 2, residual_impact: 3}, reason)
+- "Close risk #12" → propose_close_risk(12, reason)
 """
 
 

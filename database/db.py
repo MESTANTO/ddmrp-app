@@ -441,6 +441,103 @@ class AgentSignal(Base):
     run  = relationship("AgentRun", back_populates="signals")
 
 
+class SupplierTCO(Base):
+    """
+    Total Cost of Ownership snapshot for one supplier over one period.
+
+    Each row is a TCO evaluation: the unit price plus the surrounding
+    cost components (quality, delivery, service, technology, risk) that
+    Ptak-style supplier selection ignores at its peril.
+
+    The engine in `modules/tco.py` can auto-estimate components from
+    existing data (supply_entries volume × items.unit_cost × supplier
+    reliability deficit); the user can override any component in the UI;
+    the chat agent can queue overrides via `propose_save_supplier_tco`.
+    """
+    __tablename__ = "supplier_tco"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    company_id    = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    supplier_id   = Column(Integer, ForeignKey("suppliers.id"), nullable=False)
+    period_start  = Column(DateTime, nullable=False)
+    period_end    = Column(DateTime, nullable=False)
+
+    # Volume context
+    units_delivered    = Column(Float, default=0.0)
+    unit_price_avg     = Column(Float, default=0.0)   # weighted avg across items
+
+    # Cost components (€)
+    purchase_cost      = Column(Float, default=0.0)   # units × unit_price
+    quality_cost       = Column(Float, default=0.0)   # defects, returns, scrap, rework
+    delivery_cost      = Column(Float, default=0.0)   # late deliveries, expediting, freight
+    service_cost       = Column(Float, default=0.0)   # admin, after-sales, support
+    technology_cost    = Column(Float, default=0.0)   # tooling, integration, R&D
+    risk_cost          = Column(Float, default=0.0)   # expected disruption impact
+
+    # Roll-ups
+    total_cost         = Column(Float, default=0.0)
+    tco_per_unit       = Column(Float, default=0.0)
+
+    # Provenance / commentary
+    auto_computed      = Column(Boolean, default=True)   # False = user-overridden
+    notes              = Column(Text, default="")
+
+    created_at         = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at         = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SupplierRisk(Base):
+    """
+    Risk register row (Lotfi et al. 2023, Ch. 5).
+
+    Tracks one identified risk in the supply chain:
+      - Where it sits (supplier-level, item-level, or network-level)
+      - Its category (operational vs disruption, internal vs external, …)
+      - Likelihood × Impact (1-5 each) → inherent risk score 1-25
+      - Mitigation strategy from Tang's 9 (postponement, strategic_stock,
+        flexible_supply, make_and_buy, economic_incentives,
+        flexible_transportation, revenue_management, dynamic_assortment,
+        silent_rollover) plus 'other'
+      - Residual likelihood/impact after mitigation
+      - Status workflow: open → mitigating → (accepted | closed)
+    """
+    __tablename__ = "supplier_risks"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    company_id    = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    supplier_id   = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
+    item_id       = Column(Integer, ForeignKey("items.id"), nullable=True)
+
+    title         = Column(String, nullable=False)
+    description   = Column(Text, default="")
+
+    # Taxonomy
+    category      = Column(String, default="operational")  # operational | disruption | financial | quality | compliance | geopolitical | environmental
+    node          = Column(String, default="supplier")     # supplier | producer | distributor | customer | internal | network
+
+    # Inherent risk (1-5 each)
+    likelihood    = Column(Integer, default=3)
+    impact        = Column(Integer, default=3)
+    inherent_score= Column(Integer, default=9)
+
+    # Mitigation
+    mitigation_strategy = Column(String, default="other")   # one of Tang's 9 + 'other'
+    mitigation_notes    = Column(Text, default="")
+
+    # Residual risk after mitigation
+    residual_likelihood = Column(Integer, nullable=True)
+    residual_impact     = Column(Integer, nullable=True)
+    residual_score      = Column(Integer, nullable=True)
+
+    # Workflow
+    status        = Column(String, default="open")          # open | mitigating | accepted | closed
+    owner         = Column(String, default="")
+    due_date      = Column(DateTime, nullable=True)
+
+    created_at    = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at    = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class AgentAction(Base):
     """
     One row per write change proposed by the chat agent.
@@ -579,6 +676,8 @@ def init_db():
     # Agent tables are created by create_all above (no migration needed for new installs)
     # For existing DBs, add any new agent columns safely
     _migrate_agent_tables()
+    # TCO + Risk Register tables (created by create_all; no-op if already there)
+    _migrate_tco_risk_tables()
 
 
 def _migrate_buffer_columns():
@@ -827,6 +926,15 @@ def _migrate_agent_tables():
         ("notes",        "TEXT DEFAULT ''",   "TEXT DEFAULT ''"),
         ("target_id",    "INTEGER",           "INTEGER"),
     ])
+
+
+def _migrate_tco_risk_tables():
+    """
+    Ensure supplier_tco and supplier_risks tables exist with current columns.
+    create_all() creates missing tables; _add_columns_safely handles any
+    future column additions on existing tables.
+    """
+    Base.metadata.create_all(engine)
 
 
 def seed_company_data(company_id: int):

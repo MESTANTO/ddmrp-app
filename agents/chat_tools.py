@@ -171,6 +171,16 @@ def _summarise(action: AgentAction) -> str:
                 f"({p.get('start_date')} -> {p.get('end_date')})")
     if action.action_type == "delete_buffer_adjustment":
         return f"Delete buffer adjustment id={action.target_id}"
+    if action.action_type == "create_risk":
+        return f"Create risk title={(p.get('fields') or {}).get('title')}"
+    if action.action_type == "update_risk":
+        return f"Update risk id={action.target_id} fields={list((p.get('fields') or {}).keys())}"
+    if action.action_type == "delete_risk":
+        return f"Delete risk id={action.target_id}"
+    if action.action_type == "save_supplier_tco":
+        return (f"Save TCO snapshot supplier_id={p.get('supplier_id')} "
+                f"period={p.get('period_start')}→{p.get('period_end')} "
+                f"overrides={list((p.get('overrides') or {}).keys())}")
     return action.action_type
 
 
@@ -923,6 +933,249 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # -----------------------------------------------------------------------
+    # TCO TOOLS — Total Cost of Ownership for suppliers
+    # -----------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "compute_supplier_tco",
+            "description": (
+                "Compute the Total Cost of Ownership for one supplier over a "
+                "period: purchase + quality + delivery + service + technology "
+                "+ risk cost. Pulls volume from supply_entries × item unit cost, "
+                "derives quality/delivery costs from reliability_pct, and adds "
+                "the sum of inherent_score × € from open supplier_risks. Does NOT "
+                "persist — use propose_save_supplier_tco to save a snapshot."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "supplier_id":  {"type": "integer"},
+                    "period_start": {"type": "string",
+                                     "description": "ISO date 'YYYY-MM-DD' (default: 1 year ago)."},
+                    "period_end":   {"type": "string",
+                                     "description": "ISO date 'YYYY-MM-DD' (default: today)."},
+                },
+                "required": ["supplier_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compare_supplier_tco",
+            "description": (
+                "Rank ALL suppliers in the company by TCO per unit (lowest first) "
+                "over a period. Use this to identify which supplier is actually "
+                "the most expensive after accounting for quality and risk costs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "period_start": {"type": "string"},
+                    "period_end":   {"type": "string"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_supplier_tco_snapshots",
+            "description": (
+                "List previously saved TCO snapshots (newest first). Optionally "
+                "filter by supplier_id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "supplier_id": {"type": "integer"},
+                    "limit":       {"type": "integer", "default": 50},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_save_supplier_tco",
+            "description": (
+                "Compute a fresh TCO for the supplier and queue a save-snapshot "
+                "action for human approval. Optionally pass component overrides "
+                "(purchase_cost, quality_cost, delivery_cost, service_cost, "
+                "technology_cost, risk_cost) to replace the auto-computed values."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "supplier_id":     {"type": "integer"},
+                    "period_start":    {"type": "string"},
+                    "period_end":      {"type": "string"},
+                    "purchase_cost":   {"type": "number"},
+                    "quality_cost":    {"type": "number"},
+                    "delivery_cost":   {"type": "number"},
+                    "service_cost":    {"type": "number"},
+                    "technology_cost": {"type": "number"},
+                    "risk_cost":       {"type": "number"},
+                    "notes":           {"type": "string"},
+                    "reason":          {"type": "string"},
+                },
+                "required": ["supplier_id", "reason"],
+            },
+        },
+    },
+    # -----------------------------------------------------------------------
+    # RISK REGISTER TOOLS
+    # -----------------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "list_risks",
+            "description": (
+                "List risks in the company's risk register. Filter by status "
+                "(open / mitigating / accepted / closed), category, supplier_id "
+                "or item_id. Ordered by inherent_score desc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status":      {"type": "string",
+                                    "enum": ["open", "mitigating", "accepted", "closed"]},
+                    "category":    {"type": "string",
+                                    "enum": ["operational", "disruption", "financial",
+                                             "quality", "compliance", "geopolitical",
+                                             "environmental"]},
+                    "supplier_id": {"type": "integer"},
+                    "item_id":     {"type": "integer"},
+                    "limit":       {"type": "integer", "default": 50},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "risk_summary",
+            "description": (
+                "Aggregate counts (open / mitigating / accepted / closed) plus "
+                "total inherent and residual exposure, plus the top 5 risks by "
+                "inherent score."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_create_risk",
+            "description": (
+                "Queue a new risk register row for human approval. Use "
+                "supplier_id when the risk is tied to a specific supplier, "
+                "item_id for item-specific risks, or leave both null for "
+                "network-level risks. Mitigation strategy must be one of Tang's "
+                "9 (postponement, strategic_stock, flexible_supply, make_and_buy, "
+                "economic_incentives, flexible_transportation, revenue_management, "
+                "dynamic_assortment, silent_rollover) or 'other'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title":       {"type": "string"},
+                    "description": {"type": "string"},
+                    "category":    {"type": "string",
+                                    "enum": ["operational", "disruption", "financial",
+                                             "quality", "compliance", "geopolitical",
+                                             "environmental"]},
+                    "node":        {"type": "string",
+                                    "enum": ["supplier", "producer", "distributor",
+                                             "customer", "internal", "network"]},
+                    "supplier_id": {"type": "integer"},
+                    "item_id":     {"type": "integer"},
+                    "likelihood":  {"type": "integer", "minimum": 1, "maximum": 5},
+                    "impact":      {"type": "integer", "minimum": 1, "maximum": 5},
+                    "mitigation_strategy": {"type": "string",
+                                            "enum": ["postponement", "strategic_stock",
+                                                     "flexible_supply", "make_and_buy",
+                                                     "economic_incentives",
+                                                     "flexible_transportation",
+                                                     "revenue_management",
+                                                     "dynamic_assortment",
+                                                     "silent_rollover", "other"]},
+                    "mitigation_notes": {"type": "string"},
+                    "owner":        {"type": "string"},
+                    "due_date":     {"type": "string",
+                                     "description": "ISO 'YYYY-MM-DD'."},
+                    "reason":       {"type": "string"},
+                },
+                "required": ["title", "likelihood", "impact", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_update_risk",
+            "description": (
+                "Queue an update to an existing risk register row. Use this to "
+                "change mitigation, residual scores, status, owner or due date. "
+                "Status workflow: open → mitigating → (accepted | closed)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "risk_id": {"type": "integer"},
+                    "fields":  {"type": "object",
+                                "description": "Partial dict of fields to update. "
+                                "Valid keys: title, description, category, node, "
+                                "likelihood, impact, mitigation_strategy, "
+                                "mitigation_notes, residual_likelihood, "
+                                "residual_impact, status, owner, due_date."},
+                    "reason":  {"type": "string"},
+                },
+                "required": ["risk_id", "fields", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_close_risk",
+            "description": (
+                "Queue a status change to 'closed' for a risk register row. "
+                "Use when the risk is fully mitigated or no longer applicable."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "risk_id": {"type": "integer"},
+                    "reason":  {"type": "string"},
+                },
+                "required": ["risk_id", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_delete_risk",
+            "description": (
+                "Queue a delete for a risk register row. Prefer propose_close_risk "
+                "over delete — closing preserves the audit trail."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "risk_id": {"type": "integer"},
+                    "reason":  {"type": "string"},
+                },
+                "required": ["risk_id", "reason"],
+            },
+        },
+    },
 ]
 
 
@@ -1671,6 +1924,262 @@ def _t_list_items(company_id: int, filter: str = "", limit: int = 50, **_) -> di
         session.close()
 
 
+# ---------------------------------------------------------------------------
+# TCO + Risk Register tools
+# ---------------------------------------------------------------------------
+
+def _parse_iso_date(v):
+    """Accept 'YYYY-MM-DD' string or None; return datetime or None."""
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v
+    try:
+        return datetime.strptime(str(v)[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _t_compute_supplier_tco(company_id: int, supplier_id: int = 0,
+                            period_start: str = "", period_end: str = "", **_) -> dict:
+    if not supplier_id:
+        return {"error": "supplier_id is required"}
+    from modules.tco import compute_tco, to_dict
+    try:
+        result = compute_tco(
+            supplier_id=int(supplier_id), company_id=company_id,
+            period_start=_parse_iso_date(period_start),
+            period_end=_parse_iso_date(period_end),
+        )
+        return to_dict(result)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _t_compare_supplier_tco(company_id: int,
+                            period_start: str = "", period_end: str = "", **_) -> dict:
+    from modules.tco import compute_tco_all, to_dict
+    try:
+        results = compute_tco_all(
+            company_id=company_id,
+            period_start=_parse_iso_date(period_start),
+            period_end=_parse_iso_date(period_end),
+        )
+        return {"count": len(results),
+                "ranking": [to_dict(r) for r in results]}
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _t_list_supplier_tco_snapshots(company_id: int, supplier_id: int = 0,
+                                   limit: int = 50, **_) -> dict:
+    from modules.tco import list_tco_snapshots
+    rows = list_tco_snapshots(company_id=company_id,
+                              supplier_id=int(supplier_id) if supplier_id else None,
+                              limit=int(limit))
+    return {"count": len(rows), "snapshots": rows}
+
+
+def _t_propose_save_supplier_tco(company_id: int, user_id: int | None = None,
+                                 supplier_id: int = 0,
+                                 period_start: str = "", period_end: str = "",
+                                 purchase_cost=None, quality_cost=None,
+                                 delivery_cost=None, service_cost=None,
+                                 technology_cost=None, risk_cost=None,
+                                 notes: str = "", reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not supplier_id:
+        return {"error": "supplier_id is required"}
+
+    # Sanity: compute baseline so the queue card has before/after context
+    from modules.tco import compute_tco, to_dict
+    try:
+        baseline = compute_tco(
+            supplier_id=int(supplier_id), company_id=company_id,
+            period_start=_parse_iso_date(period_start),
+            period_end=_parse_iso_date(period_end),
+        )
+    except Exception as exc:
+        return {"error": f"baseline compute failed: {exc}"}
+
+    overrides = {}
+    for k, v in (("purchase_cost", purchase_cost),
+                 ("quality_cost",  quality_cost),
+                 ("delivery_cost", delivery_cost),
+                 ("service_cost",  service_cost),
+                 ("technology_cost", technology_cost),
+                 ("risk_cost",    risk_cost)):
+        if v is not None:
+            try:
+                overrides[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+
+    payload = {
+        "supplier_id":  int(supplier_id),
+        "period_start": baseline.period_start,
+        "period_end":   baseline.period_end,
+        "baseline":     to_dict(baseline),
+        "overrides":    overrides,
+        "notes":        (notes or "").strip(),
+    }
+    session = SessionLocal()
+    try:
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="save_supplier_tco", target_table="supplier_tco",
+            target_id=None,
+            payload_json=json.dumps(payload, default=str),
+            before_json=None,
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_list_risks(company_id: int, status: str = "", category: str = "",
+                  supplier_id: int = 0, item_id: int = 0, limit: int = 50,
+                  **_) -> dict:
+    from modules.risk_register import list_risks
+    rows = list_risks(
+        company_id=company_id,
+        status=status or None,
+        category=category or None,
+        supplier_id=int(supplier_id) if supplier_id else None,
+        item_id=int(item_id) if item_id else None,
+        limit=int(limit),
+    )
+    return {"count": len(rows), "risks": rows}
+
+
+def _t_risk_summary(company_id: int, **_) -> dict:
+    from modules.risk_register import risk_summary
+    from dataclasses import asdict
+    return asdict(risk_summary(company_id))
+
+
+def _t_propose_create_risk(company_id: int, user_id: int | None = None,
+                           title: str = "", description: str = "",
+                           category: str = "operational", node: str = "supplier",
+                           supplier_id: int = 0, item_id: int = 0,
+                           likelihood: int = 3, impact: int = 3,
+                           mitigation_strategy: str = "other",
+                           mitigation_notes: str = "",
+                           owner: str = "", due_date: str = "",
+                           reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not title:
+        return {"error": "title is required"}
+
+    fields = {
+        "title":         str(title).strip(),
+        "description":   str(description or "").strip(),
+        "category":      category,
+        "node":          node,
+        "supplier_id":   int(supplier_id) if supplier_id else None,
+        "item_id":       int(item_id) if item_id else None,
+        "likelihood":    int(likelihood),
+        "impact":        int(impact),
+        "mitigation_strategy": mitigation_strategy,
+        "mitigation_notes":    str(mitigation_notes or "").strip(),
+        "owner":         str(owner or "").strip(),
+        "due_date":      due_date or None,
+    }
+    session = SessionLocal()
+    try:
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="create_risk", target_table="supplier_risks",
+            target_id=None,
+            payload_json=json.dumps({"fields": fields}, default=str),
+            before_json=None,
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_update_risk(company_id: int, user_id: int | None = None,
+                           risk_id: int = 0, fields: dict | None = None,
+                           reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not risk_id:
+        return {"error": "risk_id is required"}
+
+    from database.db import SupplierRisk
+    from modules.risk_register import RISK_FIELDS
+    cleaned = _allowlist(fields, RISK_FIELDS)
+    if not cleaned:
+        return {"error": "No valid fields to update",
+                "hint":  f"Allowed: {sorted(RISK_FIELDS)}"}
+
+    session = SessionLocal()
+    try:
+        row = session.query(SupplierRisk).get(int(risk_id))
+        if row is None or row.company_id != company_id:
+            return {"error": "Risk not found or cross-company access blocked"}
+        before = {f: getattr(row, f, None) for f in RISK_FIELDS}
+        before["id"] = row.id
+        before["title"] = row.title
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="update_risk", target_table="supplier_risks",
+            target_id=row.id,
+            payload_json=json.dumps({"fields": cleaned}, default=str),
+            before_json=json.dumps(before, default=str),
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
+def _t_propose_close_risk(company_id: int, user_id: int | None = None,
+                          risk_id: int = 0, reason: str = "", **_) -> dict:
+    # Shorthand for update_risk({status: 'closed'})
+    return _t_propose_update_risk(
+        company_id=company_id, user_id=user_id,
+        risk_id=risk_id,
+        fields={"status": "closed"},
+        reason=reason or "Closing risk via shortcut",
+    )
+
+
+def _t_propose_delete_risk(company_id: int, user_id: int | None = None,
+                           risk_id: int = 0, reason: str = "", **_) -> dict:
+    rl = _check_rate_limit(company_id)
+    if rl: return rl
+    if not risk_id:
+        return {"error": "risk_id is required"}
+
+    from database.db import SupplierRisk
+    from modules.risk_register import RISK_FIELDS
+    session = SessionLocal()
+    try:
+        row = session.query(SupplierRisk).get(int(risk_id))
+        if row is None or row.company_id != company_id:
+            return {"error": "Risk not found or cross-company access blocked"}
+        before = {f: getattr(row, f, None) for f in RISK_FIELDS}
+        before["id"] = row.id
+        before["title"] = row.title
+        action = AgentAction(
+            company_id=company_id, user_id=user_id,
+            action_type="delete_risk", target_table="supplier_risks",
+            target_id=row.id,
+            payload_json=json.dumps({}, default=str),
+            before_json=json.dumps(before, default=str),
+            reason=str(reason or "").strip(),
+        )
+        return _queue(action, session)
+    finally:
+        session.close()
+
+
 def _t_list_pending_actions(company_id: int, limit: int = 20, **_) -> dict:
     session = SessionLocal()
     try:
@@ -1721,6 +2230,18 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
     "propose_create_supplier":          _t_propose_create_supplier,
     "propose_delete_supplier":          _t_propose_delete_supplier,
     "list_pending_actions":             _t_list_pending_actions,
+    # TCO tools
+    "compute_supplier_tco":             _t_compute_supplier_tco,
+    "compare_supplier_tco":             _t_compare_supplier_tco,
+    "list_supplier_tco_snapshots":      _t_list_supplier_tco_snapshots,
+    "propose_save_supplier_tco":        _t_propose_save_supplier_tco,
+    # Risk register tools
+    "list_risks":                       _t_list_risks,
+    "risk_summary":                     _t_risk_summary,
+    "propose_create_risk":              _t_propose_create_risk,
+    "propose_update_risk":              _t_propose_update_risk,
+    "propose_close_risk":               _t_propose_close_risk,
+    "propose_delete_risk":              _t_propose_delete_risk,
     # Lookup / search tools — bridge part_number → numeric id
     "lookup_item":                      _t_lookup_item,
     "lookup_supplier":                  _t_lookup_supplier,
@@ -1837,6 +2358,31 @@ TOOL_NAME_ALIASES = {
     "resolve_supplier":             "lookup_supplier",
     "search_items":                 "list_items",
     "get_items":                    "list_items",
+    # TCO aliases
+    "supplier_tco":                 "compute_supplier_tco",
+    "tco":                          "compute_supplier_tco",
+    "calculate_tco":                "compute_supplier_tco",
+    "rank_suppliers_by_tco":        "compare_supplier_tco",
+    "compare_tco":                  "compare_supplier_tco",
+    "tco_ranking":                  "compare_supplier_tco",
+    "list_tco":                     "list_supplier_tco_snapshots",
+    "tco_history":                  "list_supplier_tco_snapshots",
+    "save_tco":                     "propose_save_supplier_tco",
+    # Risk register aliases
+    "risks":                        "list_risks",
+    "risk_register":                "list_risks",
+    "list_risk_register":           "list_risks",
+    "risks_overview":               "risk_summary",
+    "risk_dashboard":               "risk_summary",
+    "create_risk":                  "propose_create_risk",
+    "add_risk":                     "propose_create_risk",
+    "register_risk":                "propose_create_risk",
+    "update_risk":                  "propose_update_risk",
+    "edit_risk":                    "propose_update_risk",
+    "close_risk":                   "propose_close_risk",
+    "mitigate_risk":                "propose_close_risk",
+    "delete_risk":                  "propose_delete_risk",
+    "remove_risk":                  "propose_delete_risk",
 }
 
 

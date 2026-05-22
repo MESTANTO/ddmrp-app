@@ -29,6 +29,8 @@ from database.db import (
     BufferAdjustment,
     Item,
     Supplier,
+    SupplierRisk,
+    SupplierTCO,
     SessionLocal,
 )
 
@@ -330,6 +332,120 @@ def _handle_delete_buffer_adjustment(action: AgentAction, payload: dict, session
     return snap
 
 
+def _handle_create_risk(action: AgentAction, payload: dict, session) -> dict:
+    from modules.risk_register import create_risk
+    fields = payload.get("fields") or {}
+    if not fields.get("title"):
+        raise ValueError("title is required")
+    rid = create_risk(company_id=action.company_id, fields=fields)
+    action.target_id = rid
+    session.commit()
+    row = session.query(SupplierRisk).get(rid)
+    return {
+        "id":             row.id,
+        "title":          row.title,
+        "category":       row.category,
+        "node":           row.node,
+        "likelihood":     row.likelihood,
+        "impact":         row.impact,
+        "inherent_score": row.inherent_score,
+        "status":         row.status,
+    }
+
+
+def _handle_update_risk(action: AgentAction, payload: dict, session) -> dict:
+    from modules.risk_register import update_risk, RISK_FIELDS
+    row = session.query(SupplierRisk).get(action.target_id)
+    if row is None:
+        raise ValueError(f"Risk id={action.target_id} not found")
+    if row.company_id != action.company_id:
+        raise PermissionError("Cross-company write blocked")
+
+    fields = {k: v for k, v in (payload.get("fields") or {}).items()
+              if k in RISK_FIELDS}
+    if not fields:
+        raise ValueError("No valid fields to update")
+
+    # Sanity bounds for likelihood / impact (1-5)
+    for k in ("likelihood", "impact", "residual_likelihood", "residual_impact"):
+        if k in fields and fields[k] is not None:
+            try:
+                v = int(fields[k])
+                if v < 1 or v > 5:
+                    raise ValueError(f"{k}={v} outside 1..5")
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"{k} must be 1..5: {e}")
+
+    ok = update_risk(action.company_id, int(action.target_id), fields)
+    if not ok:
+        raise ValueError("Update failed (not found or cross-company)")
+    row = session.query(SupplierRisk).get(action.target_id)
+    return {
+        "id":             row.id,
+        "title":          row.title,
+        "category":       row.category,
+        "likelihood":     row.likelihood,
+        "impact":         row.impact,
+        "inherent_score": row.inherent_score,
+        "residual_score": row.residual_score,
+        "status":         row.status,
+        "mitigation_strategy": row.mitigation_strategy,
+    }
+
+
+def _handle_delete_risk(action: AgentAction, payload: dict, session) -> dict:
+    row = session.query(SupplierRisk).get(action.target_id)
+    if row is None:
+        raise ValueError(f"Risk id={action.target_id} not found")
+    if row.company_id != action.company_id:
+        raise PermissionError("Cross-company write blocked")
+    snap = {"id": row.id, "title": row.title, "status": row.status,
+            "inherent_score": row.inherent_score}
+    session.delete(row)
+    session.commit()
+    return snap
+
+
+def _handle_save_supplier_tco(action: AgentAction, payload: dict, session) -> dict:
+    """Persist a TCO snapshot from a propose_save_supplier_tco action."""
+    from modules.tco import TCOResult, save_tco
+
+    supplier_id = payload.get("supplier_id")
+    if not supplier_id:
+        raise ValueError("supplier_id is required")
+    sup = session.query(Supplier).get(int(supplier_id))
+    if sup is None or sup.company_id != action.company_id:
+        raise PermissionError("Cross-company write blocked")
+
+    baseline = payload.get("baseline") or {}
+    overrides = payload.get("overrides") or {}
+    notes     = payload.get("notes") or ""
+
+    # Reconstruct TCOResult from the stored baseline
+    try:
+        r = TCOResult(**baseline)
+    except Exception as exc:
+        raise ValueError(f"Bad baseline payload: {exc}")
+    r.notes = notes
+
+    snap_id = save_tco(company_id=action.company_id, result=r,
+                       auto_computed=not overrides,
+                       overrides=overrides or None)
+    action.target_id = snap_id
+    session.commit()
+
+    saved = session.query(SupplierTCO).get(snap_id)
+    return {
+        "id":             saved.id,
+        "supplier_id":    saved.supplier_id,
+        "period_start":   saved.period_start.isoformat() if saved.period_start else None,
+        "period_end":     saved.period_end.isoformat() if saved.period_end else None,
+        "total_cost":     saved.total_cost,
+        "tco_per_unit":   saved.tco_per_unit,
+        "auto_computed":  bool(saved.auto_computed),
+    }
+
+
 _HANDLERS: dict[str, Callable[[AgentAction, dict, Any], dict]] = {
     "update_item":              _handle_update_item,
     "create_item":              _handle_create_item,
@@ -339,6 +455,11 @@ _HANDLERS: dict[str, Callable[[AgentAction, dict, Any], dict]] = {
     "delete_supplier":          _handle_delete_supplier,
     "create_buffer_adjustment": _handle_create_buffer_adjustment,
     "delete_buffer_adjustment": _handle_delete_buffer_adjustment,
+    # Risk register + TCO
+    "create_risk":              _handle_create_risk,
+    "update_risk":              _handle_update_risk,
+    "delete_risk":              _handle_delete_risk,
+    "save_supplier_tco":        _handle_save_supplier_tco,
 }
 
 
