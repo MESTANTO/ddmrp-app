@@ -376,21 +376,47 @@ def calculate_on_order(item: Item, as_of: datetime = None) -> float:
         session.close()
 
 
-def calculate_qualified_demand(item: Item, as_of: datetime = None) -> float:
+def calculate_qualified_demand(
+    item: Item,
+    as_of: datetime = None,
+    top_of_red: Optional[float] = None,
+) -> float:
     """
-    Qualified demand = demand spikes (actual orders) due within the item's
-    Spike Horizon.  Forecast entries are excluded from spikes.
-    A spike is any single demand entry that exceeds (Spike Threshold Factor x ADU).
+    Qualified demand per Ptak & Smith (2019), Chapter 9 p. 151 and p. 179.
 
-    Spike Horizon and Spike Threshold are configurable per item (deck slide 83);
-    fallbacks: global Settings defaults, then DLT for the horizon and 2x for the factor.
+    Three demand buckets (book rule):
+      1. Past-due  (demand_date <  today): included unconditionally — no threshold.
+      2. Today     (demand_date == today): included unconditionally — no threshold.
+      3. Future    (demand_date in (today, today+spike_horizon]):
+             daily demand totals are compared against spike_threshold;
+             a day qualifies if its total exceeds the threshold, and the full
+             day total (not just the excess) is included.
+
+    Spike threshold is capped at top_of_red (TOR) per book p. 181:
+        "the OST should always be within the total red zone value."
+
+    Pass top_of_red from the caller when zones have already been computed to
+    avoid double work.  If omitted and item.adu > 0 the cap is applied lazily
+    (requires a zones computation; callers like recalculate_buffer should pass
+    it explicitly).
     """
+    from collections import defaultdict
+
     if as_of is None:
         as_of = datetime.utcnow()
 
+    today_date = as_of.date()
+
     spike_horizon_days, spike_factor = resolve_spike_params(item)
-    horizon = as_of + timedelta(days=spike_horizon_days)
-    spike_threshold = item.adu * spike_factor
+    raw_threshold = (item.adu or 0.0) * spike_factor
+
+    # Cap OST ≤ TOR (book p. 181)
+    if top_of_red is not None and top_of_red > 0:
+        spike_threshold = min(raw_threshold, top_of_red)
+    else:
+        spike_threshold = raw_threshold
+
+    horizon_dt = as_of + timedelta(days=spike_horizon_days)
 
     session = get_session()
     try:
@@ -399,23 +425,44 @@ def calculate_qualified_demand(item: Item, as_of: datetime = None) -> float:
             .filter(
                 DemandEntry.item_id == item.id,
                 DemandEntry.demand_type == "actual",
-                DemandEntry.demand_date >= as_of,
-                DemandEntry.demand_date <= horizon,
+                DemandEntry.demand_date <= horizon_dt,
             )
             .all()
         )
-        qualified = sum(e.quantity for e in entries if e.quantity > spike_threshold)
-        return qualified
+
+        past_due_total = 0.0
+        today_total = 0.0
+        # Aggregate future demand by calendar date before applying threshold
+        daily_future: dict = defaultdict(float)
+
+        for e in entries:
+            qty = float(e.quantity or 0)
+            d = e.demand_date.date() if hasattr(e.demand_date, "date") else e.demand_date
+            if d < today_date:
+                past_due_total += qty
+            elif d == today_date:
+                today_total += qty
+            else:
+                daily_future[d] += qty
+
+        # Future spikes: full day total included when daily total > threshold
+        future_spikes = sum(v for v in daily_future.values() if v > spike_threshold)
+
+        return past_due_total + today_total + future_spikes
     finally:
         session.close()
 
 
-def calculate_net_flow_position(item: Item, as_of: datetime = None) -> float:
+def calculate_net_flow_position(
+    item: Item,
+    as_of: datetime = None,
+    top_of_red: Optional[float] = None,
+) -> float:
     """
     Net Flow Position = On-Hand + On-Order - Qualified Demand
     """
     on_order = calculate_on_order(item, as_of)
-    qualified_demand = calculate_qualified_demand(item, as_of)
+    qualified_demand = calculate_qualified_demand(item, as_of, top_of_red=top_of_red)
     return item.on_hand + on_order - qualified_demand
 
 
@@ -494,7 +541,7 @@ def recalculate_buffer(item: Item, as_of: datetime = None,
     # Compute zones using the dynamic ADU
     zones = calculate_zones(item, adu_override=dyn_adu)
 
-    nfp           = calculate_net_flow_position(item, as_of)
+    nfp           = calculate_net_flow_position(item, as_of, top_of_red=zones.top_of_red)
     status        = determine_status(nfp, zones)
     suggested_qty = calculate_suggested_order(nfp, zones)
     next_due      = as_of + timedelta(days=7)   # recalculate again in 1 week
@@ -535,7 +582,7 @@ def recalculate_buffer(item: Item, as_of: datetime = None,
         part_number=item.part_number,
         on_hand=item.on_hand,
         on_order=calculate_on_order(item, as_of),
-        qualified_demand=calculate_qualified_demand(item, as_of),
+        qualified_demand=calculate_qualified_demand(item, as_of, top_of_red=zones.top_of_red),
         net_flow_position=nfp,
         zones=zones,
         status=status,

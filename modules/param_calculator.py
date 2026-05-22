@@ -80,6 +80,9 @@ class CalcParams:
     demand_data_sufficient: bool   # False → not enough history, ADU kept/defaulted
     supply_data_sufficient: bool   # False → not enough supply data, DLT/LTF kept
 
+    # Advisory notes (warnings, guidance)
+    notes: str = ""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core calculation
@@ -89,7 +92,7 @@ def calculate_params(
     item: Item,
     lookback_days: int   = 60,
     forward_days: int    = 30,
-    adu_method: str      = "blended",   # "past" | "forward" | "blended"
+    adu_method: str      = "past",      # "past" | "forward" | "blended" — book default is past-only
     past_weight: float   = 0.6,
     forward_weight: float = 0.4,
 ) -> CalcParams:
@@ -212,6 +215,20 @@ def calculate_params(
         ltf   = item.lead_time_factor if item.lead_time_factor > 0 else 0.5
         cv_lt = 0.5
 
+    # DLT divergence warning (Ptak & Smith p. 99 / Deviation 5):
+    # param_calculator DLT is derived from open supply-order dates — a reasonable proxy
+    # for purchased items but not for manufactured items where bom_engine.compute_dlt()
+    # gives the structural (longest unprotected cumulative) lead time.
+    _notes = ""
+    if item.dlt and item.dlt > 0:
+        dlt_div_pct = abs(dlt - item.dlt) / item.dlt * 100
+        if dlt_div_pct > 20:
+            _notes = (
+                f"Computed DLT ({dlt} days) diverges {dlt_div_pct:.0f}% from stored "
+                f"structural DLT ({item.dlt} days). For manufactured items use "
+                "bom_engine.compute_dlt() as the authoritative source."
+            )
+
     return CalcParams(
         item_id=item.id,
         part_number=item.part_number,
@@ -233,13 +250,14 @@ def calculate_params(
         adu_method=adu_method,
         demand_data_sufficient=demand_sufficient,
         supply_data_sufficient=supply_sufficient,
+        notes=_notes,
     )
 
 
 def calculate_all_params(
     lookback_days: int   = 60,
     forward_days: int    = 30,
-    adu_method: str      = "blended",
+    adu_method: str      = "past",      # book default: pure historical
     past_weight: float   = 0.6,
     forward_weight: float = 0.4,
     company_id: int      = None,
