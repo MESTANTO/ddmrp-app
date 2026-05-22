@@ -24,7 +24,12 @@ import plotly.express as px
 import streamlit as st
 
 from agents import chat_tools
-from agents.action_applier import apply_action, reject_action
+from agents.action_applier import (
+    apply_action,
+    apply_actions_bulk,
+    reject_action,
+    reject_actions_bulk,
+)
 from agents.inventory_agent import ANALYSIS_CATEGORIES
 from agents.llm_client import (
     DEFAULT_MODEL,
@@ -1243,6 +1248,7 @@ def _show_pending_tab(company_id: int, user_id: int):
     if not pending:
         st.caption("Nothing to review right now.")
     else:
+        _render_bulk_actions_bar(pending, company_id)
         for a in pending:
             _render_pending_card(a, company_id, user_id)
 
@@ -1264,6 +1270,123 @@ def _show_pending_tab(company_id: int, user_id: int):
                     "Notes":   (a.get("notes")  or "")[:80],
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _render_bulk_actions_bar(pending: list[dict], company_id: int):
+    """Approve-All / Reject-All bar with a confirmation gate.
+
+    Two-click flow per action to prevent fat-fingered mass approvals:
+      click 1 → arms the confirmation (stored in session_state)
+      click 2 → runs the bulk apply/reject loop with a live progress UI
+    """
+    ids_by_type: dict[str, list[int]] = {}
+    for a in pending:
+        ids_by_type.setdefault(a["action_type"], []).append(a["id"])
+    all_ids = [a["id"] for a in pending]
+
+    arm_key = "aim_bulk_arm"   # holds 'approve' | 'reject' | None
+    st.session_state.setdefault(arm_key, None)
+
+    armed = st.session_state[arm_key]
+
+    if armed is None:
+        c1, c2, c3, c4 = st.columns([1.4, 1.4, 2.2, 3])
+        if c1.button(f"✅ Approve all ({len(all_ids)})",
+                     type="primary", use_container_width=True,
+                     key="aim_bulk_approve_arm"):
+            st.session_state[arm_key] = "approve"
+            st.rerun()
+        if c2.button(f"❌ Reject all ({len(all_ids)})",
+                     use_container_width=True,
+                     key="aim_bulk_reject_arm"):
+            st.session_state[arm_key] = "reject"
+            st.rerun()
+        # Per-type counts so the user sees what's in the queue at a glance
+        if len(ids_by_type) > 1:
+            summary = "  ·  ".join(f"{k}: {len(v)}" for k, v in ids_by_type.items())
+            c3.caption(summary)
+        st.divider()
+        return
+
+    # Confirmation gate
+    if armed == "approve":
+        st.warning(f"⚠️ About to apply **{len(all_ids)}** pending change(s). "
+                   "Each runs through the same write path the UI uses. "
+                   "Failures on individual rows are reported but do not abort "
+                   "the batch.")
+        c1, c2, _ = st.columns([1.5, 1, 4])
+        if c1.button("Confirm — apply all", type="primary",
+                     use_container_width=True, key="aim_bulk_approve_go"):
+            _run_bulk_approve(all_ids)
+            st.session_state[arm_key] = None
+            st.rerun()
+        if c2.button("Cancel", use_container_width=True,
+                     key="aim_bulk_approve_cancel"):
+            st.session_state[arm_key] = None
+            st.rerun()
+    elif armed == "reject":
+        st.warning(f"⚠️ About to reject **{len(all_ids)}** pending change(s). "
+                   "Data is unchanged; rows move to History as `rejected`.")
+        reason = st.text_input("Rejection reason (applied to all)",
+                               key="aim_bulk_reject_reason",
+                               placeholder="e.g. proposed during a stale demand window")
+        c1, c2, _ = st.columns([1.5, 1, 4])
+        if c1.button("Confirm — reject all", type="primary",
+                     use_container_width=True, key="aim_bulk_reject_go"):
+            _run_bulk_reject(all_ids, reason or "")
+            st.session_state[arm_key] = None
+            st.rerun()
+        if c2.button("Cancel", use_container_width=True,
+                     key="aim_bulk_reject_cancel"):
+            st.session_state[arm_key] = None
+            st.rerun()
+    st.divider()
+
+
+def _run_bulk_approve(action_ids: list[int]):
+    """Loop apply_action with a live progress UI, then summarise."""
+    total = len(action_ids)
+    with st.status(f"Applying {total} change(s)…", expanded=True) as status:
+        progress = st.progress(0.0, text=f"0 / {total}")
+
+        def _cb(i: int, n: int, res: dict):
+            progress.progress(i / max(n, 1),
+                              text=f"{i} / {n}  ·  action #{res.get('id')}")
+
+        result = apply_actions_bulk(action_ids, progress_cb=_cb)
+        applied = result["applied"]
+        failed  = result["failed"]
+        already = result["already"]
+        if failed == 0:
+            status.update(label=f"✅ Applied {applied} change(s)",
+                          state="complete")
+        else:
+            status.update(label=f"⚠️ Applied {applied} · Failed {failed}",
+                          state="error")
+        # Inline per-row outcomes for failures
+        if failed:
+            rows = [{"id": r["id"],
+                     "ok": bool(r.get("ok")),
+                     "error": r.get("error", ""),
+                     "after": "…" if r.get("after") else ""}
+                    for r in result["results"] if not r.get("ok")]
+            st.markdown("**Failed actions:**")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True)
+        st.caption(f"applied={applied}  failed={failed}  already={already}  total={total}")
+
+
+def _run_bulk_reject(action_ids: list[int], reason: str):
+    total = len(action_ids)
+    with st.status(f"Rejecting {total} change(s)…", expanded=False) as status:
+        result = reject_actions_bulk(action_ids, reason=reason)
+        if result["failed"] == 0:
+            status.update(label=f"✅ Rejected {result['rejected']} change(s)",
+                          state="complete")
+        else:
+            status.update(label=(f"⚠️ Rejected {result['rejected']} · "
+                                 f"Failed {result['failed']}"),
+                          state="error")
 
 
 def _render_pending_card(a: dict, company_id: int, user_id: int):

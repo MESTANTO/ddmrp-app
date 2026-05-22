@@ -542,6 +542,85 @@ def reject_action(action_id: int, reason: str = "") -> dict:
         session.close()
 
 
+def list_pending_action_ids(company_id: int, action_type: str | None = None) -> list[int]:
+    """Return all pending action ids for a company, optionally filtered by type."""
+    session = SessionLocal()
+    try:
+        q = (session.query(AgentAction.id)
+             .filter(AgentAction.company_id == company_id,
+                     AgentAction.status == "pending"))
+        if action_type:
+            q = q.filter(AgentAction.action_type == action_type)
+        q = q.order_by(AgentAction.created_at.asc())
+        return [row[0] for row in q.all()]
+    finally:
+        session.close()
+
+
+def apply_actions_bulk(action_ids: list[int],
+                       progress_cb: Callable[[int, int, dict], None] | None = None
+                       ) -> dict:
+    """Apply many pending actions sequentially.
+
+    Each action runs inside its own session via `apply_action`. A failure on
+    one row does not abort the loop — its error is captured in `notes` and
+    the remaining actions still run.
+
+    Returns:
+        {ok, total, applied, failed, already, results: [{id, ...}, ...]}
+    """
+    results: list[dict] = []
+    applied = failed = already = 0
+    total = len(action_ids)
+    for i, aid in enumerate(action_ids, start=1):
+        res = apply_action(int(aid))
+        res = {"id": int(aid), **res}
+        results.append(res)
+        if res.get("already_applied"):
+            already += 1
+        elif res.get("ok"):
+            applied += 1
+        else:
+            failed += 1
+        if progress_cb is not None:
+            try:
+                progress_cb(i, total, res)
+            except Exception:
+                pass
+    return {
+        "ok": True,
+        "total": total,
+        "applied": applied,
+        "failed": failed,
+        "already": already,
+        "results": results,
+    }
+
+
+def reject_actions_bulk(action_ids: list[int], reason: str = "") -> dict:
+    """Reject many pending actions. Returns aggregate counters + per-row results."""
+    results: list[dict] = []
+    rejected = skipped = failed = 0
+    for aid in action_ids:
+        res = reject_action(int(aid), reason)
+        res = {"id": int(aid), **res}
+        results.append(res)
+        if res.get("already_handled"):
+            skipped += 1
+        elif res.get("ok"):
+            rejected += 1
+        else:
+            failed += 1
+    return {
+        "ok": True,
+        "total": len(action_ids),
+        "rejected": rejected,
+        "skipped": skipped,
+        "failed": failed,
+        "results": results,
+    }
+
+
 def _invalidate_caches() -> None:
     """Clear page-level @st.cache_data caches so changes show up immediately."""
     # Wrapped in try/except so a missing cached loader never blocks the apply.
