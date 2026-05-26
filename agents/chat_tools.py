@@ -342,6 +342,21 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "list_skills",
+            "description": (
+                "Return the full catalog of analysis skills available to the agent, "
+                "with skill_id, label, and description for each one. "
+                "Call this whenever the user asks 'what can you do?', 'what analyses "
+                "are available?', 'what skills do you have?', or similar capability "
+                "questions. Returns both base DDMRP skills (1–9) and book-derived "
+                "optimization skills (10+)."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "propose_value_reduction",
             "description": (
                 "The headline tool: runs skill_08 (inventory value reduction) and "
@@ -1259,7 +1274,7 @@ def _t_run_skill(company_id: int, skill_id: int, model: str, api_key: str, **_) 
     Does NOT persist to AgentRun/AgentSignal — chat invocations are ephemeral.
     """
     if skill_id not in _SKILL_ID_TO_KEY:
-        return {"error": f"Unknown skill_id={skill_id}. Valid: 1–8."}
+        return {"error": f"Unknown skill_id={skill_id}. Valid: 1–{_MAX_SKILL_ID}."}
 
     cat_key = _SKILL_ID_TO_KEY[skill_id]
     raw     = collect_raw_data(company_id)
@@ -1293,6 +1308,34 @@ def _t_run_skill(company_id: int, skill_id: int, model: str, api_key: str, **_) 
     label = next((c["label"] for c in ANALYSIS_CATEGORIES if c["key"] == cat_key), cat_key)
     return {"skill": label, "skill_key": cat_key,
             "count": len(serialised), "signals": serialised}
+
+
+def _t_list_skills(**_) -> dict:
+    """Return the full catalog of available analysis skills with IDs, labels, and what to expect."""
+    base_skills = []
+    book_skills = []
+    for idx, cat in enumerate(ANALYSIS_CATEGORIES, 1):
+        entry = {
+            "skill_id":    idx,
+            "key":         cat["key"],
+            "label":       cat["label"],
+            "description": cat.get("description", ""),
+        }
+        if cat["key"].startswith("book_"):
+            book_skills.append(entry)
+        else:
+            base_skills.append(entry)
+    return {
+        "total": len(ANALYSIS_CATEGORIES),
+        "base_skills": base_skills,
+        "book_skills": book_skills,
+        "usage_hint": (
+            "Call run_skill(skill_id=N) to execute any skill. "
+            "Call run_all_skills() to run all base skills at once. "
+            "Book skills (10+) apply academic optimization frameworks "
+            "from 'Optimization Modeling for Supply Chain Applications' (Haitao Li, 2023)."
+        ),
+    }
 
 
 def _t_propose_value_reduction(company_id: int, model: str, api_key: str,
@@ -2223,6 +2266,7 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict]] = {
     "list_data_quality":       _t_list_data_quality,
     "abc_xyz_matrix":          _t_abc_xyz_matrix,
     "run_skill":               _t_run_skill,
+    "list_skills":             _t_list_skills,
     "propose_value_reduction": _t_propose_value_reduction,
     "render_chart":            _t_render_chart,
     # Write tools — queue pending changes for human approval
