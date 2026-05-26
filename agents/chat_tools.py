@@ -2449,11 +2449,16 @@ def resolve_tool_name(name: str) -> str:
 
 def parse_inline_tool_calls(text: str) -> list[tuple[str, dict]]:
     """
-    Parse <tool_call>...</tool_call> blocks that some models (Kimi, Qwen,
-    some llama variants) emit as plain text instead of using OpenAI's
-    structured tool_calls field.
+    Parse tool-call blocks that some models (Kimi, Qwen, llama variants)
+    emit as plain text instead of OpenAI's structured tool_calls field.
 
-    Accepts the common JSON shapes:
+    Handles four common formats:
+      1. <tool_call>{"name": "...", "arguments": {...}}</tool_call>  (with closing tag)
+      2. <tool_call>{"name": "...", "arguments": {...}}              (no closing tag)
+      3. <tool_call>\n{"name": "...", "arguments": {...}}\n          (newline-separated)
+      4. Bare JSON object on its own line (last-resort fallback)
+
+    Accepts JSON shapes:
       {"name": "...", "arguments": {...}}
       {"tool_name": "...", "parameters": {...}}
       {"function": "...", "args": {...}}
@@ -2463,23 +2468,50 @@ def parse_inline_tool_calls(text: str) -> list[tuple[str, dict]]:
     import re
     if not text or "<tool_call>" not in text:
         return []
+
     results: list[tuple[str, dict]] = []
-    for m in re.finditer(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
-        blob = m.group(1).strip()
+    seen: set[int] = set()  # deduplicate by blob position
+
+    def _parse_blob(blob: str, pos: int = -1) -> None:
+        blob = blob.strip()
+        if not blob or pos in seen:
+            return
+        seen.add(pos)
         try:
             obj = json.loads(blob)
         except json.JSONDecodeError:
-            continue
+            # Try to extract the first {...} JSON object from the blob
+            m2 = re.search(r"\{.*\}", blob, re.DOTALL)
+            if not m2:
+                return
+            try:
+                obj = json.loads(m2.group(0))
+            except json.JSONDecodeError:
+                return
         if not isinstance(obj, dict):
-            continue
-        raw_name = obj.get("name") or obj.get("tool_name") or obj.get("function") or ""
-        args     = (obj.get("arguments") or obj.get("parameters")
-                    or obj.get("args") or obj.get("input") or {})
+            return
+        raw_name = (obj.get("name") or obj.get("tool_name")
+                    or obj.get("function") or "")
+        args = (obj.get("arguments") or obj.get("parameters")
+                or obj.get("args") or obj.get("input") or {})
         if not isinstance(args, dict):
             args = {}
         canonical = resolve_tool_name(str(raw_name))
         if canonical:
             results.append((canonical, args))
+
+    # Pass 1: with closing tag  <tool_call>...</tool_call>
+    for m in re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL):
+        _parse_blob(m.group(1), m.start())
+
+    # Pass 2: without closing tag — everything after <tool_call> up to EOL or next tag
+    for m in re.finditer(r"<tool_call>(.*?)(?=<tool_call>|$)", text, re.DOTALL):
+        blob = m.group(1).strip()
+        # Skip if already parsed in pass 1
+        if "</tool_call>" in blob:
+            continue
+        _parse_blob(blob, m.start())
+
     return results
 
 
