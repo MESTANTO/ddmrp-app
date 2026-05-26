@@ -110,6 +110,10 @@ _TYPE_LABEL = {
 
 # Inventory-value-focused quick prompts (replace the old generic ones)
 QUICK_PROMPTS = [
+    ("🧠 What analyses can you do?",
+     "List all the analysis skills you have available. For each one, "
+     "tell me the skill ID, what it analyses, and what kind of findings "
+     "or signals I can expect as output."),
     ("💶 Where is my cash trapped?",
      "Compute the inventory value summary and tell me where the cash is "
      "tied up. Break it down by ABC class and by execution colour, then "
@@ -143,9 +147,9 @@ QUICK_PROMPTS = [
 def show():
     st.header("🤖 AI Inventory Manager")
     st.caption(
-        "An inventory-value expert that combines 8 focused DDMRP skills with a "
-        "tool-calling chat. Ask it where your cash is trapped, run any of the "
-        "skills on demand, and let it render charts inline."
+        "An inventory-value expert with 25 analysis skills (9 built-in DDMRP + "
+        "16 optimization frameworks from supply chain OR). Ask it what it can do, "
+        "run any skill on demand, and let it render charts inline."
     )
 
     # Self-heal the agent_runs / agent_signals schema if a stale init_db
@@ -543,11 +547,12 @@ RISK DECISION GUIDE:
 
 **CAPABILITY QUESTIONS — what you can do**
 
-When a user asks "what can you do?", "what analyses are available?",
-"what skills do you have?", "list your capabilities", or similar:
+MANDATORY: When a user asks "what can you do?", "what analyses are available?",
+"what skills do you have?", "list your capabilities", "what can you analyse?",
+or any similar capability question — you MUST call `list_skills()` first.
+Never answer from memory. The catalog changes as new skills are deployed.
 
-1. Call `list_skills()` — this returns the full live catalog (currently 25 skills).
-2. Present the result in two sections:
+After calling `list_skills()`, present the result in two sections:
 
 **Section 1 — Built-in DDMRP skills (IDs 1–9):**
 For each skill: `Skill N — [Label]: [what signals it produces and what action it drives]`
