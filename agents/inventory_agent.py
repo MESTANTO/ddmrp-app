@@ -114,6 +114,31 @@ ANALYSIS_CATEGORIES = [
     },
 ]
 
+# ---------------------------------------------------------------------------
+# Dynamic book skill discovery — scans agents/skills/book/ at import time
+# ---------------------------------------------------------------------------
+
+_BOOK_SKILLS_DIR = _SKILLS_DIR / "book"
+if _BOOK_SKILLS_DIR.exists():
+    _master_path = _BOOK_SKILLS_DIR / "book_master.md"
+    if _master_path.exists():
+        ANALYSIS_CATEGORIES.append({
+            "key":        "book_master",
+            "label":      "Book: Master Framework",
+            "skill_file": "book/book_master.md",
+            "data_keys":  ["snapshot"],
+            "description": "Applies the book's overall framework and mental models to the inventory.",
+        })
+    for _ch_file in sorted(_BOOK_SKILLS_DIR.glob("book_ch*.md")):
+        _num = _ch_file.stem.replace("book_ch", "")
+        ANALYSIS_CATEGORIES.append({
+            "key":        f"book_ch{_num}",
+            "label":      f"Book: Chapter {int(_num)}",
+            "skill_file": f"book/{_ch_file.name}",
+            "data_keys":  ["snapshot"],
+            "description": f"Applies Chapter {int(_num)} knowledge from the book to the inventory.",
+        })
+
 _CATEGORY_BY_KEY = {c["key"]: c for c in ANALYSIS_CATEGORIES}
 
 # ---------------------------------------------------------------------------

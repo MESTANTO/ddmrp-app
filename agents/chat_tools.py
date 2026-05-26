@@ -188,6 +188,10 @@ def _summarise(action: AgentAction) -> str:
 # OpenAI tool schemas
 # ---------------------------------------------------------------------------
 
+# Computed at import time so book-derived skills added to ANALYSIS_CATEGORIES
+# by the discovery block in inventory_agent.py are automatically reflected.
+_MAX_SKILL_ID = len(ANALYSIS_CATEGORIES)
+
 TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
@@ -318,17 +322,18 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "run_skill",
             "description": (
-                "Run one of the 9 focused inventory analyses (a single LLM-backed "
-                "skill) and return its parsed signals. Skills: 1=data_quality, "
-                "2=buffer_nfp, 3=abc_xyz, 4=demand_variability, 5=safety_stock, "
-                "6=overstock, 7=supplier_risk, 8=value_reduction, "
-                "9=demand_forecasting. Use when the user asks for a full analysis."
+                f"Run a focused LLM-backed inventory analysis skill (1–{_MAX_SKILL_ID}). "
+                "Skills 1–9: built-in DDMRP analyses (1=data_quality, 2=buffer_nfp, "
+                "3=abc_xyz, 4=demand_variability, 5=safety_stock, 6=overstock, "
+                "7=supplier_risk, 8=value_reduction, 9=demand_forecasting). "
+                f"Skills 10–{_MAX_SKILL_ID}: book-derived chapter knowledge applied to "
+                "your inventory. Use run_all_skills to run all categories."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "skill_id": {"type": "integer", "minimum": 1, "maximum": 9,
-                                 "description": "Skill number 1–9 (9=Demand Forecasting)."},
+                    "skill_id": {"type": "integer", "minimum": 1, "maximum": _MAX_SKILL_ID,
+                                 "description": f"Skill number 1–{_MAX_SKILL_ID}."},
                 },
                 "required": ["skill_id"],
             },
