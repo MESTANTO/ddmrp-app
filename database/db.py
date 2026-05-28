@@ -569,6 +569,51 @@ class AgentAction(Base):
 
 
 # ---------------------------------------------------------------------------
+# Optimization Sessions — deterministic OR module
+#
+# Each user-launched optimization (sourcing LP, facility location, MPS,
+# routing, …) writes ONE OptimizationRun row + N OptimizationResult rows.
+# Snapshots are kept for 10 days; older rows are reaped on init_db().
+# ---------------------------------------------------------------------------
+
+class OptimizationRun(Base):
+    """One row per optimization scenario executed by a user."""
+    __tablename__ = "optimization_runs"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    company_id      = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    user_id         = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # session key in {ses01_sourcing, ses02_network, ses03_facility, ses04_decoupling,
+    #                 ses05_mps, ses06_scheduling, ses07_routing, ses08_finance}
+    session_key     = Column(String, nullable=False)
+    scenario_name   = Column(String, default="")
+    params_json     = Column(Text,   default="{}")   # JSON-serialized input params
+    status          = Column(String, default="pending")   # pending | running | solved | infeasible | failed
+    objective_value = Column(Float,  nullable=True)
+    solver_used     = Column(String, default="")     # CBC | NETWORKX | ORTOOLS | SCIPY
+    runtime_ms      = Column(Integer, nullable=True)
+    error_message   = Column(Text,   nullable=True)
+    created_at      = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at      = Column(DateTime, nullable=False)
+
+    results = relationship("OptimizationResult", back_populates="run", cascade="all, delete")
+
+
+class OptimizationResult(Base):
+    """One JSON payload per kind of artefact produced by an optimization run."""
+    __tablename__ = "optimization_results"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    run_id       = Column(Integer, ForeignKey("optimization_runs.id"), nullable=False)
+    # kind in {allocation, schedule, route, sensitivity, summary, kpi, gantt, chart_data}
+    kind         = Column(String, nullable=False)
+    payload_json = Column(Text,   nullable=False)
+    created_at   = Column(DateTime, default=datetime.utcnow)
+
+    run = relationship("OptimizationRun", back_populates="results")
+
+
+# ---------------------------------------------------------------------------
 # BOM (Bill of Materials) — used by compute_dlt() in bom_engine.py
 # ---------------------------------------------------------------------------
 
@@ -678,6 +723,9 @@ def init_db():
     _migrate_agent_tables()
     # TCO + Risk Register tables (created by create_all; no-op if already there)
     _migrate_tco_risk_tables()
+    # Optimization runs/results tables + reap snapshots older than 10 days
+    _migrate_optimization_tables()
+    _reap_expired_optimization_runs()
 
 
 def _migrate_buffer_columns():
@@ -935,6 +983,36 @@ def _migrate_tco_risk_tables():
     future column additions on existing tables.
     """
     Base.metadata.create_all(engine)
+
+
+def _migrate_optimization_tables():
+    """
+    Ensure optimization_runs and optimization_results tables exist with current
+    columns. create_all() creates missing tables; _add_columns_safely covers
+    any future additions.
+    """
+    Base.metadata.create_all(engine)
+
+
+def _reap_expired_optimization_runs():
+    """
+    Delete optimization runs (and cascade their results) whose `expires_at`
+    is in the past. Snapshots are intentionally short-lived (10 days) to
+    avoid stale what-if scenarios hanging around the database.
+    """
+    session = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        expired = session.query(OptimizationRun).filter(
+            OptimizationRun.expires_at < now
+        ).all()
+        for run in expired:
+            session.delete(run)
+        session.commit()
+    except Exception:
+        session.rollback()
+    finally:
+        session.close()
 
 
 def seed_company_data(company_id: int):

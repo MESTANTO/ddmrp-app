@@ -75,6 +75,9 @@ GROUPS: dict[str, list[tuple[str, str]]] = {
         ("⚠️  Risk Register",          "risk_register"),
         ("📤  Export to Excel",       "export"),
     ],
+    "🧮  Optimization": [
+        ("🧮  Optimization Sessions", "optimization_home"),
+    ],
 }
 
 # Bottom-level standalone pages
@@ -248,6 +251,10 @@ elif page_key == "risk_register":
 
 elif page_key == "export":
     from modules.export import show
+    show()
+
+elif page_key == "optimization_home":
+    from views.optimization.home import show
     show()
 
 elif page_key == "settings":
