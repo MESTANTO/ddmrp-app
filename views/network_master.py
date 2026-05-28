@@ -22,8 +22,28 @@ import streamlit as st
 
 from database.db import (
     get_session, Location, Lane, LocationDemand, Supplier, Item,
+    Base, engine,
 )
 from database.auth import get_company_id
+
+
+def _ensure_tables_exist() -> None:
+    """
+    Defensive: make sure the network tables exist before any query runs.
+
+    On Streamlit Cloud, init_db() is cached with @st.cache_resource and
+    only runs once per worker process. Right after a deploy that adds new
+    tables, a worker may still be serving with stale-state, so we re-issue
+    create_all() here. The call is idempotent on Postgres + SQLite — no
+    cost if the tables already exist.
+    """
+    try:
+        Base.metadata.create_all(engine, tables=[
+            Location.__table__, Lane.__table__, LocationDemand.__table__,
+        ])
+    except Exception:
+        # If migrations failed, the query below will raise a clearer error.
+        pass
 
 
 NODE_TYPES = ["plant", "dc", "customer", "supplier"]
@@ -76,6 +96,7 @@ def _location_options(company_id: int, types: list[str] | None = None) -> dict[i
 # ───────────────────────────────────────────────────────────────────────────
 
 def show() -> None:
+    _ensure_tables_exist()
     company_id = get_company_id()
 
     st.title("🌐 Network Master")

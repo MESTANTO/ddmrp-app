@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from database.auth import get_company_id, get_current_user
+from database.db import Base, engine, Location, Lane, LocationDemand
 from modules.optimization.data_adapters import load_network_inputs
 from modules.optimization.ses02_network import solve as solve_network
 from modules.optimization.solver_base import record_run
@@ -25,6 +26,14 @@ from views.optimization._shared import (
 
 
 def show() -> None:
+    # Defensive: ensure new network tables exist (no-op if already created).
+    try:
+        Base.metadata.create_all(engine, tables=[
+            Location.__table__, Lane.__table__, LocationDemand.__table__,
+        ])
+    except Exception:
+        pass
+
     company_id = get_company_id()
     user       = get_current_user()
     user_id    = user.get("id") if user else None
