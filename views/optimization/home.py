@@ -26,7 +26,7 @@ SESSIONS: list[dict] = [
         "icon":  "🌐",
         "tag":   "Ch4 Network LP",
         "blurb": "Push flow from plants → DCs → customers at minimum cost; visualise the Sankey of optimal lanes.",
-        "status": "coming",
+        "status": "available",
     },
     {
         "key":   "ses03_facility",
@@ -86,6 +86,10 @@ def show() -> None:
         if selected == "ses01_sourcing":
             from views.optimization import ses01_sourcing
             ses01_sourcing.show()
+            return
+        if selected == "ses02_network":
+            from views.optimization import ses02_network
+            ses02_network.show()
             return
         # Future sessions will be wired here as they ship.
         st.warning(f"Session `{selected}` is not yet available.")

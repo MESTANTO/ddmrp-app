@@ -569,6 +569,105 @@ class AgentAction(Base):
 
 
 # ---------------------------------------------------------------------------
+# Supply Network — Locations & Lanes (multi-echelon master data)
+#
+# Used by Session 2 (Multi-Echelon Network Flow), Session 3 (Facility
+# Location), Session 4 (Decoupling Placement) and Session 7 (Routing).
+#
+# Design rules (per user instruction):
+#   - DO NOT duplicate columns that already live on `suppliers` or `items`.
+#   - Existing Supplier is the procurement-entity master; Location is the
+#     physical-network-node master. A supplier's plant can be exposed as a
+#     Location with node_type='supplier' AND a `supplier_id` FK back to
+#     the supplier row, so contact/lead-time/reliability are read-through.
+#   - Item-level on_hand stays on `items` (aggregate); per-location stock
+#     can be tracked later via LocationDemand or a future LocationStock
+#     table — not duplicated here.
+# ---------------------------------------------------------------------------
+
+class Location(Base):
+    """A physical node in the supply network (plant, DC, customer, supplier)."""
+    __tablename__ = "locations"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    company_id   = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    code         = Column(String, nullable=False)
+    name         = Column(String, nullable=False)
+    # node_type ∈ {plant, dc, customer, supplier}
+    node_type    = Column(String, nullable=False)
+
+    # Location attributes
+    country      = Column(String, default="")
+    city         = Column(String, default="")
+    address      = Column(Text,   default="")
+
+    # Capacity / cost — needed for network-flow, facility-location, IRP
+    throughput_capacity = Column(Float, default=0.0)   # max units in/out per day; 0 = ∞
+    storage_capacity    = Column(Float, default=0.0)   # max on-hand at this node; 0 = ∞
+    fixed_open_cost     = Column(Float, default=0.0)   # € / period (Ch7 CFLP)
+    holding_cost_per_unit_day = Column(Float, default=0.0)  # used by IRP / SSPP
+
+    # Optional FK to the existing Supplier row when this node represents
+    # a supplier's plant. Read-through avoids duplicating address/lead-time.
+    supplier_id  = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
+
+    status       = Column(String, default="active")    # active | inactive
+    notes        = Column(Text,   default="")
+
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    supplier     = relationship("Supplier", foreign_keys=[supplier_id])
+
+
+class Lane(Base):
+    """A transportation arc connecting two Locations."""
+    __tablename__ = "lanes"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    company_id   = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    origin_id    = Column(Integer, ForeignKey("locations.id"), nullable=False)
+    dest_id      = Column(Integer, ForeignKey("locations.id"), nullable=False)
+
+    mode         = Column(String, default="truck")   # truck | rail | ocean | air | parcel
+    cost_per_unit   = Column(Float, default=0.0)
+    lead_time_days  = Column(Integer, default=0)
+    capacity_units  = Column(Float, default=0.0)     # 0 = unlimited per period
+
+    status       = Column(String, default="active")  # active | inactive
+    notes        = Column(Text,   default="")
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    origin       = relationship("Location", foreign_keys=[origin_id])
+    dest         = relationship("Location", foreign_keys=[dest_id])
+
+
+class LocationDemand(Base):
+    """
+    Per-customer-location demand for one item over a period.
+
+    Splits the item's aggregate ADU across customer Locations. If no rows
+    exist for an item, the multi-echelon solver falls back to a single
+    virtual customer carrying items.adu × horizon.
+    """
+    __tablename__ = "location_demands"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    company_id    = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    item_id       = Column(Integer, ForeignKey("items.id"), nullable=False)
+    location_id   = Column(Integer, ForeignKey("locations.id"), nullable=False)
+    # Demand for this item at this location, expressed as monthly units.
+    monthly_demand = Column(Float, default=0.0)
+    notes         = Column(Text, default="")
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    updated_at    = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    item          = relationship("Item")
+    location      = relationship("Location")
+
+
+# ---------------------------------------------------------------------------
 # Optimization Sessions — deterministic OR module
 #
 # Each user-launched optimization (sourcing LP, facility location, MPS,
@@ -726,6 +825,8 @@ def init_db():
     # Optimization runs/results tables + reap snapshots older than 10 days
     _migrate_optimization_tables()
     _reap_expired_optimization_runs()
+    # Network master tables (Locations / Lanes / LocationDemand)
+    _migrate_network_tables()
 
 
 def _migrate_buffer_columns():
@@ -990,6 +1091,15 @@ def _migrate_optimization_tables():
     Ensure optimization_runs and optimization_results tables exist with current
     columns. create_all() creates missing tables; _add_columns_safely covers
     any future additions.
+    """
+    Base.metadata.create_all(engine)
+
+
+def _migrate_network_tables():
+    """
+    Ensure locations, lanes, and location_demands tables exist with current
+    columns. create_all() creates missing tables; _add_columns_safely covers
+    any future additions on existing tables.
     """
     Base.metadata.create_all(engine)
 

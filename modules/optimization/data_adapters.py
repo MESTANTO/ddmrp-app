@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from database.db import get_session, Item, Supplier
+from database.db import (
+    get_session, Item, Supplier,
+    Location, Lane, LocationDemand,
+)
 
 
 def load_sourcing_inputs(
@@ -88,6 +91,119 @@ def load_sourcing_inputs(
             "top_n_items":  top_n_items,
             "items":        items_out,
             "suppliers":    suppliers_out,
+        }
+    finally:
+        sess.close()
+
+
+def load_network_inputs(
+    company_id: int,
+    *,
+    horizon_days: int = 30,
+    item_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """
+    Build inputs for the Session 2 multi-echelon min-cost flow.
+
+    Returns:
+        horizon_days:  user-selected horizon
+        locations:     [{id, code, name, node_type, throughput_capacity,
+                         storage_capacity, holding_cost_per_unit_day}]
+        lanes:         [{id, origin_id, dest_id, mode, cost_per_unit,
+                         lead_time_days, capacity_units}]
+        items:         [{id, part_number, unit_cost, aggregate_demand}]
+        per_item_demand: dict[item_id, list[{location_id, demand}]] over horizon
+                         — sourced from LocationDemand × horizon/30 if rows
+                         exist; otherwise a single-virtual-customer fallback.
+
+    Only `active` Lanes/Locations are returned.
+    """
+    sess = get_session()
+    try:
+        locs_q = (sess.query(Location)
+                      .filter(Location.company_id == company_id,
+                              Location.status == "active")
+                      .all())
+        lanes_q = (sess.query(Lane)
+                       .filter(Lane.company_id == company_id,
+                               Lane.status == "active")
+                       .all())
+        items_q = sess.query(Item).filter(Item.company_id == company_id)
+        if item_ids:
+            items_q = items_q.filter(Item.id.in_(item_ids))
+        items_q = items_q.all()
+        demand_q = (sess.query(LocationDemand)
+                        .filter(LocationDemand.company_id == company_id)
+                        .all())
+
+        locations_out = [{
+            "id":                        int(l.id),
+            "code":                      l.code,
+            "name":                      l.name,
+            "node_type":                 l.node_type,
+            "throughput_capacity":       float(l.throughput_capacity or 0.0),
+            "storage_capacity":          float(l.storage_capacity or 0.0),
+            "fixed_open_cost":           float(l.fixed_open_cost or 0.0),
+            "holding_cost_per_unit_day": float(l.holding_cost_per_unit_day or 0.0),
+        } for l in locs_q]
+
+        lanes_out = [{
+            "id":             int(ln.id),
+            "origin_id":      int(ln.origin_id),
+            "dest_id":        int(ln.dest_id),
+            "mode":           ln.mode,
+            "cost_per_unit":  float(ln.cost_per_unit or 0.0),
+            "lead_time_days": int(ln.lead_time_days or 0),
+            "capacity_units": float(ln.capacity_units or 0.0),
+        } for ln in lanes_q]
+
+        items_out: list[dict[str, Any]] = []
+        per_item_demand: dict[int, list[dict[str, Any]]] = {}
+
+        # Index per-item demand rows by item
+        demand_by_item: dict[int, list[Any]] = {}
+        for d in demand_q:
+            demand_by_item.setdefault(int(d.item_id), []).append(d)
+
+        # Default fallback: pick the *first* customer Location as the sink
+        customer_locs = [l for l in locs_q if l.node_type == "customer"]
+        fallback_sink = customer_locs[0].id if customer_locs else None
+
+        scale = horizon_days / 30.0  # LocationDemand.monthly_demand → period
+
+        for it in items_q:
+            adu  = float(it.adu or 0.0)
+            cost = float(it.unit_cost or 0.0)
+            agg_demand = adu * horizon_days
+            items_out.append({
+                "id":               int(it.id),
+                "part_number":      it.part_number,
+                "description":      it.description or "",
+                "unit_cost":        cost,
+                "aggregate_demand": agg_demand,
+            })
+
+            rows = demand_by_item.get(int(it.id))
+            if rows:
+                per_item_demand[int(it.id)] = [
+                    {"location_id": int(r.location_id),
+                     "demand":      float(r.monthly_demand or 0.0) * scale}
+                    for r in rows
+                ]
+            elif fallback_sink and agg_demand > 0:
+                per_item_demand[int(it.id)] = [
+                    {"location_id": int(fallback_sink),
+                     "demand":      agg_demand}
+                ]
+            else:
+                per_item_demand[int(it.id)] = []
+
+        return {
+            "horizon_days":    horizon_days,
+            "locations":       locations_out,
+            "lanes":           lanes_out,
+            "items":           items_out,
+            "per_item_demand": per_item_demand,
         }
     finally:
         sess.close()

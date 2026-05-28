@@ -56,6 +56,7 @@ GROUPS: dict[str, list[tuple[str, str]]] = {
     "📁  Master Data": [
         ("📋  Material Master",       "material_master"),
         ("🏭  Supplier Master",       "supplier_master"),
+        ("🌐  Network Master",        "network_master"),
         ("📈  Demand & Supply",       "demand_supply"),
         ("🔗  Process Designer",      "process_designer"),
         ("🧬  BOM & Auto DLT",        "bom_engine"),
@@ -251,6 +252,10 @@ elif page_key == "risk_register":
 
 elif page_key == "export":
     from modules.export import show
+    show()
+
+elif page_key == "network_master":
+    from views.network_master import show
     show()
 
 elif page_key == "optimization_home":
