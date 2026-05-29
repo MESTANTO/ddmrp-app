@@ -207,3 +207,95 @@ def load_network_inputs(
         }
     finally:
         sess.close()
+
+
+def load_facility_inputs(
+    company_id: int,
+    *,
+    horizon_days: int = 30,
+) -> dict[str, Any]:
+    """
+    Build inputs for the Session 3 facility-location model (Ch7 UFLP/CFLP).
+
+    Candidate facilities = active plant/dc Locations (each carries a
+    `fixed_open_cost` and a per-period `capacity` derived from
+    throughput_capacity × horizon). Customers = active customer Locations,
+    each with aggregate demand over the horizon (summed across all items).
+
+    Transport cost between a facility and a customer is NOT precomputed here;
+    the solver derives it as the cheapest lane-path cost over `lanes`.
+
+    Returns:
+        horizon_days
+        facilities: [{id, code, name, node_type, fixed_open_cost, capacity}]
+                    capacity = throughput_capacity × horizon (0 = ∞)
+        customers:  [{id, code, name, demand}]  (aggregate over horizon)
+        lanes:      [{id, origin_id, dest_id, mode, cost_per_unit,
+                      lead_time_days, capacity_units}]
+    """
+    sess = get_session()
+    try:
+        locs_q = (sess.query(Location)
+                      .filter(Location.company_id == company_id,
+                              Location.status == "active")
+                      .all())
+        lanes_q = (sess.query(Lane)
+                       .filter(Lane.company_id == company_id,
+                               Lane.status == "active")
+                       .all())
+        demand_q = (sess.query(LocationDemand)
+                        .filter(LocationDemand.company_id == company_id)
+                        .all())
+        items_q = sess.query(Item).filter(Item.company_id == company_id).all()
+
+        facilities_out = [{
+            "id":              int(l.id),
+            "code":            l.code,
+            "name":            l.name,
+            "node_type":       l.node_type,
+            "fixed_open_cost": float(l.fixed_open_cost or 0.0),
+            "capacity":        float(l.throughput_capacity or 0.0) * horizon_days,
+        } for l in locs_q if l.node_type in ("plant", "dc")]
+
+        customer_locs = [l for l in locs_q if l.node_type == "customer"]
+
+        scale = horizon_days / 30.0  # monthly_demand → period
+        demand_by_loc: dict[int, float] = {}
+        for d in demand_q:
+            demand_by_loc[int(d.location_id)] = (
+                demand_by_loc.get(int(d.location_id), 0.0)
+                + float(d.monthly_demand or 0.0) * scale
+            )
+
+        # Fallback when no LocationDemand rows exist: load the whole network's
+        # aggregate demand (Σ adu × horizon) onto the first customer location,
+        # mirroring the Session 2 single-virtual-customer fallback.
+        if not demand_by_loc and customer_locs:
+            total_demand = sum(float(it.adu or 0.0) * horizon_days for it in items_q)
+            demand_by_loc[int(customer_locs[0].id)] = total_demand
+
+        customers_out = [{
+            "id":     int(l.id),
+            "code":   l.code,
+            "name":   l.name,
+            "demand": round(demand_by_loc.get(int(l.id), 0.0), 4),
+        } for l in customer_locs]
+
+        lanes_out = [{
+            "id":             int(ln.id),
+            "origin_id":      int(ln.origin_id),
+            "dest_id":        int(ln.dest_id),
+            "mode":           ln.mode,
+            "cost_per_unit":  float(ln.cost_per_unit or 0.0),
+            "lead_time_days": int(ln.lead_time_days or 0),
+            "capacity_units": float(ln.capacity_units or 0.0),
+        } for ln in lanes_q]
+
+        return {
+            "horizon_days": horizon_days,
+            "facilities":   facilities_out,
+            "customers":    customers_out,
+            "lanes":        lanes_out,
+        }
+    finally:
+        sess.close()
