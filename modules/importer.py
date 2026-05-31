@@ -319,6 +319,195 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Supplier-Part (item ↔ supplier) template + importer
+# ---------------------------------------------------------------------------
+
+ITEM_SUPPLIER_HEADERS = [
+    {"name": "Part Number *",     "width": 16},
+    {"name": "Supplier Code *",   "width": 16},
+    {"name": "Unit Cost (€)",     "width": 14},
+    {"name": "Lead Time (days)",  "width": 16},
+    {"name": "Min Order Qty",     "width": 14},
+    {"name": "Preferred",         "width": 12},
+    {"name": "Status",            "width": 12},
+]
+
+ITEM_SUPPLIER_EXAMPLE = ["RM-001", "SUP-001", 24.5, 14, 50.0, "yes", "active"]
+
+
+def build_item_supplier_template() -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Supplier-Part"
+
+    _add_instructions(ws,
+        "Instructions: Fill from row 4 onward. Row 3 is an example (do not delete rows 1-3). "
+        "Fields marked * are required. Part Number must match an existing Item; "
+        "Supplier Code must match an existing Supplier. A part may appear on multiple rows "
+        "(one per supplier). Unit Cost / Lead Time / Min Order Qty left at 0 inherit from the "
+        "Item or Supplier master. Preferred: yes/no — marks the primary source. "
+        "Status options: active, inactive.",
+        row=1, col_span=len(ITEM_SUPPLIER_HEADERS))
+    _write_header(ws, ITEM_SUPPLIER_HEADERS, row=2)
+    _write_example_row(ws, ITEM_SUPPLIER_EXAMPLE, row=3)
+
+    name_to_col = {h["name"]: get_column_letter(i + 1)
+                   for i, h in enumerate(ITEM_SUPPLIER_HEADERS)}
+
+    dv_pref = DataValidation(type="list", formula1='"yes,no"', allow_blank=True)
+    ws.add_data_validation(dv_pref)
+    dv_pref.sqref = f'{name_to_col["Preferred"]}4:{name_to_col["Preferred"]}1000'
+
+    dv_status = DataValidation(type="list", formula1='"active,inactive"', allow_blank=True)
+    ws.add_data_validation(dv_status)
+    dv_status.sqref = f'{name_to_col["Status"]}4:{name_to_col["Status"]}1000'
+
+    ws.freeze_panes = "A4"
+    return _wb_to_bytes(wb)
+
+
+def import_item_suppliers(uploaded_file) -> tuple[int, list[str]]:
+    from database.db import get_session, Item, Supplier, ItemSupplier
+
+    try:
+        df = pd.read_excel(uploaded_file, header=1, skiprows=[2])  # header row 2, skip example row 3
+    except Exception as e:
+        return 0, [f"Could not read file: {e}"]
+
+    df.columns = df.columns.str.strip()
+    df = df.dropna(how="all")
+    df.columns = [c.replace(" *", "").strip() for c in df.columns]
+
+    cid = get_company_id()
+    session = get_session()
+    try:
+        item_map = {
+            (it.part_number or "").strip().upper(): it.id
+            for it in session.query(Item).filter(Item.company_id == cid).all()
+        }
+        sup_map = {
+            (s.code or "").strip().upper(): s.id
+            for s in session.query(Supplier).filter(Supplier.company_id == cid).all()
+        }
+    finally:
+        session.close()
+
+    def _yes(v) -> bool:
+        return str(v).strip().lower() in ("yes", "y", "true", "1", "x")
+
+    errors: list[str] = []
+    new_links: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+
+    for idx, row in df.iterrows():
+        row_num = idx + 4
+        part = str(row.get("Part Number", "")).strip().upper()
+        code = str(row.get("Supplier Code", "")).strip().upper()
+        if not part or part == "NAN":
+            continue
+        if not code or code == "NAN":
+            errors.append(f"Row {row_num}: Supplier Code is required for {part}.")
+            continue
+
+        item_id = item_map.get(part)
+        if item_id is None:
+            errors.append(f"Row {row_num}: Part Number '{part}' not found — row skipped.")
+            continue
+        supplier_id = sup_map.get(code)
+        if supplier_id is None:
+            errors.append(f"Row {row_num}: Supplier Code '{code}' not found — row skipped.")
+            continue
+
+        key = (item_id, supplier_id)
+        if key in seen:
+            errors.append(f"Row {row_num}: duplicate {part} ↔ {code} — row skipped.")
+            continue
+        seen.add(key)
+
+        try:
+            status = str(row.get("Status", "active") or "active").strip().lower()
+            if status not in ("active", "inactive"):
+                status = "active"
+            new_links.append(dict(
+                item_id        = item_id,
+                supplier_id    = supplier_id,
+                unit_cost      = float(row.get("Unit Cost (€)", 0) or 0),
+                lead_time_days = int(float(row.get("Lead Time (days)", 0) or 0)),
+                min_order_qty  = float(row.get("Min Order Qty", 0) or 0),
+                is_preferred   = _yes(row.get("Preferred", "")),
+                status         = status,
+            ))
+        except (ValueError, TypeError) as e:
+            errors.append(f"Row {row_num} ({part} ↔ {code}): invalid numeric value — {e}")
+
+    if not new_links:
+        return 0, errors + ["No valid rows found in file — existing data was NOT deleted."]
+
+    success = 0
+    session = get_session()
+    try:
+        session.query(ItemSupplier).filter(ItemSupplier.company_id == cid).delete()
+        session.flush()
+        for d in new_links:
+            session.add(ItemSupplier(company_id=cid, **d))
+            success += 1
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        errors.append(f"Database error: {e}")
+        success = 0
+    finally:
+        session.close()
+
+    return success, errors
+
+
+def export_item_suppliers() -> bytes:
+    """Export current supplier-part associations into the import template layout."""
+    from database.db import get_session, Item, Supplier, ItemSupplier
+
+    cid = get_company_id()
+    session = get_session()
+    try:
+        item_by_id = {it.id: it for it in session.query(Item).filter(Item.company_id == cid).all()}
+        sup_by_id  = {s.id: s for s in session.query(Supplier).filter(Supplier.company_id == cid).all()}
+        links = (session.query(ItemSupplier)
+                        .filter(ItemSupplier.company_id == cid)
+                        .all())
+        rows = []
+        for ln in links:
+            it = item_by_id.get(ln.item_id)
+            s  = sup_by_id.get(ln.supplier_id)
+            if it is None or s is None:
+                continue
+            rows.append([
+                it.part_number, s.code,
+                float(ln.unit_cost or 0.0),
+                int(ln.lead_time_days or 0),
+                float(ln.min_order_qty or 0.0),
+                "yes" if ln.is_preferred else "no",
+                ln.status or "active",
+            ])
+    finally:
+        session.close()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Supplier-Part"
+    _add_instructions(ws,
+        "Current supplier-part associations. Edit and re-import via the import widget "
+        "(fill from row 4 onward; row 3 is an example).",
+        row=1, col_span=len(ITEM_SUPPLIER_HEADERS))
+    _write_header(ws, ITEM_SUPPLIER_HEADERS, row=2)
+    _write_example_row(ws, ITEM_SUPPLIER_EXAMPLE, row=3)
+    for r, values in enumerate(rows, start=4):
+        for c, val in enumerate(values, start=1):
+            ws.cell(row=r, column=c, value=val)
+    ws.freeze_panes = "A4"
+    return _wb_to_bytes(wb)
+
+
+# ---------------------------------------------------------------------------
 # Demand template + importer
 # ---------------------------------------------------------------------------
 

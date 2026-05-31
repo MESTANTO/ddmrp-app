@@ -12,7 +12,7 @@ from typing import Any
 
 from database.db import (
     get_session, Item, Supplier,
-    Location, Lane, LocationDemand,
+    Location, Lane, LocationDemand, ItemSupplier,
 )
 
 
@@ -28,9 +28,15 @@ def load_sourcing_inputs(
     Returns a dict with:
         items:     list of {part_number, description, demand, unit_cost}
         suppliers: list of {code, name, lead_time_days, reliability_pct, capacity}
-        candidates: list of {item, supplier, unit_cost, effective_cost}
-                    — Cartesian product items × active suppliers, since the
-                    real-world purchase rarely restricts to default supplier.
+        candidates: list of {item_id, supplier_id, unit_cost, lead_time_days,
+                             min_order_qty, is_preferred} — the explicit
+                    supplier↔part links from the Supplier-Part Matrix
+                    (`item_suppliers`), restricted to kept items × active
+                    suppliers. Per-link unit_cost / lead_time inherit from the
+                    Item / Supplier master when left at 0.
+        has_links: True if the company defined ANY supplier-part links. When
+                   False, `candidates` is empty and the solver falls back to
+                   the Cartesian items × suppliers product (legacy behaviour).
 
     `top_n_items` keeps the LP tractable. The selection is by **dollar volume**
     (ADU × unit_cost × horizon), which is also where money is on the line.
@@ -82,15 +88,50 @@ def load_sourcing_inputs(
                 "status":          s.status or "active",
             })
 
-        # Candidate matrix: every item can be sourced from every active supplier.
-        # `effective_cost` blends unit cost + reliability penalty + lead-time
-        # penalty. The penalties are *parametric* — the view exposes the
-        # weights so the user can re-run with different trade-offs.
+        # Candidate links from the Supplier-Part Matrix (item_suppliers).
+        # When the company has defined explicit links, the solver restricts
+        # sourcing to those pairs and inherits per-link unit_cost / lead_time
+        # (0 → fall back to Item.unit_cost / Supplier.lead_time_days). When no
+        # links exist at all, `candidates` stays empty and the solver uses the
+        # Cartesian items × active-suppliers product (legacy behaviour).
+        active_sup_ids = {s["id"] for s in suppliers_out}
+        kept_item_map  = {int(it.id): it for it in items_kept}
+
+        links_q = (sess.query(ItemSupplier)
+                       .filter(ItemSupplier.company_id == company_id,
+                               ItemSupplier.status != "inactive")
+                       .all())
+        has_links = (sess.query(ItemSupplier)
+                         .filter(ItemSupplier.company_id == company_id)
+                         .first() is not None)
+
+        candidates: list[dict[str, Any]] = []
+        for ln in links_q:
+            i_id = int(ln.item_id)
+            s_id = int(ln.supplier_id)
+            if i_id not in kept_item_map or s_id not in active_sup_ids:
+                continue
+            it  = kept_item_map[i_id]
+            sup = next(s for s in sup_q if int(s.id) == s_id)
+            link_cost = float(ln.unit_cost or 0.0)
+            link_lt   = int(ln.lead_time_days or 0)
+            link_moq  = float(ln.min_order_qty or 0.0)
+            candidates.append({
+                "item_id":        i_id,
+                "supplier_id":    s_id,
+                "unit_cost":      link_cost if link_cost > 0 else float(it.unit_cost or 0.0),
+                "lead_time_days": link_lt   if link_lt  > 0 else int(sup.lead_time_days or 0),
+                "min_order_qty":  link_moq  if link_moq > 0 else float(it.min_order_qty or 0.0),
+                "is_preferred":   bool(ln.is_preferred),
+            })
+
         return {
             "horizon_days": horizon_days,
             "top_n_items":  top_n_items,
             "items":        items_out,
             "suppliers":    suppliers_out,
+            "candidates":   candidates,
+            "has_links":    has_links,
         }
     finally:
         sess.close()

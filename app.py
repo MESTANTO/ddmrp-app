@@ -56,6 +56,7 @@ GROUPS: dict[str, list[tuple[str, str]]] = {
     "📁  Master Data": [
         ("📋  Material Master",       "material_master"),
         ("🏭  Supplier Master",       "supplier_master"),
+        ("🔗  Supplier-Part Matrix",  "supplier_part_matrix"),
         ("🌐  Network Master",        "network_master"),
         ("📈  Demand & Supply",       "demand_supply"),
         ("🔗  Process Designer",      "process_designer"),
@@ -192,6 +193,10 @@ elif page_key == "material_master":
 
 elif page_key == "supplier_master":
     from modules.supplier_master import show
+    show()
+
+elif page_key == "supplier_part_matrix":
+    from views.supplier_part_matrix import show
     show()
 
 elif page_key == "demand_supply":

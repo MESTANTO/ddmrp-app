@@ -5,7 +5,7 @@ Supports PostgreSQL (Supabase) via DATABASE_URL secret, with SQLite fallback.
 
 from sqlalchemy import (
     create_engine, Column, Integer, Float, String,
-    DateTime, ForeignKey, Text, Boolean
+    DateTime, ForeignKey, Text, Boolean, UniqueConstraint
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
@@ -227,6 +227,44 @@ class Item(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ItemSupplier(Base):
+    """
+    Many-to-many supplier ↔ part association.
+
+    A part can be sourced from several suppliers; each link carries the
+    supplier-specific commercial terms used by the Sourcing optimization
+    (Session 1). The single `Item.default_supplier_id` is kept for backward
+    compatibility — `is_preferred` here is the multi-supplier equivalent.
+
+    References existing Item/Supplier rows (no duplicated master columns):
+    fall back to Item.unit_cost / Supplier.lead_time_days / Item.min_order_qty
+    when a per-link value is left at 0.
+    """
+    __tablename__ = "item_suppliers"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    company_id     = Column(Integer, ForeignKey("companies.id"), nullable=True)
+    item_id        = Column(Integer, ForeignKey("items.id"), nullable=False)
+    supplier_id    = Column(Integer, ForeignKey("suppliers.id"), nullable=False)
+
+    # Per-link commercial terms (0 / null → inherit from Item or Supplier)
+    unit_cost      = Column(Float,   default=0.0)   # € per unit from this supplier
+    lead_time_days = Column(Integer, default=0)     # overrides Supplier default
+    min_order_qty  = Column(Float,   default=0.0)   # per-link MOQ
+    is_preferred   = Column(Boolean, default=False) # primary source for the part
+    status         = Column(String,  default="active")  # active | inactive
+
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    updated_at     = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    item           = relationship("Item", foreign_keys=[item_id])
+    supplier       = relationship("Supplier", foreign_keys=[supplier_id])
+
+    __table_args__ = (
+        UniqueConstraint("item_id", "supplier_id", name="uq_item_supplier"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +865,8 @@ def init_db():
     _reap_expired_optimization_runs()
     # Network master tables (Locations / Lanes / LocationDemand)
     _migrate_network_tables()
+    # Many-to-many supplier ↔ part associations
+    _migrate_item_supplier_tables()
 
 
 def _migrate_buffer_columns():
@@ -1100,6 +1140,14 @@ def _migrate_network_tables():
     Ensure locations, lanes, and location_demands tables exist with current
     columns. create_all() creates missing tables; _add_columns_safely covers
     any future additions on existing tables.
+    """
+    Base.metadata.create_all(engine)
+
+
+def _migrate_item_supplier_tables():
+    """
+    Ensure the item_suppliers association table exists. create_all() creates
+    the missing table; _add_columns_safely covers future column additions.
     """
     Base.metadata.create_all(engine)
 

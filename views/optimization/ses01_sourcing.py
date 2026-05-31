@@ -114,6 +114,27 @@ def show() -> None:
                 k3.metric("Total demand", f"{total_demand:,.0f}")
                 k4.metric("Total spend", f"€ {total_spend:,.0f}")
 
+                # Sourcing mode — restricted to the Supplier-Part Matrix links
+                # when any exist, otherwise the legacy Cartesian product.
+                candidates = inputs.get("candidates") or []
+                kept_ids   = {it["id"] for it in inputs["items"]}
+                if inputs.get("has_links"):
+                    items_with_link = {c["item_id"] for c in candidates}
+                    missing = len(kept_ids - items_with_link)
+                    st.info(
+                        f"🔗 **Matrix sourcing** — restricted to "
+                        f"{len(candidates)} supplier-part link(s) from the "
+                        f"Supplier-Part Matrix."
+                        + (f" ⚠️ {missing} selected item(s) have no link and "
+                           "will be reported as unsourced." if missing else "")
+                    )
+                else:
+                    st.caption(
+                        "No Supplier-Part Matrix links defined — every item may "
+                        "be sourced from every active supplier (Cartesian). "
+                        "Define links in Master Data → Supplier-Part Matrix to constrain this."
+                    )
+
                 if inputs["items"]:
                     st.markdown("**Items the solver will allocate**")
                     st.dataframe(
@@ -167,6 +188,8 @@ def show() -> None:
                             "max_suppliers_per_item": int(max_per_item),
                             "n_items":     len(inputs["items"]),
                             "n_suppliers": len(inputs["suppliers"]),
+                            "sourcing_mode": "matrix" if inputs.get("has_links") else "cartesian",
+                            "n_candidate_links": len(inputs.get("candidates") or []),
                         },
                         result=result,
                     )
@@ -227,6 +250,17 @@ def _render_results(run, payloads: dict) -> None:
     kpi        = payloads.get("kpi", {})
     allocation = payloads.get("allocation", {}).get("rows", [])
     sens       = payloads.get("sensitivity", {})
+
+    # Sourcing mode + unsourced items (matrix mode only)
+    if summary.get("sourcing_mode") == "matrix":
+        st.caption("🔗 Sourcing restricted to Supplier-Part Matrix links.")
+    unsourced = sens.get("unsourced", [])
+    if unsourced:
+        st.warning(
+            f"⚠️ {len(unsourced)} item(s) had no supplier link and could not be "
+            "sourced. Add links in Master Data → Supplier-Part Matrix."
+        )
+        st.dataframe(pd.DataFrame(unsourced), use_container_width=True, height=160)
 
     # KPIs
     k1, k2, k3, k4 = st.columns(4)
