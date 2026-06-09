@@ -87,6 +87,26 @@ def show() -> None:
                 help="Penalty per item-supplier relationship used. Encourages consolidation.",
             )
 
+        st.markdown("##### 3. Preferred-supplier bias")
+        c7, c8 = st.columns([2, 3])
+        with c7:
+            prefer_preferred = st.checkbox(
+                "Favour preferred suppliers",
+                value=False,
+                help="Gives links flagged 'Preferred' in the Supplier-Part Matrix "
+                     "a small cost advantage so they win on near-ties. Reported "
+                     "costs stay at the true effective cost.",
+            )
+        with c8:
+            preferred_discount = st.slider(
+                "Preferred advantage", 0.0, 0.20, 0.03, step=0.01,
+                format="%.0f%%",
+                disabled=not prefer_preferred,
+                help="Objective-only discount applied to preferred links "
+                     "(e.g. 3% means a preferred supplier wins unless another "
+                     "is more than 3% cheaper).",
+            )
+
         scenario_name = st.text_input(
             "Scenario name (optional)",
             placeholder="e.g. baseline / α=0.20 / consolidate",
@@ -171,6 +191,8 @@ def show() -> None:
                         "beta":  float(beta),
                         "fixed_cost_per_link": float(fixed_cost),
                         "max_suppliers_per_item": int(max_per_item),
+                        "prefer_preferred": bool(prefer_preferred),
+                        "preferred_discount": float(preferred_discount),
                     }
                     with st.spinner("Solving MILP with CBC…"):
                         result = solve_sourcing(params)
@@ -190,6 +212,8 @@ def show() -> None:
                             "n_suppliers": len(inputs["suppliers"]),
                             "sourcing_mode": "matrix" if inputs.get("has_links") else "cartesian",
                             "n_candidate_links": len(inputs.get("candidates") or []),
+                            "prefer_preferred": bool(prefer_preferred),
+                            "preferred_discount": float(preferred_discount),
                         },
                         result=result,
                     )
@@ -302,14 +326,18 @@ def _render_results(run, payloads: dict) -> None:
     if allocation:
         st.markdown("**Optimal allocation (item × supplier)**")
         alloc_df = pd.DataFrame(allocation)
+        if "is_preferred" in alloc_df.columns:
+            alloc_df["preferred"] = alloc_df["is_preferred"].map(
+                lambda v: "⭐" if v else "")
         # nicer column ordering
-        cols = ["part_number", "supplier_code", "supplier_name",
+        cols = ["part_number", "supplier_code", "supplier_name", "preferred",
                 "units", "share_pct", "value", "unit_cost"]
         cols = [c for c in cols if c in alloc_df.columns]
         st.dataframe(
             alloc_df[cols],
             use_container_width=True, height=420,
             column_config={
+                "preferred": st.column_config.TextColumn("Pref.", help="⭐ = preferred supplier link"),
                 "units":     st.column_config.NumberColumn("Units", format="%.0f"),
                 "share_pct": st.column_config.NumberColumn("Share %", format="%.1f%%"),
                 "value":     st.column_config.NumberColumn("Value €", format="€ %.2f"),

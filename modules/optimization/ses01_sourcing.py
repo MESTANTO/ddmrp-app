@@ -73,6 +73,11 @@ def solve(params: dict[str, Any]) -> SolveResult:
     beta        = float(params.get("beta",  0.05))
     fixed_cost  = float(params.get("fixed_cost_per_link", 0.0))
     max_per_item = int(params.get("max_suppliers_per_item", 2))
+    # Soft bias toward preferred links: shave `preferred_discount` off the
+    # *objective* coefficient of preferred pairs (reporting still uses the true
+    # effective cost), so a preferred supplier wins when costs are close.
+    prefer_preferred   = bool(params.get("prefer_preferred", False))
+    preferred_discount = float(params.get("preferred_discount", 0.03))
 
     item_ids  = [i["id"] for i in items]
     sup_ids   = [s["id"] for s in suppliers]
@@ -88,6 +93,7 @@ def solve(params: dict[str, Any]) -> SolveResult:
 
     # pair → (unit_cost, lead_time_days, min_order_qty)
     pair_terms: dict[tuple[int, int], tuple[float, float, float]] = {}
+    pair_pref:  dict[tuple[int, int], bool] = {}
     if restricted:
         for c in candidates:
             i_id = int(c["item_id"])
@@ -99,12 +105,14 @@ def solve(params: dict[str, Any]) -> SolveResult:
                 float(c.get("lead_time_days") or 0.0),
                 float(c.get("min_order_qty") or 0.0),
             )
+            pair_pref[(i_id, s_id)] = bool(c.get("is_preferred"))
     else:
         for i_id in item_ids:
             unit = float(item_map[i_id]["unit_cost"] or 0.0)
             for s_id in sup_ids:
                 lt = float(sup_map[s_id]["lead_time_days"] or 0.0)
                 pair_terms[(i_id, s_id)] = (unit, lt, 0.0)
+                pair_pref[(i_id, s_id)] = False
 
     pairs = list(pair_terms.keys())
     suppliers_for_item: dict[int, list[int]] = {i: [] for i in item_ids}
@@ -128,11 +136,21 @@ def solve(params: dict[str, Any]) -> SolveResult:
         )
 
     # ── Effective cost per pair (reliability from supplier; lead-time per link)
+    # eff_cost = the TRUE effective cost used for value reporting.
+    # obj_cost = the coefficient the solver minimises; identical to eff_cost
+    #            unless the user enabled the preferred-bias, which shaves a small
+    #            discount off preferred pairs so they win on near-ties.
     eff_cost: dict[tuple[int, int], float] = {}
+    obj_cost: dict[tuple[int, int], float] = {}
     for (i_id, s_id), (unit, lt, _moq) in pair_terms.items():
         rel = float(sup_map[s_id]["reliability_pct"] or 100.0)
         penalty = alpha * (100.0 - rel) / 100.0 + beta * lt / 30.0
-        eff_cost[(i_id, s_id)] = max(unit, 0.01) * (1.0 + penalty)
+        ec = max(unit, 0.01) * (1.0 + penalty)
+        eff_cost[(i_id, s_id)] = ec
+        if prefer_preferred and pair_pref[(i_id, s_id)]:
+            obj_cost[(i_id, s_id)] = ec * (1.0 - preferred_discount)
+        else:
+            obj_cost[(i_id, s_id)] = ec
 
     # ── LP model ─────────────────────────────────────────────────────────────
     prob = pulp.LpProblem("sourcing_allocation", pulp.LpMinimize)
@@ -141,7 +159,7 @@ def solve(params: dict[str, Any]) -> SolveResult:
 
     # Objective
     prob += (
-        pulp.lpSum(eff_cost[p] * x[p] for p in pairs)
+        pulp.lpSum(obj_cost[p] * x[p] for p in pairs)
         + fixed_cost * pulp.lpSum(y[p] for p in pairs)
     ), "total_cost"
 
@@ -224,6 +242,7 @@ def solve(params: dict[str, Any]) -> SolveResult:
                 "value":        round(value, 2),
                 "share_pct":    round(share, 1),
                 "unit_cost":    round(eff_cost[(i, s)], 4),
+                "is_preferred": bool(pair_pref.get((i, s), False)),
             })
             per_supplier_load[s] += value
             per_item_supcount[i] += 1

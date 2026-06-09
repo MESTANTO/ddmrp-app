@@ -398,6 +398,7 @@ def import_item_suppliers(uploaded_file) -> tuple[int, list[str]]:
     errors: list[str] = []
     new_links: list[dict] = []
     seen: set[tuple[int, int]] = set()
+    preferred_item: set[int] = set()   # items that already claimed a preferred row
 
     for idx, row in df.iterrows():
         row_num = idx + 4
@@ -428,13 +429,24 @@ def import_item_suppliers(uploaded_file) -> tuple[int, list[str]]:
             status = str(row.get("Status", "active") or "active").strip().lower()
             if status not in ("active", "inactive"):
                 status = "active"
+            is_pref = _yes(row.get("Preferred", ""))
+            # At most one preferred supplier per part — keep the first, clear extras.
+            if is_pref:
+                if item_id in preferred_item:
+                    errors.append(
+                        f"Row {row_num} ({part} ↔ {code}): {part} already has a "
+                        "preferred supplier — Preferred cleared on this row."
+                    )
+                    is_pref = False
+                else:
+                    preferred_item.add(item_id)
             new_links.append(dict(
                 item_id        = item_id,
                 supplier_id    = supplier_id,
                 unit_cost      = float(row.get("Unit Cost (€)", 0) or 0),
                 lead_time_days = int(float(row.get("Lead Time (days)", 0) or 0)),
                 min_order_qty  = float(row.get("Min Order Qty", 0) or 0),
-                is_preferred   = _yes(row.get("Preferred", "")),
+                is_preferred   = is_pref,
                 status         = status,
             ))
         except (ValueError, TypeError) as e:
@@ -451,6 +463,13 @@ def import_item_suppliers(uploaded_file) -> tuple[int, list[str]]:
         for d in new_links:
             session.add(ItemSupplier(company_id=cid, **d))
             success += 1
+        # Sync each part's preferred link back to Item.default_supplier_id.
+        for d in new_links:
+            if d["is_preferred"]:
+                item = session.query(Item).filter(
+                    Item.id == d["item_id"], Item.company_id == cid).first()
+                if item is not None:
+                    item.default_supplier_id = d["supplier_id"]
         session.commit()
     except Exception as e:
         session.rollback()

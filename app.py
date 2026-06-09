@@ -4,6 +4,7 @@ Run with: streamlit run app.py
 """
 
 import streamlit as st
+from sqlalchemy.exc import OperationalError
 from database.db import init_db
 from database.auth import is_authenticated, has_company, get_current_user, logout
 from styles import inject_css
@@ -26,7 +27,21 @@ def _init_db_once():
     return True
 
 
-_init_db_once()
+# A connection-level failure (e.g. Supabase paused) raises before any DDL runs.
+# Don't let @st.cache_resource cache the broken state — surface a friendly page
+# and let the user retry once the database is reachable again.
+try:
+    _init_db_once()
+except OperationalError:
+    _init_db_once.clear()
+    st.error(
+        "⚠️ Can't reach the database right now. "
+        "If this persists, the Supabase project may be paused — "
+        "resume it from the Supabase dashboard, then retry."
+    )
+    if st.button("🔄 Retry"):
+        st.rerun()
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Auth gate — must be authenticated before anything else is shown

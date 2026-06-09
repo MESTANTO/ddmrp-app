@@ -66,6 +66,47 @@ def _item_options(company_id: int) -> dict[int, str]:
         sess.close()
 
 
+def _sync_preferred(sess, company_id: int) -> list[str]:
+    """
+    Enforce at-most-one preferred supplier per part and sync the chosen
+    preferred link back to `Item.default_supplier_id` (the legacy single-supplier
+    field, kept authoritative in one place).
+
+    Returns a list of human-readable warnings for any conflicts resolved.
+    Does NOT clear an item's default_supplier_id when it has no preferred link —
+    a manually-set default in Material Master is left untouched.
+    """
+    warnings: list[str] = []
+    links = (sess.query(ItemSupplier)
+                 .filter(ItemSupplier.company_id == company_id)
+                 .all())
+    by_item: dict[int, list] = {}
+    for l in links:
+        by_item.setdefault(l.item_id, []).append(l)
+
+    for item_id, ls in by_item.items():
+        prefs = [l for l in ls if l.is_preferred and (l.status or "active") != "inactive"]
+        chosen = None
+        if len(prefs) > 1:
+            chosen = prefs[0]
+            for extra in prefs[1:]:
+                extra.is_preferred = False
+            warnings.append(
+                f"Part #{item_id}: had {len(prefs)} preferred suppliers — "
+                f"kept one, cleared {len(prefs) - 1}."
+            )
+        elif len(prefs) == 1:
+            chosen = prefs[0]
+
+        if chosen is not None:
+            item = (sess.query(Item)
+                        .filter(Item.id == item_id, Item.company_id == company_id)
+                        .first())
+            if item is not None and item.default_supplier_id != chosen.supplier_id:
+                item.default_supplier_id = chosen.supplier_id
+    return warnings
+
+
 def _supplier_options(company_id: int) -> dict[int, str]:
     sess = get_session()
     try:
@@ -171,6 +212,14 @@ def _render_add_form(company_id, item_opts, sup_opts, links) -> None:
             return
         sess = get_session()
         try:
+            # A new preferred link supersedes any existing preferred for this part.
+            if is_preferred:
+                for other in (sess.query(ItemSupplier)
+                                  .filter(ItemSupplier.company_id == company_id,
+                                          ItemSupplier.item_id == int(item_id),
+                                          ItemSupplier.is_preferred.is_(True))
+                                  .all()):
+                    other.is_preferred = False
             sess.add(ItemSupplier(
                 company_id=company_id,
                 item_id=int(item_id),
@@ -181,6 +230,8 @@ def _render_add_form(company_id, item_opts, sup_opts, links) -> None:
                 is_preferred=bool(is_preferred),
                 status=status,
             ))
+            sess.flush()
+            _sync_preferred(sess, company_id)
             sess.commit()
             st.success("Association added.")
             st.rerun()
@@ -257,8 +308,13 @@ def _persist_matrix(company_id, edited: pd.DataFrame) -> None:
             link.is_preferred   = bool(r["Preferred"])
             link.status         = str(r["Status"] or "active")
             updated += 1
+        sess.flush()
+        warns = _sync_preferred(sess, company_id)
         sess.commit()
-        st.success(f"Saved — {updated} updated, {deleted} deleted.")
+        msg = f"Saved — {updated} updated, {deleted} deleted."
+        if warns:
+            st.warning(" ".join(warns))
+        st.success(msg)
         st.rerun()
     except Exception as exc:
         sess.rollback()
