@@ -113,13 +113,20 @@ def _gen_demand(rng: np.random.Generator, item: dict, horizon: int,
 def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
               demand_mode: str, demand_profile: str, service_target: float,
               seed: int) -> dict[str, float]:
-    adu = float(item["adu"])
-    dlt = max(float(item["dlt"]), 0.0)
-    ltf = float(item["lead_time_factor"])
-    vf = float(item["variability_factor"])
-    moq = float(item["min_order_qty"])
-    oc = float(item["order_cycle"])
-    unit_cost = float(item["unit_cost"])
+    def _f(v, default=0.0):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return default
+        return v if math.isfinite(v) else default
+
+    adu = max(_f(item["adu"]), 0.0)
+    dlt = max(_f(item["dlt"]), 0.0)
+    ltf = _f(item["lead_time_factor"], 0.5)
+    vf = _f(item["variability_factor"], 0.5)
+    moq = max(_f(item["min_order_qty"]), 0.0)
+    oc = max(_f(item["order_cycle"]), 0.0)
+    unit_cost = max(_f(item["unit_cost"]), 0.0)
     ordering_cost = item["ordering_cost"] if item["ordering_cost"] > 0 else _DEFAULT_ORDERING_COST
     holding_pct = item["holding_cost_pct"] if item["holding_cost_pct"] > 0 else _DEFAULT_HOLDING_PCT
 

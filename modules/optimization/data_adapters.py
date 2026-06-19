@@ -8,6 +8,7 @@ objects) so the result can be JSON-serialized into `optimization_runs.params_jso
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from datetime import datetime, timedelta
@@ -16,6 +17,22 @@ from database.db import (
     get_session, Item, Supplier, DemandEntry,
     Location, Lane, LocationDemand, ItemSupplier,
 )
+
+
+def _num(value: Any, default: float = 0.0) -> float:
+    """
+    Coerce a master-data value to a finite float, falling back to `default`.
+
+    Unlike `float(x or default)`, this also catches NaN — which is *truthy*, so
+    `nan or 0.5` would otherwise leak the NaN through. Master-data factors like
+    lead_time_factor / variability_factor are sometimes stored as NaN; left
+    unguarded they poison the DDMRP zone formulas (red_base = adu·dlt·ltf).
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
 
 
 def load_sourcing_inputs(
@@ -442,16 +459,16 @@ def load_simulation_inputs(
                 "part_number":             it.part_number,
                 "description":             it.description or "",
                 "item_type":               it.item_type or "P",
-                "adu":                     float(it.adu or 0.0),
-                "dlt":                     float(it.dlt or 0.0),
-                "lead_time_factor":        float(it.lead_time_factor or 0.5),
-                "variability_factor":      float(it.variability_factor or 0.5),
-                "min_order_qty":           float(it.min_order_qty or 0.0),
-                "order_cycle":             float(it.order_cycle or 0.0),
-                "on_hand":                 float(it.on_hand or 0.0),
-                "unit_cost":               float(it.unit_cost or 0.0),
-                "ordering_cost":           float(it.ordering_cost or 0.0),
-                "holding_cost_pct":        float(it.holding_cost_pct or 0.0),
+                "adu":                     _num(it.adu, 0.0),
+                "dlt":                     _num(it.dlt, 0.0),
+                "lead_time_factor":        _num(it.lead_time_factor, 0.5),
+                "variability_factor":      _num(it.variability_factor, 0.5),
+                "min_order_qty":           _num(it.min_order_qty, 0.0),
+                "order_cycle":             _num(it.order_cycle, 0.0),
+                "on_hand":                 _num(it.on_hand, 0.0),
+                "unit_cost":               _num(it.unit_cost, 0.0),
+                "ordering_cost":           _num(it.ordering_cost, 0.0),
+                "holding_cost_pct":        _num(it.holding_cost_pct, 0.0),
                 "supplier_lead_time_days": int(supplier_lt),
                 "is_ddmrp_eligible":       eligible,
                 "positioning_score":       score,
