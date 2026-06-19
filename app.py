@@ -88,6 +88,7 @@ GROUPS: dict[str, list[tuple[str, str]]] = {
     "📈  Analysis": [
         ("🔠  ABC / XYZ / ACV²",      "abc_xyz"),
         ("📉  Model Velocity",        "model_velocity"),
+        ("⚖️  Methodology Simulation", "sim_methodology"),
         ("💰  Total Cost of Ownership","tco_analysis"),
         ("⚠️  Risk Register",          "risk_register"),
         ("📤  Export to Excel",       "export"),
@@ -252,6 +253,10 @@ elif page_key == "ai_inventory_manager":
 
 elif page_key == "abc_xyz":
     from views.abc_xyz import show
+    show()
+
+elif page_key == "sim_methodology":
+    from views.sim_methodology import show
     show()
 
 elif page_key == "safety_stock":

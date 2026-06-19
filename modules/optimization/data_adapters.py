@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from datetime import datetime, timedelta
+
 from database.db import (
-    get_session, Item, Supplier,
+    get_session, Item, Supplier, DemandEntry,
     Location, Lane, LocationDemand, ItemSupplier,
 )
 
@@ -337,6 +339,142 @@ def load_facility_inputs(
             "facilities":   facilities_out,
             "customers":    customers_out,
             "lanes":        lanes_out,
+        }
+    finally:
+        sess.close()
+
+
+def load_simulation_inputs(
+    company_id: int,
+    *,
+    lookback_days: int = 90,
+    only_ddmrp_eligible: bool = False,
+    top_n_items: int | None = 50,
+) -> dict[str, Any]:
+    """
+    Build inputs for the DDMRP-vs-MRP methodology simulation.
+
+    For every (or every DDMRP-eligible) item we pull the full set of master-data
+    parameters the inventory policies need — nothing is duplicated, all values
+    come from the existing `items` table — plus a historical daily-demand series
+    (used both for the bootstrap demand mode and to derive a coefficient of
+    variation that shapes the synthetic demand mode).
+
+    DDMRP eligibility comes from `positioning_engine.analyze_all_items`
+    (recommended_type=="DDMRP" or a manual mrp_type_override=="DDMRP").
+
+    Returns:
+        lookback_days
+        items: list of per-item dicts with master parameters + demand stats:
+            id, part_number, description, item_type,
+            adu, dlt, lead_time_factor, variability_factor,
+            min_order_qty, order_cycle, on_hand,
+            unit_cost, ordering_cost, holding_cost_pct,
+            supplier_lead_time_days,
+            is_ddmrp_eligible, positioning_score,
+            hist_mean, hist_cv, hist_series (daily, len=lookback_days)
+    """
+    from modules.positioning_engine import analyze_all_items
+
+    sess = get_session()
+    try:
+        items_q = (sess.query(Item)
+                       .filter(Item.company_id == company_id)
+                       .order_by(Item.part_number)
+                       .all())
+
+        # Default supplier lead time per item (fallback to item.dlt when unset).
+        sup_lt: dict[int, int] = {}
+        sup_rows = (sess.query(Supplier)
+                        .filter(Supplier.company_id == company_id).all())
+        sup_lt_by_id = {int(s.id): int(s.lead_time_days or 0) for s in sup_rows}
+
+        # Historical actual-demand series per item over the lookback window.
+        today = datetime.utcnow().date()
+        start = today - timedelta(days=lookback_days)
+        dem_rows = (sess.query(DemandEntry)
+                        .filter(DemandEntry.demand_type == "actual",
+                                DemandEntry.demand_date >= datetime.combine(start, datetime.min.time()),
+                                DemandEntry.demand_date <= datetime.combine(today, datetime.max.time()))
+                        .all())
+        per_item_day: dict[int, dict] = {}
+        for e in dem_rows:
+            d = e.demand_date.date()
+            per_item_day.setdefault(int(e.item_id), {})
+            per_item_day[int(e.item_id)][d] = (
+                per_item_day[int(e.item_id)].get(d, 0.0) + float(e.quantity or 0.0)
+            )
+
+        # Positioning / eligibility (company-scoped).
+        try:
+            positioning = {p.item_id: p for p in analyze_all_items(company_id)}
+        except Exception:
+            positioning = {}
+
+        def _series(item_id: int) -> list[float]:
+            day_map = per_item_day.get(item_id, {})
+            out = []
+            for off in range(lookback_days):
+                d = start + timedelta(days=off)
+                out.append(round(day_map.get(d, 0.0), 4))
+            return out
+
+        items_out: list[dict[str, Any]] = []
+        for it in items_q:
+            series = _series(int(it.id))
+            n = len(series) or 1
+            hist_mean = sum(series) / n
+            if hist_mean > 0 and len(series) > 1:
+                var = sum((x - hist_mean) ** 2 for x in series) / len(series)
+                hist_cv = (var ** 0.5) / hist_mean
+            else:
+                hist_cv = 0.0
+
+            pos = positioning.get(int(it.id))
+            eligible = bool(pos and pos.effective_type == "DDMRP")
+            score = int(pos.total_score) if pos else 0
+
+            sup_id = int(it.default_supplier_id) if it.default_supplier_id else None
+            supplier_lt = sup_lt_by_id.get(sup_id, 0) if sup_id else 0
+
+            items_out.append({
+                "id":                      int(it.id),
+                "part_number":             it.part_number,
+                "description":             it.description or "",
+                "item_type":               it.item_type or "P",
+                "adu":                     float(it.adu or 0.0),
+                "dlt":                     float(it.dlt or 0.0),
+                "lead_time_factor":        float(it.lead_time_factor or 0.5),
+                "variability_factor":      float(it.variability_factor or 0.5),
+                "min_order_qty":           float(it.min_order_qty or 0.0),
+                "order_cycle":             float(it.order_cycle or 0.0),
+                "on_hand":                 float(it.on_hand or 0.0),
+                "unit_cost":               float(it.unit_cost or 0.0),
+                "ordering_cost":           float(it.ordering_cost or 0.0),
+                "holding_cost_pct":        float(it.holding_cost_pct or 0.0),
+                "supplier_lead_time_days": int(supplier_lt),
+                "is_ddmrp_eligible":       eligible,
+                "positioning_score":       score,
+                "hist_mean":               round(hist_mean, 4),
+                "hist_cv":                 round(hist_cv, 4),
+                "hist_series":             series,
+            })
+
+        if only_ddmrp_eligible:
+            items_out = [d for d in items_out if d["is_ddmrp_eligible"]]
+
+        # Keep items with positive demand potential, ranked by dollar volume.
+        items_out = [d for d in items_out if d["adu"] > 0 or d["hist_mean"] > 0]
+        items_out.sort(
+            key=lambda d: max(d["adu"], d["hist_mean"]) * max(d["unit_cost"], 0.0),
+            reverse=True,
+        )
+        if top_n_items:
+            items_out = items_out[:top_n_items]
+
+        return {
+            "lookback_days": lookback_days,
+            "items":         items_out,
         }
     finally:
         sess.close()

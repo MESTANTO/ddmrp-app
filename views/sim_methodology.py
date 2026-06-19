@@ -1,0 +1,407 @@
+"""
+DDMRP vs MRP — Methodology Simulation (standalone page).
+
+Replays the company's parts (optionally only the DDMRP-eligible ones) through a
+daily Monte-Carlo loop under several replenishment policies, then compares the
+inventory rotation index ("indice di rotazione di stock"), average stock value
+and service level so the user can choose the methodology that maximises service
+while minimising stock.
+
+Two tabs:
+  • Configure & Run — horizon, replications, demand mode/profile, policies,
+                      service target, eligible-only filter, item preview
+  • Results         — KPI strip, per-policy comparison, per-item table,
+                      per-item recommendation (DDMRP vs best MRP)
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from database.auth import get_company_id, get_current_user
+from modules.optimization.data_adapters import load_simulation_inputs
+from modules.optimization.ses_simulation import solve as solve_sim, POLICY_LABELS
+from modules.optimization.solver_base import record_run
+from views.optimization._shared import (
+    render_run_history,
+    load_run_payloads,
+    status_badge,
+)
+
+_SESSION_KEY = "sim_ddmrp_mrp"
+
+
+def show() -> None:
+    company_id = get_company_id()
+    user       = get_current_user()
+    user_id    = user.get("id") if user else None
+
+    st.title("⚖️ DDMRP vs MRP — Methodology Simulation")
+    st.caption(
+        "Simulate each part over repeated DDMRP cycles against classic MRP "
+        "policies (Reorder Point, ROP+SS, Kanban, Periodic Review) and compare "
+        "stock rotation, average stock value and service level. "
+        "Solver: Monte-Carlo · snapshots expire in 10 days."
+    )
+    st.divider()
+
+    tab_run, tab_results = st.tabs(["🛠️ Configure & Run", "📊 Results"])
+
+    with tab_run:
+        _render_configure(company_id, user_id)
+
+    with tab_results:
+        run_id = st.session_state.get(f"{_SESSION_KEY}_last_run_id")
+        if not run_id:
+            st.info("Run a simulation from the **Configure & Run** tab to see results here.")
+            return
+        payloads = load_run_payloads(int(run_id), company_id)
+        if not payloads:
+            st.error("Run not found (it may have expired).")
+            return
+        _render_results(payloads["_run"], payloads)
+
+
+# ── Configure & Run ──────────────────────────────────────────────────────────
+
+def _render_configure(company_id: int, user_id) -> None:
+    st.markdown("##### Scope")
+    c1, c2 = st.columns(2)
+    with c1:
+        only_eligible = st.checkbox(
+            "Only DDMRP-eligible parts", value=False,
+            help="Use the Strategic Positioning recommendation (score-based) to "
+                 "limit the simulation to parts flagged for DDMRP.",
+        )
+    with c2:
+        top_n = st.number_input(
+            "Max parts (by € volume)", min_value=1, max_value=500,
+            value=50, step=5,
+            help="Caps the run for responsiveness — parts ranked by ADU × unit cost.",
+        )
+
+    try:
+        inputs = load_simulation_inputs(
+            company_id,
+            only_ddmrp_eligible=only_eligible,
+            top_n_items=int(top_n),
+        )
+    except Exception as exc:
+        st.error(f"Failed to load inputs: {exc}")
+        return
+
+    items = inputs["items"]
+    n_items = len(items)
+    n_eligible = sum(1 for it in items if it["is_ddmrp_eligible"])
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Parts in scope", n_items)
+    k2.metric("DDMRP-eligible", n_eligible)
+    k3.metric("Σ unit-cost × ADU/day",
+              f"€ {sum(it['adu'] * it['unit_cost'] for it in items):,.0f}")
+
+    if n_items == 0:
+        st.warning(
+            "No parts with demand in scope. Set **ADU** (or demand history) and "
+            "**Unit Cost** in Material Master, and/or relax the eligible-only filter."
+        )
+
+    st.markdown("##### Simulation horizon")
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        horizon = st.number_input(
+            "Horizon (days per cycle loop)", min_value=30, max_value=730,
+            value=180, step=30,
+            help="Length of each simulated DDMRP/MRP loop.",
+        )
+    with h2:
+        n_reps = st.number_input(
+            "Replications", min_value=1, max_value=200, value=30, step=5,
+            help="Monte-Carlo replications averaged per part × policy.",
+        )
+    with h3:
+        seed = st.number_input("Random seed", min_value=0, value=42, step=1)
+
+    st.markdown("##### Demand")
+    d1, d2 = st.columns(2)
+    with d1:
+        demand_mode = st.radio(
+            "Demand source", ["synthetic", "bootstrap"], horizontal=True,
+            help="Synthetic = generated from ADU + variability per the profile "
+                 "below. Bootstrap = resampled from each part's actual history.",
+        )
+    with d2:
+        demand_profile = st.selectbox(
+            "Synthetic profile",
+            ["stable", "seasonal", "lumpy", "trending"],
+            disabled=(demand_mode == "bootstrap"),
+            help="Shape of the synthetic demand signal per part.",
+        )
+
+    st.markdown("##### Policies & target")
+    p1, p2 = st.columns([3, 1])
+    with p1:
+        mrp_choices = {k: v for k, v in POLICY_LABELS.items() if k != "ddmrp"}
+        selected_mrp = st.multiselect(
+            "MRP policies to compare against DDMRP",
+            options=list(mrp_choices.keys()),
+            default=list(mrp_choices.keys()),
+            format_func=lambda k: mrp_choices[k],
+        )
+    with p2:
+        service_target = st.number_input(
+            "Target fill rate (%)", min_value=50.0, max_value=99.9,
+            value=95.0, step=0.5,
+        ) / 100.0
+
+    scenario_name = st.text_input(
+        "Scenario name (optional)",
+        value=f"sim · {int(horizon)}d × {int(n_reps)} · {demand_mode}",
+    )
+
+    with st.expander("Parts in scope (master-data preview)"):
+        if items:
+            df = pd.DataFrame([{
+                "Part": it["part_number"],
+                "Description": it["description"],
+                "Type": it["item_type"],
+                "ADU": it["adu"],
+                "DLT": it["dlt"],
+                "Unit € ": it["unit_cost"],
+                "MOQ": it["min_order_qty"],
+                "OC": it["order_cycle"],
+                "CV(hist)": it["hist_cv"],
+                "Eligible": "✅" if it["is_ddmrp_eligible"] else "—",
+                "Score": it["positioning_score"],
+            } for it in items])
+            st.dataframe(df, use_container_width=True, height=260, hide_index=True)
+        else:
+            st.info("No parts to preview.")
+
+    st.divider()
+    policies = ["ddmrp", *selected_mrp]
+    if st.button("🚀 Run simulation", type="primary",
+                 use_container_width=True, disabled=(n_items == 0)):
+        params = {
+            "items":          items,
+            "horizon_days":   int(horizon),
+            "n_replications": int(n_reps),
+            "demand_mode":    demand_mode,
+            "demand_profile": demand_profile,
+            "policies":       policies,
+            "service_target": float(service_target),
+            "seed":           int(seed),
+        }
+        try:
+            with st.spinner(f"Simulating {n_items} part(s) × {len(policies)} "
+                            f"policies × {int(n_reps)} reps…"):
+                result = solve_sim(params)
+            run_id = record_run(
+                company_id=company_id,
+                user_id=user_id,
+                session_key=_SESSION_KEY,
+                scenario_name=scenario_name,
+                params={
+                    "n_items":        n_items,
+                    "horizon_days":   int(horizon),
+                    "n_replications": int(n_reps),
+                    "demand_mode":    demand_mode,
+                    "demand_profile": demand_profile,
+                    "policies":       policies,
+                    "service_target": float(service_target),
+                    "only_ddmrp_eligible": only_eligible,
+                    "seed":           int(seed),
+                },
+                result=result,
+            )
+            if result.status == "solved":
+                st.success(
+                    f"✓ Simulated in {result.runtime_ms} ms · "
+                    f"DDMRP Σ stock value = € {result.objective_value:,.0f} · run #{run_id}"
+                )
+                st.session_state[f"{_SESSION_KEY}_last_run_id"] = run_id
+            else:
+                st.error(f"Status: {result.status}. {result.error_message or ''}")
+        except Exception as exc:
+            st.error(f"Simulation error: {exc}")
+
+    st.divider()
+    render_run_history(
+        company_id, _SESSION_KEY,
+        on_select=lambda rid: st.session_state.update(
+            {f"{_SESSION_KEY}_last_run_id": rid}),
+    )
+
+
+# ── Results ──────────────────────────────────────────────────────────────────
+
+def _render_results(run, payloads: dict) -> None:
+    st.markdown(
+        f"### Run #{run.id} — {run.scenario_name or '—'}  "
+        f"{status_badge(run.status)}",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Created {run.created_at.strftime('%Y-%m-%d %H:%M')} · "
+        f"solver {run.solver_used} · {run.runtime_ms or 0} ms · "
+        f"expires {run.expires_at.strftime('%Y-%m-%d')}"
+    )
+
+    if run.status != "solved":
+        st.error(f"Status: {run.status}. {run.error_message or ''}")
+        return
+
+    summary = payloads.get("summary", {})
+    rows    = payloads.get("by_item_policy", {}).get("rows", [])
+    recs    = payloads.get("recommendation", {}).get("rows", [])
+    psum    = summary.get("policy_summary", [])
+
+    target = summary.get("service_target", 0.95)
+
+    # KPI strip
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Parts simulated", summary.get("n_items", 0))
+    k2.metric("Policies", summary.get("n_policies", 0))
+    k3.metric("DDMRP Σ stock value",
+              f"€ {summary.get('ddmrp_total_stock_value', 0):,.0f}")
+    k4.metric("DDMRP recommended",
+              f"{summary.get('n_ddmrp_recommended', 0)} / {summary.get('n_items', 0)}")
+    st.caption(
+        f"Horizon **{summary.get('horizon_days', 0)}d** × "
+        f"{summary.get('n_replications', 0)} reps · demand "
+        f"**{summary.get('demand_mode', '—')}**"
+        + (f" / {summary.get('demand_profile')}" if summary.get('demand_mode') == 'synthetic' else "")
+        + f" · target fill **{target * 100:.0f}%**"
+    )
+
+    st.divider()
+
+    # ── Per-policy comparison ────────────────────────────────────────────────
+    if psum:
+        st.markdown("#### Policy comparison (all parts aggregated)")
+        df = pd.DataFrame(psum)
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            fig = go.Figure()
+            fig.add_bar(
+                x=df["policy_label"], y=df["total_stock_value"],
+                marker_color=["#6366F1" if p == "ddmrp" else "#94A3B8"
+                              for p in df["policy"]],
+                hovertemplate="<b>%{x}</b><br>Σ stock € %{y:,.0f}<extra></extra>",
+            )
+            fig.update_layout(
+                title="Total average stock value (€)", height=340,
+                margin=dict(t=40, b=80, l=40, r=20), yaxis_title="€",
+                plot_bgcolor="white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        with cc2:
+            fig = go.Figure()
+            fig.add_bar(
+                x=df["policy_label"], y=df["avg_fill_rate"] * 100.0,
+                marker_color=["#22C55E" if f >= target else "#EF4444"
+                              for f in df["avg_fill_rate"]],
+                hovertemplate="<b>%{x}</b><br>fill %{y:.1f}%<extra></extra>",
+            )
+            fig.add_hline(y=target * 100.0, line_dash="dash",
+                          line_color="#1f2937",
+                          annotation_text=f"target {target*100:.0f}%")
+            fig.update_layout(
+                title="Average unit fill rate (%)", height=340,
+                margin=dict(t=40, b=80, l=40, r=20), yaxis_title="%",
+                plot_bgcolor="white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        df["Avg fill %"] = df["avg_fill_rate"] * 100.0
+        df["Avg CSL %"] = df["avg_csl"] * 100.0
+        show = df.rename(columns={
+            "policy_label": "Policy",
+            "total_stock_value": "Σ stock €",
+            "avg_turnover": "Avg turnover",
+            "total_holding_cost": "Σ holding €/yr",
+            "n_items": "Parts",
+        })[["Policy", "Avg fill %", "Avg CSL %", "Σ stock €",
+            "Avg turnover", "Σ holding €/yr", "Parts"]]
+        st.dataframe(
+            show, use_container_width=True, hide_index=True,
+            column_config={
+                "Avg fill %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Avg CSL %":  st.column_config.NumberColumn(format="%.1f%%"),
+                "Σ stock €": st.column_config.NumberColumn(format="€ %.0f"),
+                "Avg turnover": st.column_config.NumberColumn("Avg turnover ×", format="%.2f"),
+                "Σ holding €/yr": st.column_config.NumberColumn(format="€ %.0f"),
+            },
+        )
+
+    st.divider()
+
+    # ── Per-item recommendation ──────────────────────────────────────────────
+    if recs:
+        st.markdown("#### Recommendation per part")
+        st.caption(
+            "Best policy = lowest average stock value among policies meeting the "
+            "target fill rate. Δ vs MRP < 0 means DDMRP holds **less** stock than "
+            "the cheapest MRP policy."
+        )
+        rdf = pd.DataFrame(recs)
+        rdf["Eligible"] = rdf["is_ddmrp_eligible"].map(lambda b: "✅" if b else "—")
+        rdf["Best"] = rdf["best_policy_label"]
+        rdf["DDMRP wins"] = rdf["ddmrp_wins"].map(lambda b: "🏆" if b else "")
+        rdf["Best fill %"] = rdf["best_fill"] * 100.0
+        rdf["DDMRP fill %"] = rdf["ddmrp_fill"] * 100.0
+        view = rdf.rename(columns={
+            "part_number": "Part",
+            "best_stock_value": "Best stock €",
+            "best_turnover": "Best turnover",
+            "ddmrp_stock_value": "DDMRP stock €",
+            "ddmrp_turnover": "DDMRP turnover",
+            "ddmrp_stock_delta_vs_mrp": "Δ stock vs MRP €",
+        })
+        cols = ["Part", "Eligible", "Best", "DDMRP wins",
+                "Best fill %", "Best stock €", "DDMRP fill %", "DDMRP stock €",
+                "DDMRP turnover", "Δ stock vs MRP €"]
+        cols = [c for c in cols if c in view.columns]
+        st.dataframe(
+            view[cols], use_container_width=True, hide_index=True, height=360,
+            column_config={
+                "Best fill %":  st.column_config.NumberColumn(format="%.1f%%"),
+                "DDMRP fill %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Best stock €":  st.column_config.NumberColumn(format="€ %.0f"),
+                "DDMRP stock €": st.column_config.NumberColumn(format="€ %.0f"),
+                "DDMRP turnover": st.column_config.NumberColumn("DDMRP turnover ×", format="%.2f"),
+                "Δ stock vs MRP €": st.column_config.NumberColumn(format="€ %.0f"),
+            },
+        )
+
+    # ── Full detail ──────────────────────────────────────────────────────────
+    if rows:
+        with st.expander("Full detail — every part × policy"):
+            ddf = pd.DataFrame(rows)
+            ddf["Policy"] = ddf["policy"].map(lambda p: POLICY_LABELS.get(p, p))
+            ddf["Fill %"] = ddf["unit_fill_rate"] * 100.0
+            ddf["CSL %"] = ddf["cycle_service_level"] * 100.0
+            view = ddf.rename(columns={
+                "part_number": "Part",
+                "avg_on_hand_units": "Avg OH units",
+                "avg_on_hand_value": "Avg OH €",
+                "turnover_index": "Turnover",
+                "n_orders": "# Orders",
+                "annual_holding_cost": "Holding €/yr",
+            })
+            cols = ["Part", "Policy", "Fill %", "CSL %", "Avg OH units", "Avg OH €",
+                    "Turnover", "# Orders", "Holding €/yr"]
+            cols = [c for c in cols if c in view.columns]
+            st.dataframe(
+                view[cols], use_container_width=True, hide_index=True, height=400,
+                column_config={
+                    "Fill %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "CSL %":  st.column_config.NumberColumn(format="%.1f%%"),
+                    "Avg OH units": st.column_config.NumberColumn(format="%.1f"),
+                    "Avg OH €": st.column_config.NumberColumn(format="€ %.0f"),
+                    "Turnover": st.column_config.NumberColumn("Turnover ×", format="%.2f"),
+                    "Holding €/yr": st.column_config.NumberColumn(format="€ %.0f"),
+                },
+            )
