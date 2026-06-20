@@ -195,6 +195,19 @@ class Item(Base):
     ordering_cost    = Column(Float, default=0.0)   # € per order (0 → use global default)
     holding_cost_pct = Column(Float, default=0.0)   # annual holding cost % as fraction, e.g. 0.25 (0 → use global default)
 
+    # ── Current SAP planning policy (AS-IS baseline for Methodology Simulation) ──
+    # Mirrors the client's live SAP MARC planning fields so the simulation can
+    # replay their current policy and quantify the gain of switching methodology.
+    sap_mrp_type              = Column(String, default="")   # PD | VB | VM | ND | V1 | V2
+    sap_safety_stock          = Column(Float,  default=0.0)  # units
+    sap_reorder_point         = Column(Float,  default=0.0)  # units
+    sap_fixed_lot             = Column(Float,  default=0.0)  # fixed lot size (units)
+    sap_min_lot               = Column(Float,  default=0.0)  # minimum lot size (units)
+    sap_max_lot               = Column(Float,  default=0.0)  # maximum lot size (units)
+    sap_rounding_value        = Column(Float,  default=0.0)  # rounding value (units)
+    sap_planned_delivery_time = Column(Float,  default=0.0)  # days
+    sap_gr_processing_time    = Column(Float,  default=0.0)  # days
+
     # Default supplier
     default_supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
 
@@ -849,6 +862,7 @@ def init_db():
     _migrate_buffer_columns()
     _migrate_item_columns()
     _migrate_positioning_columns()
+    _migrate_sap_columns()       # AS-IS current SAP planning fields
     _migrate_bom_columns()
     _migrate_process_node_items()
     _migrate_supplier_columns()
@@ -985,6 +999,21 @@ def _migrate_positioning_columns():
         ("inventory_leverage_score", "TEXT",                     "VARCHAR"),
         ("critical_operation",       "INTEGER",                  "BOOLEAN"),
         ("mrp_type_override",        "TEXT DEFAULT 'auto'",      "VARCHAR DEFAULT 'auto'"),
+    ])
+
+
+def _migrate_sap_columns():
+    """Add current-SAP-planning (AS-IS) fields to existing `items` tables (idempotent)."""
+    _add_columns_safely("items", [
+        ("sap_mrp_type",              "TEXT DEFAULT ''",    "VARCHAR DEFAULT ''"),
+        ("sap_safety_stock",          "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
+        ("sap_reorder_point",         "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
+        ("sap_fixed_lot",             "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
+        ("sap_min_lot",               "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
+        ("sap_max_lot",               "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
+        ("sap_rounding_value",        "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
+        ("sap_planned_delivery_time", "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
+        ("sap_gr_processing_time",    "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
     ])
 
 

@@ -40,11 +40,22 @@ _Z_TABLE = [
 ]
 
 POLICY_LABELS = {
+    "as_is":       "AS-IS (current SAP)",
     "ddmrp":       "DDMRP buffer",
     "rop_q":       "Reorder Point (s,Q)",
     "rop_ss":      "ROP + Safety Stock",
     "kanban":      "Kanban (two-bin)",
     "periodic_rs": "Periodic Review (R,S)",
+}
+
+# Which SAP MRP Type each recommended methodology maps to, so the per-part
+# output is directly actionable in SAP.
+POLICY_TO_SAP = {
+    "ddmrp":       "PD + DDMRP buffer",
+    "rop_q":       "VB (manual reorder point)",
+    "rop_ss":      "VM (auto reorder point)",
+    "kanban":      "VB (fixed lot = container)",
+    "periodic_rs": "PD (period lot-sizing)",
 }
 
 _DEFAULT_ORDERING_COST = 50.0
@@ -130,11 +141,41 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
     ordering_cost = item["ordering_cost"] if item["ordering_cost"] > 0 else _DEFAULT_ORDERING_COST
     holding_pct = item["holding_cost_pct"] if item["holding_cost_pct"] > 0 else _DEFAULT_HOLDING_PCT
 
+    # ── Current SAP planning fields (AS-IS baseline) ─────────────────────────
+    sap_mrp     = str(item.get("sap_mrp_type", "") or "").upper()
+    sap_ss      = max(_f(item.get("sap_safety_stock", 0.0)), 0.0)
+    sap_rop     = max(_f(item.get("sap_reorder_point", 0.0)), 0.0)
+    sap_flot    = max(_f(item.get("sap_fixed_lot", 0.0)), 0.0)
+    sap_minlot  = max(_f(item.get("sap_min_lot", 0.0)), 0.0)
+    sap_maxlot  = max(_f(item.get("sap_max_lot", 0.0)), 0.0)
+    sap_round   = max(_f(item.get("sap_rounding_value", 0.0)), 0.0)
+    sap_pdt     = max(_f(item.get("sap_planned_delivery_time", 0.0)), 0.0)
+    sap_grt     = max(_f(item.get("sap_gr_processing_time", 0.0)), 0.0)
+
+    def _apply_lot_rules(qty: float) -> float:
+        """Snap an order quantity to SAP min/max/rounding lot rules."""
+        if qty <= 0:
+            return 0.0
+        if sap_minlot > 0:
+            qty = max(qty, sap_minlot)
+        if sap_round > 0:
+            qty = math.ceil(qty / sap_round) * sap_round
+        if sap_maxlot > 0:
+            qty = min(qty, sap_maxlot)
+        return qty
+
     # Replenishment lead time: MRP policies use supplier LT (fallback DLT);
-    # DDMRP uses the decoupled lead time.
+    # DDMRP uses the decoupled lead time; AS-IS uses the SAP planned delivery +
+    # GR processing time when provided (else falls back to supplier LT).
     sup_lt = int(item.get("supplier_lead_time_days") or 0)
     mrp_lt = sup_lt if sup_lt > 0 else dlt
-    lead = dlt if policy == "ddmrp" else mrp_lt
+    as_is_lt = (sap_pdt + sap_grt) if (sap_pdt + sap_grt) > 0 else mrp_lt
+    if policy == "ddmrp":
+        lead = dlt
+    elif policy == "as_is":
+        lead = as_is_lt
+    else:
+        lead = mrp_lt
     lead_i = max(int(round(lead)), 0)
 
     z = _z_from_service(service_target * 100.0)
@@ -159,6 +200,11 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
     # Review period for periodic policy.
     review_R = int(round(oc)) if oc >= 1 else 7
 
+    # AS-IS effective safety stock used for the recommendation/return params.
+    as_is_ss = sap_ss
+    # AS-IS replenishment mode: 'none' (ND), 'topup' (PD), 'rop' (VB/VM/V1/V2).
+    as_is_mode = "rop"
+
     # Policy reorder point / order-up-to for initialisation.
     if policy == "rop_q":
         s_point = adu * lead
@@ -174,6 +220,26 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
     elif policy == "periodic_rs":
         s_point = 0.0
         order_up = adu * (lead + review_R) + ss
+    elif policy == "as_is":
+        if sap_mrp == "ND":
+            # No planning — never replenishes; warm start at a token level.
+            as_is_mode = "none"
+            s_point = -1.0
+            order_q = 0.0
+            order_up = max(adu * lead + sap_ss, adu * 7.0)
+        elif sap_mrp == "PD":
+            # Deterministic / lot-for-lot: top up to cover lead demand + SS.
+            as_is_mode = "topup"
+            order_up = adu * lead + sap_ss
+            s_point = order_up
+            order_q = _apply_lot_rules(order_q) or order_q
+        else:
+            # VB / VM / V1 / V2 — reorder-point planning.
+            as_is_mode = "rop"
+            s_point = sap_rop if sap_rop > 0 else (adu * lead + sap_ss)
+            base_lot = sap_flot if sap_flot > 0 else order_q
+            order_q = _apply_lot_rules(base_lot) or base_lot
+            order_up = s_point + order_q
     else:  # ddmrp
         s_point = toy
         order_up = tog
@@ -217,6 +283,15 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
                         q = order_up - ip
                 else:
                     days_since_review += 1
+            elif policy == "as_is":
+                if as_is_mode == "none":
+                    q = 0.0
+                elif as_is_mode == "topup":
+                    if ip <= s_point:
+                        q = order_up - ip
+                else:  # rop
+                    if ip <= s_point:
+                        q = order_q
             else:
                 if ip <= s_point:
                     if policy in ("rop_q", "kanban"):
@@ -224,7 +299,9 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
                     else:  # ddmrp, rop_ss top-up to order_up
                         q = order_up - ip
             if q > 0:
-                if moq > 0:
+                if policy == "as_is":
+                    q = _apply_lot_rules(q) or q
+                elif moq > 0:
                     q = max(q, moq)
                 arrivals[tt + lead_i] += q
                 on_order += q
@@ -269,6 +346,18 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
         "annual_holding_cost": round(float(np.mean(rep_hold)), 2),
         "ordering_cost_window": round(float(np.mean(rep_order_cost)), 2),
         "meets_target":        bool(np.mean(rep_fill) >= service_target),
+        # Computed planning parameters of this policy (for SAP prescription).
+        "calc_reorder_point":  round(max(s_point, 0.0), 2),
+        "calc_order_up":       round(max(order_up, 0.0), 2),
+        "calc_order_qty":      round(max(order_q, 0.0), 2),
+        "calc_safety_stock":   round(
+            (ss if policy in ("rop_ss", "periodic_rs")
+             else tor if policy == "ddmrp"
+             else as_is_ss if policy == "as_is"
+             else 0.0), 2),
+        "calc_tor":            round(tor, 2),
+        "calc_toy":            round(toy, 2),
+        "calc_tog":            round(tog, 2),
     }
 
 
@@ -296,6 +385,11 @@ def solve(params: dict[str, Any]) -> SolveResult:
     policies = params.get("policies") or list(POLICY_LABELS.keys())
     if "ddmrp" not in policies:
         policies = ["ddmrp", *policies]
+    # AS-IS (current SAP) is the assessment baseline — always present and first.
+    if "as_is" not in policies:
+        policies = ["as_is", *policies]
+    else:
+        policies = ["as_is", *[p for p in policies if p != "as_is"]]
 
     if not items:
         return SolveResult(
@@ -327,26 +421,36 @@ def solve(params: dict[str, Any]) -> SolveResult:
             rows.append(res)
             per_policy[pol] = res
 
-        # Recommendation: cheapest stock among policies meeting the target;
-        # if none meet it, the one with the highest fill rate.
-        meeting = [p for p in per_policy.values() if p["meets_target"]]
+        # Recommendation: cheapest stock among candidate policies meeting the
+        # target; if none meet it, the one with the highest fill rate. The AS-IS
+        # baseline is never itself a "recommendation" — it's what we improve on.
+        candidates = {k: v for k, v in per_policy.items() if k != "as_is"}
+        meeting = [p for p in candidates.values() if p["meets_target"]]
         if meeting:
             best = min(meeting, key=lambda p: p["avg_on_hand_value"])
         else:
-            best = max(per_policy.values(), key=lambda p: p["unit_fill_rate"])
+            best = max(candidates.values(), key=lambda p: p["unit_fill_rate"])
 
         ddmrp = per_policy["ddmrp"]
-        mrp_only = {k: v for k, v in per_policy.items() if k != "ddmrp"}
+        as_is = per_policy.get("as_is")
+        mrp_only = {k: v for k, v in candidates.items() if k != "ddmrp"}
         best_mrp = (min(mrp_only.values(), key=lambda p: p["avg_on_hand_value"])
                     if mrp_only else None)
+
+        bp = best["policy"]
+        ddmrp_wins = bool(bp == "ddmrp")
+        # AS-IS metrics + deltas (positive delta_stock_value = inventory freed).
+        as_is_fill = as_is["unit_fill_rate"] if as_is else None
+        as_is_stock = as_is["avg_on_hand_value"] if as_is else None
+        no_policy_meets = not bool(meeting)
 
         recommendation.append({
             "item_id":           it["id"],
             "part_number":       it["part_number"],
             "description":       it["description"],
             "is_ddmrp_eligible": it["is_ddmrp_eligible"],
-            "best_policy":       best["policy"],
-            "best_policy_label": POLICY_LABELS.get(best["policy"], best["policy"]),
+            "best_policy":       bp,
+            "best_policy_label": POLICY_LABELS.get(bp, bp),
             "best_fill":         best["unit_fill_rate"],
             "best_stock_value":  best["avg_on_hand_value"],
             "best_turnover":     best["turnover_index"],
@@ -359,7 +463,31 @@ def solve(params: dict[str, Any]) -> SolveResult:
                 round(ddmrp["avg_on_hand_value"] - best_mrp["avg_on_hand_value"], 2)
                 if best_mrp else None
             ),
-            "ddmrp_wins": bool(best["policy"] == "ddmrp"),
+            "ddmrp_wins": ddmrp_wins,
+            # ── AS-IS baseline (current SAP) ─────────────────────────────────
+            "as_is_mrp_type":    (it.get("sap_mrp_type", "") or "").upper() or "(unset)",
+            "as_is_fill":        as_is_fill,
+            "as_is_csl":         as_is["cycle_service_level"] if as_is else None,
+            "as_is_stock_value": as_is_stock,
+            "as_is_turnover":    as_is["turnover_index"] if as_is else None,
+            "delta_fill": (round(best["unit_fill_rate"] - as_is_fill, 4)
+                           if as_is_fill is not None else None),
+            "delta_stock_value": (round(as_is_stock - best["avg_on_hand_value"], 2)
+                                  if as_is_stock is not None else None),
+            # ── Prescribed SAP target (from the winning policy) ──────────────
+            "target_mrp_type":     POLICY_TO_SAP.get(bp, bp),
+            "target_safety_stock": best.get("calc_safety_stock"),
+            "target_reorder_point": best.get("calc_reorder_point"),
+            "target_lot":          best.get("calc_order_qty"),
+            "target_tor":          best.get("calc_tor") if ddmrp_wins else None,
+            "target_toy":          best.get("calc_toy") if ddmrp_wins else None,
+            "target_tog":          best.get("calc_tog") if ddmrp_wins else None,
+            "no_policy_meets":     no_policy_meets,
+            "keep_current": bool(
+                as_is is not None and as_is["meets_target"]
+                and as_is_stock is not None
+                and as_is_stock <= best["avg_on_hand_value"] + 1e-6
+            ),
         })
 
     # ── Aggregate summary per policy ─────────────────────────────────────────
@@ -382,6 +510,20 @@ def solve(params: dict[str, Any]) -> SolveResult:
     ddmrp_total = next((s["total_stock_value"] for s in policy_summary if s["policy"] == "ddmrp"), 0.0)
     n_ddmrp_wins = sum(1 for r in recommendation if r["ddmrp_wins"])
 
+    # ── Portfolio executive summary (AS-IS vs recommended) ───────────────────
+    asis_stock_vals = [r["as_is_stock_value"] for r in recommendation
+                       if r["as_is_stock_value"] is not None]
+    asis_fills = [r["as_is_fill"] for r in recommendation if r["as_is_fill"] is not None]
+    total_asis_stock = round(float(np.sum(asis_stock_vals)), 2) if asis_stock_vals else 0.0
+    total_reco_stock = round(float(np.sum([r["best_stock_value"] for r in recommendation])), 2)
+    wc_freed = round(total_asis_stock - total_reco_stock, 2)
+    wc_freed_pct = round(100.0 * wc_freed / total_asis_stock, 1) if total_asis_stock > 0 else 0.0
+    avg_asis_fill = round(float(np.mean(asis_fills)), 4) if asis_fills else None
+    avg_reco_fill = round(float(np.mean([r["best_fill"] for r in recommendation])), 4) if recommendation else None
+    n_unmanaged = sum(1 for r in recommendation if r["as_is_mrp_type"] == "ND")
+    n_no_policy_meets = sum(1 for r in recommendation if r["no_policy_meets"])
+    n_keep_current = sum(1 for r in recommendation if r["keep_current"])
+
     summary = {
         "n_items":         len(items),
         "n_policies":      len(policies),
@@ -393,6 +535,16 @@ def solve(params: dict[str, Any]) -> SolveResult:
         "ddmrp_total_stock_value": ddmrp_total,
         "n_ddmrp_recommended": n_ddmrp_wins,
         "policy_summary":  policy_summary,
+        # Portfolio executive summary for the client assessment.
+        "total_asis_stock_value":  total_asis_stock,
+        "total_reco_stock_value":  total_reco_stock,
+        "working_capital_freed":   wc_freed,
+        "working_capital_freed_pct": wc_freed_pct,
+        "avg_asis_fill":   avg_asis_fill,
+        "avg_reco_fill":   avg_reco_fill,
+        "n_unmanaged":     n_unmanaged,
+        "n_no_policy_meets": n_no_policy_meets,
+        "n_keep_current":  n_keep_current,
     }
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)

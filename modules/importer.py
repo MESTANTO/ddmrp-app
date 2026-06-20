@@ -99,6 +99,16 @@ MATERIAL_HEADERS = [
     {"name": "Unit Cost (€)",        "width": 14},
     {"name": "Ordering Cost (€)",    "width": 16},
     {"name": "Holding Cost %",       "width": 16},
+    # ── Current SAP planning policy (AS-IS baseline) ──
+    {"name": "SAP MRP Type",         "width": 14},
+    {"name": "SAP Safety Stock",     "width": 16},
+    {"name": "SAP Reorder Point",    "width": 16},
+    {"name": "SAP Fixed Lot",        "width": 14},
+    {"name": "SAP Min Lot",          "width": 12},
+    {"name": "SAP Max Lot",          "width": 12},
+    {"name": "SAP Rounding Value",   "width": 18},
+    {"name": "SAP Planned Delivery Time (days)", "width": 26},
+    {"name": "SAP GR Processing Time (days)",    "width": 26},
 ]
 
 MATERIAL_EXAMPLE = [
@@ -108,6 +118,7 @@ MATERIAL_EXAMPLE = [
     "", "",
     100.0,
     25.0, 50.0, 25.0,
+    "VM", 30.0, 80.0, 50.0, 0.0, 0.0, 0.0, 5.0, 1.0,
 ]
 
 
@@ -126,7 +137,10 @@ def build_material_template() -> bytes:
         "Spike Horizon (days) and Spike Threshold Factor (× ADU) are ASOH overrides (slide 83) — "
         "leave blank to use global defaults. "
         "Unit of Measure options: EA, KG, LT, M, MT, PC. "
-        "Cost fields are optional. Holding Cost % is annual percentage (e.g. 25 = 25%).",
+        "Cost fields are optional. Holding Cost % is annual percentage (e.g. 25 = 25%). "
+        "SAP fields capture the part's CURRENT SAP planning policy (the AS-IS baseline used by "
+        "Methodology Simulation): SAP MRP Type options PD, VB, VM, ND, V1, V2; Safety Stock / "
+        "Reorder Point / lot sizes in units; lead times in days. Leave blank/0 if unknown.",
         row=1, col_span=len(MATERIAL_HEADERS))
     _write_header(ws, MATERIAL_HEADERS, row=2)
     _write_example_row(ws, MATERIAL_EXAMPLE, row=3)
@@ -159,6 +173,11 @@ def build_material_template() -> bytes:
     ws.add_data_validation(dv_vf)
     dv_vf.sqref = f'{name_to_col["Variability Factor"]}4:{name_to_col["Variability Factor"]}1000'
 
+    # Dropdown validation for SAP MRP Type
+    dv_mrp = DataValidation(type="list", formula1='"PD,VB,VM,ND,V1,V2"', allow_blank=True)
+    ws.add_data_validation(dv_mrp)
+    dv_mrp.sqref = f'{name_to_col["SAP MRP Type"]}4:{name_to_col["SAP MRP Type"]}1000'
+
     ws.freeze_panes = "A4"
     return _wb_to_bytes(wb)
 
@@ -170,6 +189,7 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
     LTF_BANDS = {"S": (0.61, 1.00), "M": (0.41, 0.60), "L": (0.20, 0.40)}
     VF_BANDS  = {"L": (0.00, 0.40), "M": (0.41, 0.60), "H": (0.61, 1.00)}
     VALID_TYPES = {"M", "I", "P", "D"}
+    VALID_SAP_MRP = {"PD", "VB", "VM", "ND", "V1", "V2"}
 
     try:
         df = pd.read_excel(uploaded_file, header=1, skiprows=[2])  # header at row 2, skip row 3 (example)
@@ -270,6 +290,17 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
                 unit_cost        = float(row.get("Unit Cost (€)", 0) or 0),
                 ordering_cost    = float(row.get("Ordering Cost (€)", 0) or 0),
                 holding_cost_pct = float(row.get("Holding Cost %", 0) or 0) / 100.0,
+                sap_mrp_type     = (str(row.get("SAP MRP Type", "") or "").strip().upper()
+                                    if str(row.get("SAP MRP Type", "") or "").strip().upper()
+                                    in VALID_SAP_MRP else ""),
+                sap_safety_stock          = float(row.get("SAP Safety Stock", 0) or 0),
+                sap_reorder_point         = float(row.get("SAP Reorder Point", 0) or 0),
+                sap_fixed_lot             = float(row.get("SAP Fixed Lot", 0) or 0),
+                sap_min_lot               = float(row.get("SAP Min Lot", 0) or 0),
+                sap_max_lot               = float(row.get("SAP Max Lot", 0) or 0),
+                sap_rounding_value        = float(row.get("SAP Rounding Value", 0) or 0),
+                sap_planned_delivery_time = float(row.get("SAP Planned Delivery Time (days)", 0) or 0),
+                sap_gr_processing_time    = float(row.get("SAP GR Processing Time (days)", 0) or 0),
             ))
         except (ValueError, TypeError) as e:
             errors.append(f"Row {row_num} ({part}): Invalid numeric value — {e}")
@@ -303,6 +334,15 @@ def import_materials(uploaded_file) -> tuple[int, list[str]]:
                 unit_cost=d["unit_cost"],
                 ordering_cost=d["ordering_cost"],
                 holding_cost_pct=d["holding_cost_pct"],
+                sap_mrp_type=d["sap_mrp_type"],
+                sap_safety_stock=d["sap_safety_stock"],
+                sap_reorder_point=d["sap_reorder_point"],
+                sap_fixed_lot=d["sap_fixed_lot"],
+                sap_min_lot=d["sap_min_lot"],
+                sap_max_lot=d["sap_max_lot"],
+                sap_rounding_value=d["sap_rounding_value"],
+                sap_planned_delivery_time=d["sap_planned_delivery_time"],
+                sap_gr_processing_time=d["sap_gr_processing_time"],
                 company_id=cid,
             ))
             success += 1

@@ -130,9 +130,11 @@ def _render_configure(company_id: int, user_id) -> None:
     d1, d2 = st.columns(2)
     with d1:
         demand_mode = st.radio(
-            "Demand source", ["synthetic", "bootstrap"], horizontal=True,
-            help="Synthetic = generated from ADU + variability per the profile "
-                 "below. Bootstrap = resampled from each part's actual history.",
+            "Demand source", ["bootstrap", "synthetic"], horizontal=True,
+            help="Bootstrap = resampled from each part's actual imported history "
+                 "(recommended for a client AS-IS assessment; falls back to "
+                 "synthetic for parts without history). Synthetic = generated "
+                 "from ADU + variability per the profile below.",
         )
     with d2:
         demand_profile = st.selectbox(
@@ -280,6 +282,36 @@ def _render_results(run, payloads: dict) -> None:
 
     st.divider()
 
+    # ── Executive summary (AS-IS vs recommended) ─────────────────────────────
+    if summary.get("total_asis_stock_value") is not None:
+        st.markdown("#### Executive summary — AS-IS (current SAP) vs recommended")
+        asis_stock = summary.get("total_asis_stock_value", 0.0)
+        reco_stock = summary.get("total_reco_stock_value", 0.0)
+        wc_freed = summary.get("working_capital_freed", 0.0)
+        wc_pct = summary.get("working_capital_freed_pct", 0.0)
+        asis_fill = summary.get("avg_asis_fill")
+        reco_fill = summary.get("avg_reco_fill")
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Σ inventory — AS-IS", f"€ {asis_stock:,.0f}")
+        e2.metric("Σ inventory — recommended", f"€ {reco_stock:,.0f}",
+                  delta=f"-€ {wc_freed:,.0f}" if wc_freed >= 0 else f"+€ {-wc_freed:,.0f}",
+                  delta_color="normal")
+        e3.metric("Working capital freed", f"€ {wc_freed:,.0f}",
+                  delta=f"{wc_pct:.1f}%")
+        e4.metric(
+            "Avg fill — AS-IS → reco",
+            f"{(reco_fill or 0) * 100:.1f}%",
+            delta=(f"+{(reco_fill - asis_fill) * 100:.1f} pts"
+                   if (asis_fill is not None and reco_fill is not None) else None),
+        )
+        st.caption(
+            f"AS-IS avg fill **{(asis_fill or 0) * 100:.1f}%** · "
+            f"parts unmanaged today (MRP Type ND): **{summary.get('n_unmanaged', 0)}** · "
+            f"parts where no policy meets target: **{summary.get('n_no_policy_meets', 0)}** · "
+            f"parts already optimal (keep current): **{summary.get('n_keep_current', 0)}**"
+        )
+        st.divider()
+
     # ── Per-policy comparison ────────────────────────────────────────────────
     if psum:
         st.markdown("#### Policy comparison (all parts aggregated)")
@@ -367,9 +399,57 @@ def _render_results(run, payloads: dict) -> None:
     if part_set is not None:
         st.caption(f"Filtered to **{len(part_set)}** part(s).")
 
-    # ── Per-item recommendation ──────────────────────────────────────────────
+    # ── SAP prescription per part (AS-IS → recommended) ──────────────────────
+    if f_recs and "as_is_fill" in f_recs[0]:
+        st.markdown("#### SAP prescription per part — AS-IS → recommended")
+        st.caption(
+            "For each part: today's SAP setup (AS-IS) vs the recommended "
+            "methodology and the exact SAP target to configure. "
+            "Δ fill > 0 = better service · Δ stock € > 0 = inventory freed · "
+            "🔒 = already optimal (keep current)."
+        )
+        pdf = pd.DataFrame(f_recs)
+        pdf["Keep"] = pdf["keep_current"].map(lambda b: "🔒" if b else "")
+        pdf["AS-IS fill %"] = pdf["as_is_fill"].map(
+            lambda v: v * 100.0 if v is not None else None)
+        pdf["Reco fill %"] = pdf["best_fill"] * 100.0
+        pdf["Δ fill pts"] = pdf["delta_fill"].map(
+            lambda v: v * 100.0 if v is not None else None)
+        pview = pdf.rename(columns={
+            "part_number": "Part",
+            "as_is_mrp_type": "AS-IS MRP",
+            "as_is_stock_value": "AS-IS stock €",
+            "best_policy_label": "Recommended",
+            "target_mrp_type": "Target MRP Type",
+            "target_safety_stock": "Target SS",
+            "target_reorder_point": "Target ROP",
+            "target_lot": "Target Lot",
+            "best_stock_value": "Reco stock €",
+            "delta_stock_value": "Δ stock €",
+        })
+        pcols = ["Part", "Keep", "AS-IS MRP", "AS-IS fill %", "AS-IS stock €",
+                 "Recommended", "Target MRP Type", "Target SS", "Target ROP",
+                 "Target Lot", "Reco fill %", "Reco stock €",
+                 "Δ fill pts", "Δ stock €"]
+        pcols = [c for c in pcols if c in pview.columns]
+        st.dataframe(
+            pview[pcols], use_container_width=True, hide_index=True, height=360,
+            column_config={
+                "AS-IS fill %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Reco fill %":  st.column_config.NumberColumn(format="%.1f%%"),
+                "AS-IS stock €": st.column_config.NumberColumn(format="€ %.0f"),
+                "Reco stock €":  st.column_config.NumberColumn(format="€ %.0f"),
+                "Target SS":  st.column_config.NumberColumn(format="%.0f"),
+                "Target ROP": st.column_config.NumberColumn(format="%.0f"),
+                "Target Lot": st.column_config.NumberColumn(format="%.0f"),
+                "Δ fill pts": st.column_config.NumberColumn(format="%+.1f"),
+                "Δ stock €":  st.column_config.NumberColumn(format="€ %+.0f"),
+            },
+        )
+
+    # ── Per-item recommendation (DDMRP vs best MRP) ──────────────────────────
     if f_recs:
-        st.markdown("#### Recommendation per part")
+        st.markdown("#### Recommendation per part — DDMRP vs MRP")
         st.caption(
             "Best policy = lowest average stock value among policies meeting the "
             "target fill rate. Δ vs MRP < 0 means DDMRP holds **less** stock than "
@@ -452,6 +532,54 @@ def _build_excel(run, summary: dict, psum: list, recs: list, rows: list) -> byte
             ("Parts simulated", summary.get("n_items")),
         ], columns=["Field", "Value"])
         meta.to_excel(xl, sheet_name="Run Info", index=False)
+
+        # Executive summary (portfolio AS-IS vs recommended)
+        if summary.get("total_asis_stock_value") is not None:
+            exec_rows = [
+                ("Σ inventory — AS-IS (current SAP) €", summary.get("total_asis_stock_value")),
+                ("Σ inventory — recommended €", summary.get("total_reco_stock_value")),
+                ("Working capital freed €", summary.get("working_capital_freed")),
+                ("Working capital freed %", summary.get("working_capital_freed_pct")),
+                ("Avg fill — AS-IS", summary.get("avg_asis_fill")),
+                ("Avg fill — recommended", summary.get("avg_reco_fill")),
+                ("Parts unmanaged today (ND)", summary.get("n_unmanaged")),
+                ("Parts where no policy meets target", summary.get("n_no_policy_meets")),
+                ("Parts already optimal (keep current)", summary.get("n_keep_current")),
+            ]
+            pd.DataFrame(exec_rows, columns=["Metric", "Value"]).to_excel(
+                xl, sheet_name="Executive Summary", index=False)
+
+        # SAP prescription (per part, actionable settings)
+        if recs and "as_is_fill" in recs[0]:
+            sp = pd.DataFrame(recs)[[
+                c for c in (
+                    "part_number", "description", "keep_current",
+                    "as_is_mrp_type", "as_is_fill", "as_is_stock_value",
+                    "best_policy_label", "target_mrp_type",
+                    "target_safety_stock", "target_reorder_point", "target_lot",
+                    "target_tor", "target_toy", "target_tog",
+                    "best_fill", "best_stock_value",
+                    "delta_fill", "delta_stock_value", "no_policy_meets",
+                ) if c in recs[0]
+            ]].rename(columns={
+                "part_number": "Part",
+                "description": "Description",
+                "keep_current": "Keep current",
+                "as_is_mrp_type": "AS-IS MRP Type",
+                "as_is_fill": "AS-IS fill",
+                "as_is_stock_value": "AS-IS stock value",
+                "best_policy_label": "Recommended methodology",
+                "target_mrp_type": "Target MRP Type",
+                "target_safety_stock": "Target Safety Stock",
+                "target_reorder_point": "Target Reorder Point",
+                "target_lot": "Target Lot",
+                "target_tor": "DDMRP TOR", "target_toy": "DDMRP TOY", "target_tog": "DDMRP TOG",
+                "best_fill": "Recommended fill",
+                "best_stock_value": "Recommended stock value",
+                "delta_fill": "Δ fill", "delta_stock_value": "Δ stock value (freed)",
+                "no_policy_meets": "No policy meets target",
+            })
+            sp.to_excel(xl, sheet_name="SAP Prescription", index=False)
 
         if psum:
             ps = pd.DataFrame(psum).rename(columns={

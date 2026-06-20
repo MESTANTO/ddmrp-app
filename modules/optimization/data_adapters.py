@@ -475,6 +475,16 @@ def load_simulation_inputs(
                 "hist_mean":               round(hist_mean, 4),
                 "hist_cv":                 round(hist_cv, 4),
                 "hist_series":             series,
+                # ── Current SAP planning policy (AS-IS baseline) ──
+                "sap_mrp_type":              (getattr(it, "sap_mrp_type", "") or "").upper(),
+                "sap_safety_stock":          _num(getattr(it, "sap_safety_stock", 0.0), 0.0),
+                "sap_reorder_point":         _num(getattr(it, "sap_reorder_point", 0.0), 0.0),
+                "sap_fixed_lot":             _num(getattr(it, "sap_fixed_lot", 0.0), 0.0),
+                "sap_min_lot":               _num(getattr(it, "sap_min_lot", 0.0), 0.0),
+                "sap_max_lot":               _num(getattr(it, "sap_max_lot", 0.0), 0.0),
+                "sap_rounding_value":        _num(getattr(it, "sap_rounding_value", 0.0), 0.0),
+                "sap_planned_delivery_time": _num(getattr(it, "sap_planned_delivery_time", 0.0), 0.0),
+                "sap_gr_processing_time":    _num(getattr(it, "sap_gr_processing_time", 0.0), 0.0),
             })
 
         if only_ddmrp_eligible:

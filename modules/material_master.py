@@ -466,6 +466,27 @@ def _show_add_item():
                 help="'auto' = use the computed recommendation; otherwise force a type.",
             )
 
+        st.markdown(
+            "**🏭 Current SAP Planning** (optional — the AS-IS baseline replayed by "
+            "**Methodology Simulation** to quantify the gain of switching policy)"
+        )
+        sap1, sap2, sap3 = st.columns(3)
+        with sap1:
+            sap_mrp_type = st.selectbox(
+                "SAP MRP Type", options=["(not set)", "PD", "VB", "VM", "ND", "V1", "V2"],
+                help="Current SAP disposition: PD=MRP, VB=manual ROP, VM=auto ROP, ND=no planning.",
+            )
+            sap_safety_stock = st.number_input("SAP Safety Stock (units)", min_value=0.0, value=0.0, step=1.0)
+            sap_reorder_point = st.number_input("SAP Reorder Point (units)", min_value=0.0, value=0.0, step=1.0)
+        with sap2:
+            sap_fixed_lot = st.number_input("SAP Fixed Lot (units)", min_value=0.0, value=0.0, step=1.0)
+            sap_min_lot = st.number_input("SAP Min Lot (units)", min_value=0.0, value=0.0, step=1.0)
+            sap_max_lot = st.number_input("SAP Max Lot (units)", min_value=0.0, value=0.0, step=1.0)
+        with sap3:
+            sap_rounding_value = st.number_input("SAP Rounding Value (units)", min_value=0.0, value=0.0, step=1.0)
+            sap_pdt = st.number_input("SAP Planned Delivery Time (days)", min_value=0.0, value=0.0, step=1.0)
+            sap_grt = st.number_input("SAP GR Processing Time (days)", min_value=0.0, value=0.0, step=1.0)
+
         submitted = st.form_submit_button("Add Item", type="primary")
 
     if submitted:
@@ -524,6 +545,16 @@ def _show_add_item():
                 critical_operation        = (True  if crit_op == "Yes"
                                              else False if crit_op == "No" else None),
                 mrp_type_override         = mrp_override,
+                # Current SAP planning (AS-IS baseline)
+                sap_mrp_type              = "" if sap_mrp_type == "(not set)" else sap_mrp_type,
+                sap_safety_stock          = sap_safety_stock,
+                sap_reorder_point         = sap_reorder_point,
+                sap_fixed_lot             = sap_fixed_lot,
+                sap_min_lot               = sap_min_lot,
+                sap_max_lot               = sap_max_lot,
+                sap_rounding_value        = sap_rounding_value,
+                sap_planned_delivery_time = sap_pdt,
+                sap_gr_processing_time    = sap_grt,
                 company_id=get_company_id(),
             )
             session.add(item)
@@ -695,6 +726,37 @@ def _show_edit_item():
                     if item.mrp_type_override in _override_opts else 0,
                 )
 
+            st.markdown(
+                "**🏭 Current SAP Planning** (optional — AS-IS baseline for **Methodology Simulation**)"
+            )
+            _sap_opts = ["(not set)", "PD", "VB", "VM", "ND", "V1", "V2"]
+            sap1, sap2, sap3 = st.columns(3)
+            with sap1:
+                sap_mrp_type = st.selectbox(
+                    "SAP MRP Type", options=_sap_opts,
+                    index=_sap_opts.index(item.sap_mrp_type)
+                    if (item.sap_mrp_type or "") in _sap_opts else 0,
+                    help="PD=MRP, VB=manual ROP, VM=auto ROP, ND=no planning.",
+                )
+                sap_safety_stock = st.number_input("SAP Safety Stock (units)", min_value=0.0,
+                                                   value=float(item.sap_safety_stock or 0.0), step=1.0)
+                sap_reorder_point = st.number_input("SAP Reorder Point (units)", min_value=0.0,
+                                                    value=float(item.sap_reorder_point or 0.0), step=1.0)
+            with sap2:
+                sap_fixed_lot = st.number_input("SAP Fixed Lot (units)", min_value=0.0,
+                                                value=float(item.sap_fixed_lot or 0.0), step=1.0)
+                sap_min_lot = st.number_input("SAP Min Lot (units)", min_value=0.0,
+                                              value=float(item.sap_min_lot or 0.0), step=1.0)
+                sap_max_lot = st.number_input("SAP Max Lot (units)", min_value=0.0,
+                                              value=float(item.sap_max_lot or 0.0), step=1.0)
+            with sap3:
+                sap_rounding_value = st.number_input("SAP Rounding Value (units)", min_value=0.0,
+                                                     value=float(item.sap_rounding_value or 0.0), step=1.0)
+                sap_pdt = st.number_input("SAP Planned Delivery Time (days)", min_value=0.0,
+                                          value=float(item.sap_planned_delivery_time or 0.0), step=1.0)
+                sap_grt = st.number_input("SAP GR Processing Time (days)", min_value=0.0,
+                                          value=float(item.sap_gr_processing_time or 0.0), step=1.0)
+
             col_save, col_delete = st.columns([3, 1])
             save = col_save.form_submit_button("Save Changes", type="primary")
             delete = col_delete.form_submit_button("Delete Item", type="secondary")
@@ -744,6 +806,16 @@ def _show_edit_item():
                 it.critical_operation        = (True  if crit_op == "Yes"
                                                 else False if crit_op == "No" else None)
                 it.mrp_type_override         = mrp_override
+                # Current SAP planning (AS-IS baseline)
+                it.sap_mrp_type              = "" if sap_mrp_type == "(not set)" else sap_mrp_type
+                it.sap_safety_stock          = sap_safety_stock
+                it.sap_reorder_point         = sap_reorder_point
+                it.sap_fixed_lot             = sap_fixed_lot
+                it.sap_min_lot               = sap_min_lot
+                it.sap_max_lot               = sap_max_lot
+                it.sap_rounding_value        = sap_rounding_value
+                it.sap_planned_delivery_time = sap_pdt
+                it.sap_gr_processing_time    = sap_grt
                 session2.commit()
                 st.success("Item updated successfully!")
                 st.rerun()
