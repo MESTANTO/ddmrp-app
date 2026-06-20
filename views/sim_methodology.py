@@ -16,6 +16,8 @@ Two tabs:
 
 from __future__ import annotations
 
+import io
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -338,15 +340,42 @@ def _render_results(run, payloads: dict) -> None:
 
     st.divider()
 
+    # ── Part filter + Excel export ───────────────────────────────────────────
+    all_parts = sorted({r.get("part_number") for r in recs}
+                       | {r.get("part_number") for r in rows})
+    fc1, fc2 = st.columns([3, 1])
+    with fc1:
+        selected_parts = st.multiselect(
+            "Filter by part", options=all_parts, default=[],
+            help="Leave empty to show all parts. Filters the tables below and "
+                 "the per-part sheets of the Excel export.",
+        )
+    part_set = set(selected_parts) if selected_parts else None
+    f_recs = [r for r in recs if (part_set is None or r.get("part_number") in part_set)]
+    f_rows = [r for r in rows if (part_set is None or r.get("part_number") in part_set)]
+
+    with fc2:
+        st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+        st.download_button(
+            "⬇️ Export to Excel",
+            data=_build_excel(run, summary, psum, f_recs, f_rows),
+            file_name=f"ddmrp_vs_mrp_sim_run{run.id}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    if part_set is not None:
+        st.caption(f"Filtered to **{len(part_set)}** part(s).")
+
     # ── Per-item recommendation ──────────────────────────────────────────────
-    if recs:
+    if f_recs:
         st.markdown("#### Recommendation per part")
         st.caption(
             "Best policy = lowest average stock value among policies meeting the "
             "target fill rate. Δ vs MRP < 0 means DDMRP holds **less** stock than "
             "the cheapest MRP policy."
         )
-        rdf = pd.DataFrame(recs)
+        rdf = pd.DataFrame(f_recs)
         rdf["Eligible"] = rdf["is_ddmrp_eligible"].map(lambda b: "✅" if b else "—")
         rdf["Best"] = rdf["best_policy_label"]
         rdf["DDMRP wins"] = rdf["ddmrp_wins"].map(lambda b: "🏆" if b else "")
@@ -377,9 +406,9 @@ def _render_results(run, payloads: dict) -> None:
         )
 
     # ── Full detail ──────────────────────────────────────────────────────────
-    if rows:
-        with st.expander("Full detail — every part × policy"):
-            ddf = pd.DataFrame(rows)
+    if f_rows:
+        with st.expander("Full detail — every part × policy", expanded=bool(part_set)):
+            ddf = pd.DataFrame(f_rows)
             ddf["Policy"] = ddf["policy"].map(lambda p: POLICY_LABELS.get(p, p))
             ddf["Fill %"] = ddf["unit_fill_rate"] * 100.0
             ddf["CSL %"] = ddf["cycle_service_level"] * 100.0
@@ -405,3 +434,84 @@ def _render_results(run, payloads: dict) -> None:
                     "Holding €/yr": st.column_config.NumberColumn(format="€ %.0f"),
                 },
             )
+
+
+def _build_excel(run, summary: dict, psum: list, recs: list, rows: list) -> bytes:
+    """Serialise the (optionally part-filtered) results into a multi-sheet .xlsx."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        # Run metadata
+        meta = pd.DataFrame([
+            ("Run", f"#{run.id} — {run.scenario_name or '—'}"),
+            ("Created", run.created_at.strftime("%Y-%m-%d %H:%M")),
+            ("Horizon (days)", summary.get("horizon_days")),
+            ("Replications", summary.get("n_replications")),
+            ("Demand mode", summary.get("demand_mode")),
+            ("Demand profile", summary.get("demand_profile")),
+            ("Target fill rate", summary.get("service_target")),
+            ("Parts simulated", summary.get("n_items")),
+        ], columns=["Field", "Value"])
+        meta.to_excel(xl, sheet_name="Run Info", index=False)
+
+        if psum:
+            ps = pd.DataFrame(psum).rename(columns={
+                "policy_label": "Policy",
+                "avg_fill_rate": "Avg fill",
+                "avg_csl": "Avg CSL",
+                "total_stock_value": "Total stock value",
+                "avg_turnover": "Avg turnover",
+                "total_holding_cost": "Total holding cost/yr",
+                "n_items": "Parts",
+            })
+            keep = ["Policy", "Avg fill", "Avg CSL", "Total stock value",
+                    "Avg turnover", "Total holding cost/yr", "Parts"]
+            ps[[c for c in keep if c in ps.columns]].to_excel(
+                xl, sheet_name="Policy Summary", index=False)
+
+        if recs:
+            rd = pd.DataFrame(recs).rename(columns={
+                "part_number": "Part",
+                "is_ddmrp_eligible": "DDMRP eligible",
+                "best_policy_label": "Best policy",
+                "ddmrp_wins": "DDMRP wins",
+                "best_fill": "Best fill",
+                "best_stock_value": "Best stock value",
+                "best_turnover": "Best turnover",
+                "ddmrp_fill": "DDMRP fill",
+                "ddmrp_stock_value": "DDMRP stock value",
+                "ddmrp_turnover": "DDMRP turnover",
+                "best_mrp_policy": "Best MRP policy",
+                "best_mrp_stock_value": "Best MRP stock value",
+                "ddmrp_stock_delta_vs_mrp": "DDMRP stock delta vs MRP",
+            })
+            rd = rd.drop(columns=[c for c in ("item_id", "description", "best_policy")
+                                  if c in rd.columns])
+            rd.to_excel(xl, sheet_name="Recommendation", index=False)
+
+        if rows:
+            dd = pd.DataFrame(rows)
+            dd["policy"] = dd["policy"].map(lambda p: POLICY_LABELS.get(p, p))
+            dd = dd.rename(columns={
+                "part_number": "Part",
+                "policy": "Policy",
+                "unit_fill_rate": "Fill",
+                "cycle_service_level": "CSL",
+                "avg_on_hand_units": "Avg OH units",
+                "avg_on_hand_value": "Avg OH value",
+                "turnover_index": "Turnover",
+                "n_orders": "# Orders",
+                "annual_holding_cost": "Holding cost/yr",
+                "ordering_cost_window": "Ordering cost (window)",
+                "meets_target": "Meets target",
+                "unit_cost": "Unit cost",
+            })
+            dd = dd.drop(columns=[c for c in ("item_id", "description")
+                                  if c in dd.columns])
+            front = ["Part", "Policy", "Fill", "CSL", "Avg OH units", "Avg OH value",
+                     "Turnover", "# Orders", "Holding cost/yr"]
+            ordered = [c for c in front if c in dd.columns] + \
+                      [c for c in dd.columns if c not in front]
+            dd[ordered].to_excel(xl, sheet_name="Detail by Part x Policy", index=False)
+
+    buf.seek(0)
+    return buf.read()
