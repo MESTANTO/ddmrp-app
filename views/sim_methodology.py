@@ -20,6 +20,7 @@ import io
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from database.auth import get_company_id, get_current_user
@@ -38,6 +39,100 @@ from views.optimization._shared import (
 )
 
 _SESSION_KEY = "sim_ddmrp_mrp"
+
+# Stable colour per policy for the deep-analysis overlay.
+_TRACE_COLORS = {
+    "as_is":       "#94A3B8",
+    "ddmrp":       "#6366F1",
+    "rop_q":       "#0EA5E9",
+    "rop_ss":      "#14B8A6",
+    "kanban":      "#F59E0B",
+    "periodic_rs": "#A855F7",
+}
+
+
+@st.cache_data(show_spinner=False)
+def _items_map(company_id: int) -> dict:
+    """Part-number → item dict for the company (cached). Used to re-simulate a
+    single part's daily trace for the deep-analysis chart."""
+    inputs = load_simulation_inputs(
+        company_id, only_ddmrp_eligible=False, top_n_items=1000)
+    return {it["part_number"]: it for it in inputs["items"]}
+
+
+def _trace_chart(traces: dict, title: str):
+    """Build a 2-row figure for one part:
+      • row 1 — on-hand stock line(s) per policy, demand bars, planned-supply
+                (receipts) markers
+      • row 2 — inventory value (€) line(s) per policy
+    `traces` maps a display label → the trace dict returned by simulate_trace,
+    each carrying a `policy` key for colouring."""
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        row_heights=[0.62, 0.38],
+        subplot_titles=("On-hand stock · demand · planned supply",
+                        "Inventory value (€)"),
+    )
+
+    first = next(iter(traces.values()))
+    days = first.get("day", [])
+    warmup = first.get("warmup_days", 0)
+
+    # shared demand bars (identical across policies for the same seed)
+    fig.add_bar(
+        x=days, y=first.get("demand", []), name="Demand",
+        marker_color="rgba(148,163,184,0.35)",
+        hovertemplate="day %{x}<br>demand %{y:.1f}<extra></extra>",
+        row=1, col=1,
+    )
+
+    for label, tr in traces.items():
+        pol = tr.get("policy", "")
+        color = _TRACE_COLORS.get(pol, "#1f2937")
+        # on-hand line
+        fig.add_scatter(
+            x=tr.get("day", []), y=tr.get("on_hand", []), mode="lines",
+            name=f"{label} — on-hand", line=dict(color=color, width=2),
+            hovertemplate="day %{x}<br>on-hand %{y:.1f}<extra></extra>",
+            row=1, col=1,
+        )
+        # planned supply (receipts landing) markers
+        rx = [d for d, v in zip(tr.get("day", []), tr.get("receipts", [])) if v > 0]
+        ry = [v for v in tr.get("receipts", []) if v > 0]
+        if rx:
+            fig.add_scatter(
+                x=rx, y=ry, mode="markers", name=f"{label} — supply",
+                marker=dict(color=color, size=8, symbol="triangle-up",
+                            line=dict(color="white", width=1)),
+                hovertemplate="day %{x}<br>supply +%{y:.1f}<extra></extra>",
+                row=1, col=1,
+            )
+        # inventory value line
+        fig.add_scatter(
+            x=tr.get("day", []), y=tr.get("inventory_value", []), mode="lines",
+            name=f"{label} — € value", line=dict(color=color, width=2, dash="dot"),
+            hovertemplate="day %{x}<br>€ %{y:,.0f}<extra></extra>",
+            showlegend=False, row=2, col=1,
+        )
+
+    # warmup boundary (metrics start after this)
+    if warmup and days:
+        for r in (1, 2):
+            fig.add_vline(x=warmup, line_dash="dash", line_color="#CBD5E1",
+                          row=r, col=1)
+        fig.add_annotation(x=warmup, y=1.0, yref="paper", showarrow=False,
+                           text="warm-up ▸", font=dict(size=10, color="#94A3B8"),
+                           xanchor="left")
+
+    fig.update_layout(
+        title=title, height=560, barmode="overlay", plot_bgcolor="white",
+        margin=dict(t=70, b=40, l=50, r=20), hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0),
+    )
+    fig.update_yaxes(title_text="units", row=1, col=1)
+    fig.update_yaxes(title_text="€", row=2, col=1)
+    fig.update_xaxes(title_text="day", row=2, col=1)
+    return fig
 
 
 def show() -> None:
@@ -498,6 +593,13 @@ def _render_results(run, payloads: dict) -> None:
             },
         )
 
+    # ── Deep analysis — per-part daily trace ─────────────────────────────────
+    if all_parts:
+        avail = [p.get("policy") for p in psum] or ["as_is", "ddmrp"]
+        # best policy per part for a sensible default overlay
+        best_by_part = {r.get("part_number"): r.get("best_policy") for r in recs}
+        _render_trace_block(all_parts, summary, avail, best_by_part, "cmp")
+
     # ── Full detail ──────────────────────────────────────────────────────────
     if f_rows:
         with st.expander("Full detail — every part × policy", expanded=bool(part_set)):
@@ -527,6 +629,67 @@ def _render_results(run, payloads: dict) -> None:
                     "Holding €/yr": st.column_config.NumberColumn(format="€ %.0f"),
                 },
             )
+
+
+def _render_trace_block(all_parts: list, summary: dict, avail_policies: list,
+                        best_by_part: dict, key_prefix: str) -> None:
+    """Deep-analysis expander: stock / demand / planned-supply / inventory-value
+    trend for ONE selected part, overlaying one or more policies."""
+    from modules.optimization.ses_simulation import simulate_trace
+
+    with st.expander("🔬 Deep analysis — per-part daily trace", expanded=False):
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            part = st.selectbox("Part", options=all_parts,
+                                key=f"{key_prefix}_trace_part")
+        # default overlay: AS-IS + this part's best policy (fallback ddmrp)
+        best = best_by_part.get(part) or ("ddmrp" if "ddmrp" in avail_policies
+                                          else avail_policies[0])
+        default = [p for p in ("as_is", best) if p in avail_policies] or avail_policies[:1]
+        with c2:
+            policies = st.multiselect(
+                "Policies to overlay", options=avail_policies, default=default,
+                format_func=lambda k: POLICY_LABELS.get(k, k),
+                key=f"{key_prefix}_trace_pols",
+            )
+        if not part or not policies:
+            st.info("Select a part and at least one policy to plot its trace.")
+            return
+
+        company_id = get_company_id()
+        item = _items_map(company_id).get(part)
+        if item is None:
+            st.warning("Part not found in current master data — re-run the simulation.")
+            return
+
+        horizon = int(summary.get("horizon_days", 180))
+        demand_mode = summary.get("demand_mode", "synthetic")
+        demand_profile = summary.get("demand_profile", "stable")
+        target = float(summary.get("service_target", 0.95))
+        seed = int(summary.get("seed", 42))
+
+        traces = {}
+        for pol in policies:
+            tr = simulate_trace(
+                item, pol, horizon=horizon, demand_mode=demand_mode,
+                demand_profile=demand_profile, service_target=target, seed=seed)
+            if tr:
+                tr["policy"] = pol
+                traces[POLICY_LABELS.get(pol, pol)] = tr
+        if not traces:
+            st.warning("No trace could be generated for this part.")
+            return
+
+        st.plotly_chart(
+            _trace_chart(traces, f"Part {part} — daily trace ({horizon}d, 1 rep)"),
+            use_container_width=True,
+        )
+        st.caption(
+            "Single representative replication (seed-locked). Bars = daily "
+            "demand · solid line = on-hand stock · triangles = planned supply "
+            "landing · dotted line (lower panel) = inventory value (€). "
+            "Demand is identical across policies for a clean comparison."
+        )
 
 
 def _render_assignment_editor(recs: list) -> None:
@@ -753,6 +916,58 @@ def _render_to_be_results(run, payloads: dict) -> None:
             data=_build_tobe_excel(run, s, detail),
             file_name=f"ddmrp_to_be_run{run.id}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        # ── Deep analysis — AS-IS vs assigned TO-BE policy for one part ───────
+        _render_tobe_trace_block(detail, s)
+
+
+def _render_tobe_trace_block(detail: list, s: dict) -> None:
+    """Deep-analysis expander for the TO-BE tab: overlay AS-IS vs the part's
+    assigned TO-BE policy for one selected part."""
+    from modules.optimization.ses_simulation import simulate_trace
+
+    parts = [r.get("part_number") for r in detail]
+    pol_by_part = {r.get("part_number"): (r.get("to_be_policy") or "as_is")
+                   for r in detail}
+    with st.expander("🔬 Deep analysis — per-part daily trace", expanded=False):
+        part = st.selectbox("Part", options=parts, key="tobe_trace_part")
+        if not part:
+            return
+        to_be_pol = pol_by_part.get(part, "as_is")
+        policies = ["as_is"] if to_be_pol == "as_is" else ["as_is", to_be_pol]
+
+        company_id = get_company_id()
+        item = _items_map(company_id).get(part)
+        if item is None:
+            st.warning("Part not found in current master data — re-run the simulation.")
+            return
+
+        horizon = int(s.get("horizon_days", 180))
+        demand_mode = s.get("demand_mode", "synthetic")
+        demand_profile = s.get("demand_profile", "stable")
+        target = float(s.get("service_target", 0.95))
+
+        traces = {}
+        for pol in policies:
+            tr = simulate_trace(
+                item, pol, horizon=horizon, demand_mode=demand_mode,
+                demand_profile=demand_profile, service_target=target, seed=42)
+            if tr:
+                tr["policy"] = pol
+                traces[POLICY_LABELS.get(pol, pol)] = tr
+        if not traces:
+            st.warning("No trace could be generated for this part.")
+            return
+
+        st.plotly_chart(
+            _trace_chart(traces, f"Part {part} — AS-IS vs TO-BE ({horizon}d, 1 rep)"),
+            use_container_width=True,
+        )
+        st.caption(
+            "AS-IS (current SAP) vs the accepted TO-BE methodology for this part. "
+            "Bars = daily demand · solid line = on-hand stock · triangles = "
+            "planned supply landing · dotted line (lower panel) = inventory value (€)."
         )
 
 

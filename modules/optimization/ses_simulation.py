@@ -123,7 +123,7 @@ def _gen_demand(rng: np.random.Generator, item: dict, horizon: int,
 
 def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
               demand_mode: str, demand_profile: str, service_target: float,
-              seed: int) -> dict[str, float]:
+              seed: int, trace: bool = False) -> dict[str, float]:
     def _f(v, default=0.0):
         try:
             v = float(v)
@@ -249,6 +249,7 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
     rep_fill, rep_csl, rep_avg_oh = [], [], []
     rep_orders, rep_hold, rep_order_cost = [], [], []
     rep_mean_demand = []
+    trace_rec = None  # daily series of the last replication (for deep analysis)
 
     warmup = min(horizon // 3, max(lead_i * 2, 10))
 
@@ -257,6 +258,9 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
         on_hand = float(order_up)               # warm start near steady state
         arrivals = np.zeros(horizon + lead_i + 1, dtype=float)
         on_order = 0.0
+
+        if trace:
+            tr_oh, tr_dem, tr_recv, tr_ord = [], [], [], []
 
         oh_samples = []
         demanded = filled = stockout_days = 0.0
@@ -306,13 +310,30 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
                 arrivals[tt + lead_i] += q
                 on_order += q
                 n_orders += 1
-            # 4. metrics (post-warmup)
+            # 4. record daily trace (full period incl. warmup)
+            if trace:
+                tr_oh.append(round(on_hand, 3))
+                tr_dem.append(round(float(d), 3))
+                tr_recv.append(round(float(recv), 3))
+                tr_ord.append(round(float(q), 3))
+            # 5. metrics (post-warmup)
             if tt >= warmup:
                 demanded += d
                 filled += sat
                 if d - sat > 1e-9:
                     stockout_days += 1
                 oh_samples.append(on_hand)
+
+        if trace:
+            trace_rec = {
+                "day":             list(range(horizon)),
+                "warmup_days":     warmup,
+                "on_hand":         tr_oh,
+                "demand":          tr_dem,
+                "receipts":        tr_recv,   # planned supply landing each day
+                "orders":          tr_ord,    # orders released each day
+                "inventory_value": [round(v * unit_cost, 2) for v in tr_oh],
+            }
 
         meas_days = max(horizon - warmup, 1)
         avg_oh = float(np.mean(oh_samples)) if oh_samples else 0.0
@@ -358,7 +379,25 @@ def _simulate(item: dict, policy: str, *, horizon: int, n_reps: int,
         "calc_tor":            round(tor, 2),
         "calc_toy":            round(toy, 2),
         "calc_tog":            round(tog, 2),
+        "trace":               trace_rec,
     }
+
+
+def simulate_trace(item: dict, policy: str, *, horizon: int, demand_mode: str,
+                   demand_profile: str, service_target: float,
+                   seed: int = 42) -> dict:
+    """
+    Run a single representative replication for one (item, policy) and return
+    its daily series: on_hand, demand, receipts (planned supply), orders and
+    inventory_value — for deep per-part analysis charts. Uses the same daily
+    engine as the aggregate simulation so the trace is faithful to the run.
+    """
+    res = _simulate(
+        item, policy, horizon=horizon, n_reps=1, demand_mode=demand_mode,
+        demand_profile=demand_profile, service_target=service_target,
+        seed=seed, trace=True,
+    )
+    return res.get("trace") or {}
 
 
 def solve(params: dict[str, Any]) -> SolveResult:
