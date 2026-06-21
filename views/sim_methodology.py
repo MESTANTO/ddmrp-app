@@ -26,6 +26,11 @@ from database.auth import get_company_id, get_current_user
 from modules.optimization.data_adapters import load_simulation_inputs
 from modules.optimization.ses_simulation import solve as solve_sim, POLICY_LABELS
 from modules.optimization.solver_base import record_run
+from modules.positioning_engine import assign_methodologies
+
+# Methodologies the user can accept/assign to a part (AS-IS is the baseline).
+_ASSIGN_LABELS = {k: v for k, v in POLICY_LABELS.items() if k != "as_is"}
+_KEEP_CURRENT = "— keep current (AS-IS) —"
 from views.optimization._shared import (
     render_run_history,
     load_run_payloads,
@@ -49,7 +54,8 @@ def show() -> None:
     )
     st.divider()
 
-    tab_run, tab_results = st.tabs(["🛠️ Configure & Run", "📊 Results"])
+    tab_run, tab_results, tab_tobe = st.tabs(
+        ["🛠️ Configure & Run", "📊 Results", "🔮 TO-BE Scenario"])
 
     with tab_run:
         _render_configure(company_id, user_id)
@@ -58,12 +64,15 @@ def show() -> None:
         run_id = st.session_state.get(f"{_SESSION_KEY}_last_run_id")
         if not run_id:
             st.info("Run a simulation from the **Configure & Run** tab to see results here.")
-            return
-        payloads = load_run_payloads(int(run_id), company_id)
-        if not payloads:
-            st.error("Run not found (it may have expired).")
-            return
-        _render_results(payloads["_run"], payloads)
+        else:
+            payloads = load_run_payloads(int(run_id), company_id)
+            if not payloads:
+                st.error("Run not found (it may have expired).")
+            else:
+                _render_results(payloads["_run"], payloads)
+
+    with tab_tobe:
+        _render_to_be(company_id, user_id)
 
 
 # ── Configure & Run ──────────────────────────────────────────────────────────
@@ -447,6 +456,10 @@ def _render_results(run, payloads: dict) -> None:
             },
         )
 
+    # ── Accept recommendations → assign methodology in master data ───────────
+    if f_recs and "as_is_fill" in f_recs[0]:
+        _render_assignment_editor(f_recs)
+
     # ── Per-item recommendation (DDMRP vs best MRP) ──────────────────────────
     if f_recs:
         st.markdown("#### Recommendation per part — DDMRP vs MRP")
@@ -514,6 +527,272 @@ def _render_results(run, payloads: dict) -> None:
                     "Holding €/yr": st.column_config.NumberColumn(format="€ %.0f"),
                 },
             )
+
+
+def _render_assignment_editor(recs: list) -> None:
+    """Editable table to accept a recommendation and persist the chosen
+    methodology to the item master (drives the TO-BE scenario)."""
+    st.markdown("#### Accept → assign methodology in master data")
+    st.caption(
+        "Tick **Accept** to flag a part with a methodology in the master data "
+        "(DDMRP recommendations also set MRP Type override = DDMRP). The chosen "
+        "policy defaults to the recommendation but you can override it. Saved "
+        "assignments drive the **TO-BE Scenario** tab."
+    )
+    label_to_key = {v: k for k, v in _ASSIGN_LABELS.items()}
+    id_by_part = {r["part_number"]: r["item_id"] for r in recs}
+
+    edf = pd.DataFrame([{
+        "Part":        r["part_number"],
+        "Recommended": r["best_policy_label"],
+        "Accept":      not bool(r.get("keep_current")),
+        "Assign":      r["best_policy_label"],
+    } for r in recs])
+
+    edited = st.data_editor(
+        edf, use_container_width=True, hide_index=True, height=320,
+        key="assign_editor",
+        column_config={
+            "Part":        st.column_config.TextColumn(disabled=True),
+            "Recommended": st.column_config.TextColumn(disabled=True),
+            "Accept":      st.column_config.CheckboxColumn(help="Persist this assignment"),
+            "Assign":      st.column_config.SelectboxColumn(
+                options=[_KEEP_CURRENT, *_ASSIGN_LABELS.values()],
+                help="Methodology to set in the master data",
+            ),
+        },
+    )
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        save = st.button("💾 Save assignments", type="primary",
+                         use_container_width=True)
+    if save:
+        mapping = {}
+        for _, row in edited.iterrows():
+            iid = id_by_part.get(row["Part"])
+            if iid is None or not row["Accept"]:
+                continue
+            mapping[iid] = label_to_key.get(row["Assign"], "")
+        n = assign_methodologies(mapping)
+        if n:
+            st.success(f"✓ Saved {n} assignment(s) to master data. "
+                       f"Open the **TO-BE Scenario** tab to simulate the mix.")
+        else:
+            st.info("No parts ticked for Accept — nothing saved.")
+    with c2:
+        n_ticked = int(edited["Accept"].sum()) if len(edited) else 0
+        st.caption(f"**{n_ticked}** part(s) ticked to accept.")
+
+
+def _render_to_be(company_id: int, user_id) -> None:
+    """TO-BE (future-state) tab: simulate the portfolio under the accepted
+    methodology mix and compare to AS-IS."""
+    st.markdown("### 🔮 TO-BE scenario — portfolio under the accepted mix")
+    st.caption(
+        "Each part is simulated under the methodology you accepted "
+        "(Results tab → *Accept → assign*). Parts with no assignment stay on "
+        "their current AS-IS policy. The result shows the client the final "
+        "future state: service and inventory across the whole portfolio."
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        top_n = st.number_input(
+            "Max parts (by € volume)", min_value=1, max_value=500, value=100,
+            step=10, key="tobe_top_n",
+        )
+    with c2:
+        only_eligible = st.checkbox("Only DDMRP-eligible parts", value=False,
+                                    key="tobe_only_elig")
+
+    try:
+        inputs = load_simulation_inputs(
+            company_id, only_ddmrp_eligible=only_eligible, top_n_items=int(top_n))
+    except Exception as exc:
+        st.error(f"Failed to load inputs: {exc}")
+        return
+
+    items = inputs["items"]
+    n_items = len(items)
+    n_assigned = sum(1 for it in items if (it.get("assigned_methodology") or ""))
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Parts in scope", n_items)
+    k2.metric("With accepted methodology", n_assigned)
+    k3.metric("Will stay AS-IS", n_items - n_assigned)
+
+    if n_assigned == 0:
+        st.warning(
+            "No parts have an accepted methodology yet. Go to the **Results** "
+            "tab, tick **Accept** on the recommendations and save — then run here."
+        )
+
+    h1, h2, h3, h4 = st.columns(4)
+    with h1:
+        horizon = st.number_input("Horizon (days)", 30, 730, 180, 30, key="tobe_h")
+    with h2:
+        n_reps = st.number_input("Replications", 1, 200, 30, 5, key="tobe_r")
+    with h3:
+        demand_mode = st.radio("Demand", ["bootstrap", "synthetic"],
+                               horizontal=True, key="tobe_dm")
+    with h4:
+        service_target = st.number_input("Target fill %", 50.0, 99.9, 95.0, 0.5,
+                                         key="tobe_st") / 100.0
+
+    if st.button("🚀 Run TO-BE simulation", type="primary",
+                 use_container_width=True, disabled=(n_items == 0)):
+        params = {
+            "items": items, "mode": "to_be",
+            "horizon_days": int(horizon), "n_replications": int(n_reps),
+            "demand_mode": demand_mode, "demand_profile": "stable",
+            "service_target": float(service_target), "seed": 42,
+        }
+        try:
+            with st.spinner(f"Simulating TO-BE for {n_items} part(s)…"):
+                result = solve_sim(params)
+            run_id = record_run(
+                company_id=company_id, user_id=user_id,
+                session_key=f"{_SESSION_KEY}_tobe",
+                scenario_name=f"TO-BE · {n_assigned} switched · {int(horizon)}d",
+                params={"n_items": n_items, "n_switched": n_assigned,
+                        "horizon_days": int(horizon), "demand_mode": demand_mode,
+                        "service_target": float(service_target)},
+                result=result,
+            )
+            if result.status == "solved":
+                st.session_state[f"{_SESSION_KEY}_tobe_last_run_id"] = run_id
+                st.success(f"✓ TO-BE simulated in {result.runtime_ms} ms · run #{run_id}")
+            else:
+                st.error(f"Status: {result.status}. {result.error_message or ''}")
+        except Exception as exc:
+            st.error(f"TO-BE simulation error: {exc}")
+
+    run_id = st.session_state.get(f"{_SESSION_KEY}_tobe_last_run_id")
+    if run_id:
+        payloads = load_run_payloads(int(run_id), company_id)
+        if payloads:
+            _render_to_be_results(payloads["_run"], payloads)
+
+
+def _render_to_be_results(run, payloads: dict) -> None:
+    if run.status != "solved":
+        st.error(f"Status: {run.status}. {run.error_message or ''}")
+        return
+    s = payloads.get("to_be_summary", {})
+    detail = payloads.get("to_be_detail", {}).get("rows", [])
+    if not s:
+        return
+
+    st.divider()
+    st.markdown(f"#### Result — run #{run.id}")
+    asis = s.get("total_asis_stock_value", 0.0)
+    tobe = s.get("total_tobe_stock_value", 0.0)
+    freed = s.get("working_capital_freed", 0.0)
+    pct = s.get("working_capital_freed_pct", 0.0)
+    af = s.get("avg_asis_fill")
+    tf = s.get("avg_tobe_fill")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Σ inventory — AS-IS", f"€ {asis:,.0f}")
+    k2.metric("Σ inventory — TO-BE", f"€ {tobe:,.0f}",
+              delta=f"-€ {freed:,.0f}" if freed >= 0 else f"+€ {-freed:,.0f}")
+    k3.metric("Working capital freed", f"€ {freed:,.0f}", delta=f"{pct:.1f}%")
+    k4.metric("Avg fill — AS-IS → TO-BE", f"{(tf or 0) * 100:.1f}%",
+              delta=(f"+{(tf - af) * 100:.1f} pts"
+                     if (af is not None and tf is not None) else None))
+    st.caption(
+        f"Parts switched: **{s.get('n_switched', 0)}** · staying AS-IS: "
+        f"**{s.get('n_unchanged', 0)}** · AS-IS avg fill **{(af or 0) * 100:.1f}%**"
+    )
+
+    mix = s.get("methodology_mix", [])
+    if mix:
+        mdf = pd.DataFrame(mix)
+        fig = go.Figure()
+        fig.add_bar(
+            x=mdf["policy_label"], y=mdf["n_items"],
+            marker_color=["#6366F1" if p == "ddmrp" else
+                          "#94A3B8" if p == "as_is" else "#22C55E"
+                          for p in mdf["policy"]],
+            hovertemplate="<b>%{x}</b><br>%{y} parts<extra></extra>",
+        )
+        fig.update_layout(title="TO-BE methodology mix (parts per policy)",
+                          height=320, margin=dict(t=40, b=80, l=40, r=20),
+                          yaxis_title="parts", plot_bgcolor="white")
+        st.plotly_chart(fig, use_container_width=True)
+
+    if detail:
+        st.markdown("##### Per-part AS-IS → TO-BE")
+        ddf = pd.DataFrame(detail)
+        ddf["Switch"] = ddf["switched"].map(lambda b: "→" if b else "")
+        ddf["AS-IS fill %"] = ddf["as_is_fill"] * 100.0
+        ddf["TO-BE fill %"] = ddf["to_be_fill"] * 100.0
+        ddf["Δ fill pts"] = ddf["delta_fill"] * 100.0
+        view = ddf.rename(columns={
+            "part_number": "Part", "as_is_mrp_type": "AS-IS MRP",
+            "to_be_policy_label": "TO-BE methodology",
+            "as_is_stock_value": "AS-IS stock €", "to_be_stock_value": "TO-BE stock €",
+            "delta_stock_value": "Δ stock €",
+        })
+        cols = ["Part", "AS-IS MRP", "Switch", "TO-BE methodology",
+                "AS-IS fill %", "TO-BE fill %", "AS-IS stock €", "TO-BE stock €",
+                "Δ fill pts", "Δ stock €"]
+        cols = [c for c in cols if c in view.columns]
+        st.dataframe(
+            view[cols], use_container_width=True, hide_index=True, height=400,
+            column_config={
+                "AS-IS fill %": st.column_config.NumberColumn(format="%.1f%%"),
+                "TO-BE fill %": st.column_config.NumberColumn(format="%.1f%%"),
+                "AS-IS stock €": st.column_config.NumberColumn(format="€ %.0f"),
+                "TO-BE stock €": st.column_config.NumberColumn(format="€ %.0f"),
+                "Δ fill pts": st.column_config.NumberColumn(format="%+.1f"),
+                "Δ stock €": st.column_config.NumberColumn(format="€ %+.0f"),
+            },
+        )
+        st.download_button(
+            "⬇️ Export TO-BE to Excel",
+            data=_build_tobe_excel(run, s, detail),
+            file_name=f"ddmrp_to_be_run{run.id}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+def _build_tobe_excel(run, summary: dict, detail: list) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        exec_rows = [
+            ("Run", f"#{run.id} — {run.scenario_name or '—'}"),
+            ("Σ inventory — AS-IS €", summary.get("total_asis_stock_value")),
+            ("Σ inventory — TO-BE €", summary.get("total_tobe_stock_value")),
+            ("Working capital freed €", summary.get("working_capital_freed")),
+            ("Working capital freed %", summary.get("working_capital_freed_pct")),
+            ("Avg fill — AS-IS", summary.get("avg_asis_fill")),
+            ("Avg fill — TO-BE", summary.get("avg_tobe_fill")),
+            ("Parts switched", summary.get("n_switched")),
+            ("Parts staying AS-IS", summary.get("n_unchanged")),
+        ]
+        pd.DataFrame(exec_rows, columns=["Metric", "Value"]).to_excel(
+            xl, sheet_name="TO-BE Summary", index=False)
+        if summary.get("methodology_mix"):
+            pd.DataFrame(summary["methodology_mix"]).rename(columns={
+                "policy_label": "Methodology", "n_items": "Parts",
+            })[["Methodology", "Parts"]].to_excel(
+                xl, sheet_name="Methodology Mix", index=False)
+        if detail:
+            pd.DataFrame(detail).rename(columns={
+                "part_number": "Part", "description": "Description",
+                "as_is_mrp_type": "AS-IS MRP Type",
+                "to_be_policy_label": "TO-BE methodology", "switched": "Switched",
+                "as_is_fill": "AS-IS fill", "to_be_fill": "TO-BE fill",
+                "as_is_stock_value": "AS-IS stock value",
+                "to_be_stock_value": "TO-BE stock value",
+                "delta_fill": "Δ fill", "delta_stock_value": "Δ stock value (freed)",
+                "target_safety_stock": "Target Safety Stock",
+                "target_reorder_point": "Target Reorder Point",
+                "target_lot": "Target Lot",
+            }).drop(columns=["item_id", "to_be_policy"], errors="ignore").to_excel(
+                xl, sheet_name="Per-part TO-BE", index=False)
+    buf.seek(0)
+    return buf.read()
 
 
 def _build_excel(run, summary: dict, psum: list, recs: list, rows: list) -> bytes:

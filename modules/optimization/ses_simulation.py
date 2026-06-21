@@ -400,6 +400,15 @@ def solve(params: dict[str, Any]) -> SolveResult:
                           "history in Material Master first.",
         )
 
+    # TO-BE (future-state) mode: simulate every part under its accepted
+    # methodology mix and report the portfolio result vs AS-IS.
+    if params.get("mode") == "to_be":
+        return _solve_to_be(
+            items, horizon=horizon, n_reps=n_reps, demand_mode=demand_mode,
+            demand_profile=demand_profile, service_target=service_target,
+            seed=seed, t0=t0,
+        )
+
     rows: list[dict] = []
     recommendation: list[dict] = []
 
@@ -557,5 +566,110 @@ def solve(params: dict[str, Any]) -> SolveResult:
             ("summary",        summary),
             ("by_item_policy", {"rows": rows}),
             ("recommendation", {"rows": recommendation}),
+        ],
+    )
+
+
+_ASSIGNABLE = {"ddmrp", "rop_q", "rop_ss", "kanban", "periodic_rs"}
+
+
+def _solve_to_be(items, *, horizon, n_reps, demand_mode, demand_profile,
+                 service_target, seed, t0) -> SolveResult:
+    """
+    Future-state ("TO-BE") simulation: each part runs under its accepted
+    methodology (`assigned_methodology`); parts with no assignment stay on
+    their AS-IS policy. Reports the portfolio AS-IS → TO-BE delta and the
+    realised methodology mix so the client sees the end result of the switch.
+    """
+    rows: list[dict] = []
+    detail: list[dict] = []
+    n_switched = 0
+
+    for idx, it in enumerate(items):
+        assigned = (it.get("assigned_methodology") or "").lower()
+        to_be_policy = assigned if assigned in _ASSIGNABLE else "as_is"
+        switched = to_be_policy != "as_is"
+        if switched:
+            n_switched += 1
+
+        kw = dict(horizon=horizon, n_reps=n_reps, demand_mode=demand_mode,
+                  demand_profile=demand_profile, service_target=service_target,
+                  seed=seed + idx * 97)
+        as_is = _simulate(it, "as_is", **kw)
+        to_be = as_is if to_be_policy == "as_is" else _simulate(it, to_be_policy, **kw)
+
+        for tag, res in (("as_is", as_is), ("to_be", to_be)):
+            r = dict(res)
+            r.update({"scenario": tag, "item_id": it["id"],
+                      "part_number": it["part_number"],
+                      "description": it["description"],
+                      "unit_cost": it["unit_cost"]})
+            rows.append(r)
+
+        detail.append({
+            "item_id":          it["id"],
+            "part_number":      it["part_number"],
+            "description":      it["description"],
+            "as_is_mrp_type":   (it.get("sap_mrp_type", "") or "").upper() or "(unset)",
+            "to_be_policy":     to_be_policy,
+            "to_be_policy_label": POLICY_LABELS.get(to_be_policy, to_be_policy),
+            "switched":         switched,
+            "as_is_fill":       as_is["unit_fill_rate"],
+            "to_be_fill":       to_be["unit_fill_rate"],
+            "as_is_stock_value": as_is["avg_on_hand_value"],
+            "to_be_stock_value": to_be["avg_on_hand_value"],
+            "as_is_turnover":   as_is["turnover_index"],
+            "to_be_turnover":   to_be["turnover_index"],
+            "delta_fill":       round(to_be["unit_fill_rate"] - as_is["unit_fill_rate"], 4),
+            "delta_stock_value": round(as_is["avg_on_hand_value"] - to_be["avg_on_hand_value"], 2),
+            "target_safety_stock":  to_be.get("calc_safety_stock"),
+            "target_reorder_point": to_be.get("calc_reorder_point"),
+            "target_lot":           to_be.get("calc_order_qty"),
+        })
+
+    # ── Portfolio aggregation (AS-IS vs TO-BE) ───────────────────────────────
+    total_asis = round(float(np.sum([d["as_is_stock_value"] for d in detail])), 2)
+    total_tobe = round(float(np.sum([d["to_be_stock_value"] for d in detail])), 2)
+    wc_freed = round(total_asis - total_tobe, 2)
+    wc_pct = round(100.0 * wc_freed / total_asis, 1) if total_asis > 0 else 0.0
+    avg_asis_fill = round(float(np.mean([d["as_is_fill"] for d in detail])), 4) if detail else None
+    avg_tobe_fill = round(float(np.mean([d["to_be_fill"] for d in detail])), 4) if detail else None
+
+    from collections import Counter
+    mix = Counter(d["to_be_policy"] for d in detail)
+    methodology_mix = [
+        {"policy": p, "policy_label": POLICY_LABELS.get(p, p), "n_items": n}
+        for p, n in sorted(mix.items(), key=lambda kv: -kv[1])
+    ]
+
+    summary = {
+        "mode":            "to_be",
+        "n_items":         len(items),
+        "n_switched":      n_switched,
+        "n_unchanged":     len(items) - n_switched,
+        "horizon_days":    horizon,
+        "n_replications":  n_reps,
+        "demand_mode":     demand_mode,
+        "demand_profile":  demand_profile,
+        "service_target":  service_target,
+        "total_asis_stock_value": total_asis,
+        "total_tobe_stock_value": total_tobe,
+        "working_capital_freed":  wc_freed,
+        "working_capital_freed_pct": wc_pct,
+        "avg_asis_fill":   avg_asis_fill,
+        "avg_tobe_fill":   avg_tobe_fill,
+        "methodology_mix": methodology_mix,
+    }
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    return SolveResult(
+        status="solved",
+        objective_value=float(total_tobe),
+        solver_used="monte-carlo-sim",
+        runtime_ms=elapsed_ms,
+        artefacts=[
+            ("to_be_summary", summary),
+            ("to_be_detail",  {"rows": detail}),
+            ("by_item_policy", {"rows": rows}),
         ],
     )

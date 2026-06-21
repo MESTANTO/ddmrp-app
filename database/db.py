@@ -208,6 +208,12 @@ class Item(Base):
     sap_planned_delivery_time = Column(Float,  default=0.0)  # days
     sap_gr_processing_time    = Column(Float,  default=0.0)  # days
 
+    # ── Accepted TO-BE methodology (from the Methodology Simulation) ──────────
+    # Policy key the user accepted for this part (ddmrp | rop_q | rop_ss |
+    # kanban | periodic_rs). Empty = no decision yet → TO-BE keeps the part on
+    # its current AS-IS policy. Drives the TO-BE (future-state) simulation mix.
+    assigned_methodology = Column(String, default="")
+
     # Default supplier
     default_supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
 
@@ -1014,6 +1020,7 @@ def _migrate_sap_columns():
         ("sap_rounding_value",        "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
         ("sap_planned_delivery_time", "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
         ("sap_gr_processing_time",    "REAL DEFAULT 0.0",   "DOUBLE PRECISION DEFAULT 0.0"),
+        ("assigned_methodology",      "TEXT DEFAULT ''",    "VARCHAR DEFAULT ''"),
     ])
 
 

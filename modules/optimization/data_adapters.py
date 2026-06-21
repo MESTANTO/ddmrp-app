@@ -485,6 +485,8 @@ def load_simulation_inputs(
                 "sap_rounding_value":        _num(getattr(it, "sap_rounding_value", 0.0), 0.0),
                 "sap_planned_delivery_time": _num(getattr(it, "sap_planned_delivery_time", 0.0), 0.0),
                 "sap_gr_processing_time":    _num(getattr(it, "sap_gr_processing_time", 0.0), 0.0),
+                # Accepted TO-BE methodology (future-state simulation mix).
+                "assigned_methodology":      (getattr(it, "assigned_methodology", "") or "").lower(),
             })
 
         if only_ddmrp_eligible:

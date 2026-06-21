@@ -326,3 +326,37 @@ def apply_recommendation(item_id: int, mrp_type: str) -> None:
         session.commit()
     finally:
         session.close()
+
+
+_ASSIGNABLE_METHODS = {"ddmrp", "rop_q", "rop_ss", "kanban", "periodic_rs"}
+
+
+def assign_methodologies(assignments: dict) -> int:
+    """
+    Persist accepted Methodology-Simulation recommendations back to the items.
+
+    `assignments` maps item_id -> policy key (one of _ASSIGNABLE_METHODS, or ""
+    to clear the assignment). Setting a policy also aligns the binary
+    `mrp_type_override` so the rest of the app (positioning, buffers) sees the
+    part flagged as DDMRP / MRP. Returns the number of items updated.
+    """
+    if not assignments:
+        return 0
+    session = get_session()
+    updated = 0
+    try:
+        for item_id, policy in assignments.items():
+            policy = (policy or "").lower()
+            if policy and policy not in _ASSIGNABLE_METHODS:
+                continue
+            item = session.query(Item).get(int(item_id))
+            if item is None:
+                continue
+            item.assigned_methodology = policy
+            if policy:
+                item.mrp_type_override = "DDMRP" if policy == "ddmrp" else "MRP"
+            updated += 1
+        session.commit()
+    finally:
+        session.close()
+    return updated
